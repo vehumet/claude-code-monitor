@@ -18,8 +18,31 @@
 ## Requirements
 
 - **Python 3.10+** with tkinter (included in standard Python installers)
-- **Windows 10/11** (primary) | macOS/Linux (partial — no sound or window focus)
+- **Windows 10/11** (primary) | macOS/Linux (partial — no sound or window focus, **untested**)
 - **Claude Code CLI**
+
+## Project Structure
+
+```
+claude-code-monitor/
+├── .claude-plugin/
+│   └── marketplace.json
+├── plugins/
+│   └── claude-code-monitor/
+│       ├── .claude-plugin/plugin.json
+│       ├── commands/monitor.md
+│       ├── hooks/hooks.json
+│       ├── src/
+│       │   ├── claude-code-monitor.py
+│       │   ├── write-state.py
+│       │   ├── start-monitor.vbs
+│       │   └── start.sh
+│       ├── install.py
+│       └── uninstall.py
+├── CHANGELOG.md
+├── LICENSE
+└── README.md
+```
 
 ## Installation
 
@@ -47,7 +70,7 @@ claude --plugin-dir ./claude-code-monitor
 ```bash
 git clone https://github.com/vehumet/claude-code-monitor.git
 cd claude-code-monitor
-python install.py
+python plugins/claude-code-monitor/install.py
 ```
 
 This will:
@@ -59,7 +82,7 @@ This will:
 Preview changes without modifying anything:
 
 ```bash
-python install.py --dry-run
+python plugins/claude-code-monitor/install.py --dry-run
 ```
 
 ## Usage
@@ -175,13 +198,14 @@ All fields are optional — omitted fields use defaults.
 
 ```bash
 claude plugin uninstall claude-code-monitor
+claude plugin marketplace remove vehumet/claude-code-monitor
 ```
 
 ### Standalone mode
 
 ```bash
 cd claude-code-monitor
-python uninstall.py
+python plugins/claude-code-monitor/uninstall.py
 ```
 
 Options:
