@@ -6,6 +6,8 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)
 
+![Claude Code Monitor Demo](docs/cm_demo.webp)
+
 ## Features
 
 - **4 states** displayed in real-time: Working (green), Done (blue), Waiting for input (yellow), Idle (grey)
