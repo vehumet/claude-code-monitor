@@ -175,6 +175,7 @@ All fields are optional — omitted fields use defaults.
 
 ```bash
 claude plugin uninstall claude-code-monitor
+claude plugin marketplace remove vehumet/claude-code-monitor
 ```
 
 ### Standalone mode
