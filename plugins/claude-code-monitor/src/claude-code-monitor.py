@@ -194,7 +194,7 @@ def build_process_tree():
     return tree
 
 
-def find_window_for_pid(target_pid: int, tree: dict) -> int | None:
+def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | None:
     """Find the main visible window belonging to target_pid or any ancestor. Windows only."""
     if not IS_WINDOWS:
         return None
@@ -214,12 +214,13 @@ def find_window_for_pid(target_pid: int, tree: dict) -> int | None:
         pid = entry[0]  # parent_pid
 
     pid_set = set(chain)
-    candidates = []  # list of (chain_index, hwnd)
+    candidates = []  # list of (chain_index, hwnd, title)
 
     def enum_callback(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
-        if user32.GetWindowTextLengthW(hwnd) <= 0:
+        title_len = user32.GetWindowTextLengthW(hwnd)
+        if title_len <= 0:
             return True
         w_pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
@@ -228,7 +229,9 @@ def find_window_for_pid(target_pid: int, tree: dict) -> int | None:
                 idx = chain.index(w_pid.value)
             except ValueError:
                 idx = len(chain)
-            candidates.append((idx, hwnd))
+            buf = ctypes.create_unicode_buffer(title_len + 1)
+            user32.GetWindowTextW(hwnd, buf, title_len + 1)
+            candidates.append((idx, hwnd, buf.value))
         return True
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -237,6 +240,17 @@ def find_window_for_pid(target_pid: int, tree: dict) -> int | None:
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0])
+
+    # When multiple candidates share the best chain_index, disambiguate by cwd
+    best_idx = candidates[0][0]
+    tied = [c for c in candidates if c[0] == best_idx]
+    if len(tied) > 1 and cwd:
+        project_name = os.path.basename(cwd.rstrip("/\\")).lower()
+        if project_name:
+            for c in tied:
+                if project_name in c[2].lower():
+                    return c[1]
+
     return candidates[0][1]
 
 
@@ -624,7 +638,9 @@ class MonitorOverlay:
     def _activate_terminal(self, claude_pid: int):
         try:
             tree = build_process_tree()
-            hwnd = find_window_for_pid(claude_pid, tree)
+            inst = self.tracker.instances.get(claude_pid)
+            cwd = inst.cwd if inst else ""
+            hwnd = find_window_for_pid(claude_pid, tree, cwd)
             if hwnd:
                 activate_window(hwnd)
         except Exception:
