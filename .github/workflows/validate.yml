@@ -20,10 +20,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Check Python syntax
         run: |
-          python -m py_compile src/claude-code-monitor.py
-          python -m py_compile src/write-state.py
-          python -m py_compile install.py
-          python -m py_compile uninstall.py
+          python -m py_compile plugins/claude-code-monitor/src/claude-code-monitor.py
+          python -m py_compile plugins/claude-code-monitor/src/write-state.py
+          python -m py_compile plugins/claude-code-monitor/install.py
+          python -m py_compile plugins/claude-code-monitor/uninstall.py
 
   json-check:
     name: JSON validation

@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "claude-code-monitor",
-      "source": "./"
+      "source": "./plugins/claude-code-monitor"
     }
   ]
 }
