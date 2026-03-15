@@ -11,6 +11,8 @@ No external dependencies — stdlib + tkinter + ctypes only.
 __version__ = "0.0.1"
 
 import json
+import logging
+import logging.handlers
 import os
 import sys
 import glob
@@ -57,6 +59,27 @@ if IS_WINDOWS:
             ("dwFlags", wintypes.DWORD),
             ("szExeFile", ctypes.c_char * 260),
         ]
+
+
+# ── Diagnostic logger ─────────────────────────────────────────────
+
+def _setup_logger():
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "monitor")
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("claude_monitor")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(log_dir, "debug.log"),
+            maxBytes=1_048_576, backupCount=1, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s", datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(handler)
+    return logger
+
+_log = _setup_logger()
 
 
 # ── i18n ──────────────────────────────────────────────────────────
@@ -194,6 +217,13 @@ def build_process_tree():
     return tree
 
 
+SKIP_COMPONENTS = frozenset({
+    "src", "lib", "bin", "build", "dist", "users", "user", "home",
+    "documents", "desktop", "projects", "repos", "workspace",
+    "workspaces", "code", "dev", "c:", "d:", "e:", "",
+})
+
+
 def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | None:
     """Find the main visible window belonging to target_pid or any ancestor. Windows only."""
     if not IS_WINDOWS:
@@ -213,8 +243,12 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
             break
         pid = entry[0]  # parent_pid
 
+    _log.debug("find_window target=%d cwd=%s", target_pid, cwd)
+    _log.debug("  ancestor chain: %s",
+               [(p, tree.get(p, (None, "?"))[1]) for p in chain])
+
     pid_set = set(chain)
-    candidates = []  # list of (chain_index, hwnd, title)
+    candidates = []  # list of (chain_index, owning_pid, hwnd, title)
 
     def enum_callback(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
@@ -231,27 +265,53 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
                 idx = len(chain)
             buf = ctypes.create_unicode_buffer(title_len + 1)
             user32.GetWindowTextW(hwnd, buf, title_len + 1)
-            candidates.append((idx, hwnd, buf.value))
+            candidates.append((idx, w_pid.value, hwnd, buf.value))
         return True
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
 
+    _log.debug("  all candidates (%d):", len(candidates))
+    for c in candidates:
+        _log.debug("    chain_idx=%d pid=%d hwnd=%d title=%r", *c)
+
     if not candidates:
+        _log.debug("  => no candidates found")
         return None
+
+    # Filter: prefer windows whose title ends with " - Cursor"
+    cursor_candidates = [c for c in candidates if c[3].endswith(" - Cursor")]
+    if cursor_candidates:
+        _log.debug("  Cursor-title filter: %d -> %d candidates",
+                   len(candidates), len(cursor_candidates))
+        candidates = cursor_candidates
+
     candidates.sort(key=lambda c: c[0])
 
     # When multiple candidates share the best chain_index, disambiguate by cwd
     best_idx = candidates[0][0]
     tied = [c for c in candidates if c[0] == best_idx]
-    if len(tied) > 1 and cwd:
-        project_name = os.path.basename(cwd.rstrip("/\\")).lower()
-        if project_name:
-            for c in tied:
-                if project_name in c[2].lower():
-                    return c[1]
 
-    return candidates[0][1]
+    if len(tied) > 1 and cwd:
+        _log.debug("  %d tied candidates at chain_idx=%d, trying path component matching",
+                   len(tied), best_idx)
+        # Try each path component from innermost to outermost
+        parts = cwd.replace("\\", "/").rstrip("/").split("/")
+        for part in reversed(parts):
+            comp = part.lower().rstrip(":")
+            if comp in SKIP_COMPONENTS:
+                continue
+            matches = [c for c in tied if comp in c[3].lower()]
+            _log.debug("    component %r -> %d matches", comp, len(matches))
+            if len(matches) == 1:
+                _log.debug("  => unique match hwnd=%d title=%r", matches[0][2], matches[0][3])
+                return matches[0][2]  # hwnd
+
+    # Stable fallback: sort by hwnd to avoid Z-order dependency
+    tied.sort(key=lambda c: c[2])
+    result = tied[0][2]
+    _log.debug("  => fallback hwnd=%d title=%r", tied[0][2], tied[0][3])
+    return result
 
 
 def activate_window(hwnd: int):
@@ -643,8 +703,10 @@ class MonitorOverlay:
             hwnd = find_window_for_pid(claude_pid, tree, cwd)
             if hwnd:
                 activate_window(hwnd)
+            else:
+                _log.warning("_activate_terminal: no hwnd found for pid=%d", claude_pid)
         except Exception:
-            pass
+            _log.error("_activate_terminal failed for pid=%d", claude_pid, exc_info=True)
 
     def run(self):
         self.root.mainloop()
