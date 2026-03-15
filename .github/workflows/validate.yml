@@ -1,0 +1,47 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check Python syntax
+        run: |
+          python -m py_compile src/claude-code-monitor.py
+          python -m py_compile src/write-state.py
+          python -m py_compile install.py
+          python -m py_compile uninstall.py
+
+  json-check:
+    name: JSON validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate JSON files
+        run: |
+          python -c "
+          import json, glob, sys
+          errors = 0
+          for f in glob.glob('**/*.json', recursive=True):
+              try:
+                  with open(f) as fh:
+                      json.load(fh)
+                  print(f'  OK: {f}')
+              except json.JSONDecodeError as e:
+                  print(f'  FAIL: {f} — {e}')
+                  errors += 1
+          sys.exit(errors)
+          "

@@ -1,0 +1,12 @@
+{
+  "name": "claude-code-monitor-marketplace",
+  "owner": {
+    "name": "vehumet"
+  },
+  "plugins": [
+    {
+      "name": "claude-code-monitor",
+      "source": "./"
+    }
+  ]
+}
