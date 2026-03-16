@@ -102,6 +102,25 @@ def _get_ancestor_pids(my_pid, tree):
     return ancestors
 
 
+def _capture_foreground_hwnd(my_pid, tree):
+    """Capture foreground window HWND if it belongs to an ancestor process."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        ancestors = _get_ancestor_pids(my_pid, tree)
+        if owner_pid.value in ancestors:
+            return hwnd
+        return None
+    except Exception:
+        return None
+
+
 def get_state_dir():
     """Return state directory path (env var > default)."""
     return os.environ.get(
@@ -157,6 +176,7 @@ def main():
 
     pid = None
     matched_cwd = cwd
+    tree = _build_process_tree()
 
     # Phase 2: Match by session_id (full scan)
     if session_id:
@@ -187,7 +207,6 @@ def main():
             # Multiple sessions with same cwd — use process tree to disambiguate
             _log.debug("Phase 3: %d sessions share cwd, trying ancestor matching",
                        len(cwd_matches))
-            tree = _build_process_tree()
             ancestors = _get_ancestor_pids(my_pid, tree)
             _log.debug("Phase 3: my ancestors = %s", ancestors)
 
@@ -242,12 +261,24 @@ def main():
     state_file = os.path.join(state_dir, f"{pid}.json")
     now = int(time.time())
 
+    captured_hwnd = _capture_foreground_hwnd(my_pid, tree)
+    if captured_hwnd is None:
+        # 포커스가 IDE가 아닐 때 기존 HWND 보존
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            captured_hwnd = existing.get("hwnd")
+        except Exception:
+            captured_hwnd = None
+
     state_data = {
         "pid": pid,
         "state": state,
         "cwd": matched_cwd,
         "updatedAt": now,
     }
+    if captured_hwnd is not None:
+        state_data["hwnd"] = captured_hwnd
 
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 

@@ -8,7 +8,7 @@ Usage:
 No external dependencies — stdlib + tkinter + ctypes only.
 """
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 import json
 import logging
@@ -348,7 +348,7 @@ def short_cwd(cwd: str) -> str:
 
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
-                 "blink_on", "done_since")
+                 "blink_on", "done_since", "hwnd")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0):
         self.pid = pid
@@ -358,6 +358,7 @@ class Instance:
         self.display_name = short_cwd(cwd)
         self.blink_on = True
         self.done_since = 0.0
+        self.hwnd = 0
 
 
 class InstanceTracker:
@@ -418,11 +419,13 @@ class InstanceTracker:
                 pid = st.get("pid")
                 state = st.get("state", "working")
                 updated_at = st.get("updatedAt", 0)
+                saved_hwnd = st.get("hwnd", 0)
             except Exception:
                 continue
 
             if pid in self.instances:
                 inst = self.instances[pid]
+                inst.hwnd = saved_hwnd or inst.hwnd
                 if inst.state != state or inst.updated_at != updated_at:
                     old_state = inst.state
                     inst.state = state
@@ -697,8 +700,19 @@ class MonitorOverlay:
 
     def _activate_terminal(self, claude_pid: int):
         try:
-            tree = build_process_tree()
             inst = self.tracker.instances.get(claude_pid)
+
+            # 저장된 HWND 우선 사용
+            if inst and inst.hwnd:
+                user32 = ctypes.windll.user32
+                if user32.IsWindow(inst.hwnd) and user32.IsWindowVisible(inst.hwnd):
+                    activate_window(inst.hwnd)
+                    return
+                else:
+                    inst.hwnd = 0  # stale handle 클리어
+
+            # 폴백: 프로세스 트리 탐색
+            tree = build_process_tree()
             cwd = inst.cwd if inst else ""
             hwnd = find_window_for_pid(claude_pid, tree, cwd)
             if hwnd:
