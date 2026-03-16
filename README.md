@@ -34,7 +34,7 @@ claude-code-monitor/
 │       ├── .claude-plugin/plugin.json
 │       ├── commands/
 │       │   ├── monitor.md
-│       │   └── update.md          # /update-monitor slash command
+│       │   └── update.md          # /claude-code-monitor:update slash command
 │       ├── hooks/hooks.json
 │       ├── src/
 │       │   ├── claude-code-monitor.py
@@ -98,6 +98,10 @@ python plugins/claude-code-monitor/install.py --dry-run
 In Claude Code:
 
 ```
+# Plugin mode
+/claude-code-monitor:monitor
+
+# Standalone mode
 /monitor
 ```
 
@@ -203,22 +207,19 @@ All fields are optional — omitted fields use defaults.
 In Claude Code, use the slash command:
 
 ```
-/update-monitor
+/claude-code-monitor:update
 ```
 
 This will pull the latest marketplace data, update the plugin, and guide you to restart the session.
 
 ### Manual update
 
-Due to a [known Claude Code bug](https://github.com/anthropics/claude-code/issues/14061), `claude plugins update` may not pull the latest marketplace data. As a workaround:
-
 ```bash
-# 1. Pull the latest marketplace clone
-cd ~/.claude/plugins/repos/<marketplace-clone-dir>
-git pull origin main
+# 1. Update the marketplace data
+claude plugin marketplace update claude-code-monitor-marketplace
 
 # 2. Update the plugin
-claude plugins update claude-code-monitor
+claude plugin update claude-code-monitor@claude-code-monitor-marketplace
 ```
 
 Restart your Claude Code session after updating.

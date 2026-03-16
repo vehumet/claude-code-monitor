@@ -25,7 +25,7 @@ cd <marketplace-clone-dir> && git pull origin main
 ### 3. Run plugin update
 
 ```bash
-claude plugins update claude-code-monitor
+claude plugin update claude-code-monitor@claude-code-monitor-marketplace
 ```
 
 ### 4. Verify the update
