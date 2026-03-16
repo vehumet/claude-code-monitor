@@ -62,6 +62,16 @@ jobs:
               sys.exit(1)
           "
 
+  changelog-check:
+    name: CHANGELOG version check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check CHANGELOG has current version
+        run: |
+          VER=$(python3 -c "import json; print(json.load(open('plugins/claude-code-monitor/.claude-plugin/plugin.json'))['version'])")
+          grep -q "## \[${VER}\]" CHANGELOG.md || { echo "CHANGELOG.md missing entry for v${VER}"; exit 1; }
+
   json-check:
     name: JSON validation
     runs-on: ubuntu-latest

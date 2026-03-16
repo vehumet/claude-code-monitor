@@ -36,6 +36,7 @@ scripts/bump-version.py                  # 3곳 버전 동기화 도구
 
 - **버전 관리**: `plugin.json`, `marketplace.json`, `claude-code-monitor.py` 3곳에 버전이 있다. 반드시 `bump-version.py`로 동기화할 것.
 - **버전 규칙**: patch 단위(0.0.1씩)로만 올린다. major/minor 변경은 명시적 요청 시에만.
+- **릴리스 절차**: 코드 변경을 커밋한 뒤, 푸시 전에 반드시 (1) `CHANGELOG.md`에 `## [0.0.X] - YYYY-MM-DD` 형식으로 새 버전 섹션을 추가하고 (Keep a Changelog 형식: Added/Changed/Fixed 카테고리 사용) (2) `python scripts/bump-version.py patch`를 실행한 뒤 (3) `chore: bump v0.0.X` 형식의 별도 커밋을 만들어야 한다. 버전 범프·체인지로그 갱신 없이 푸시하지 말 것.
 - **상태 흐름**: `write-state.py`가 `~/.claude/monitor/state/{pid}.json`에 상태를 기록하고, 오버레이가 폴링으로 읽는다.
 - **훅 변수**: 훅에서 `${CLAUDE_PLUGIN_ROOT}`를 사용해 플러그인 경로를 참조한다.
 

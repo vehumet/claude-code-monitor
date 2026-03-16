@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.7] - 2026-03-17
+
+### Fixed
+
+- Self-register session file when `--resume` causes sessionId mismatch
+- Add Phase 2.5: walk ancestor chain to find claude.exe PID, then update or create session file
+- Remove Phase 3 startedAt fallback which could pick an unrelated session
+
+## [0.0.6] - 2026-03-17
+
+### Fixed
+
+- Remove Phase 4 blind fallback that overwrites unrelated sessions — skip state write if no match found by Phase 2/3/3.5
+
 ## [0.0.5] - 2026-03-17
 
 ### Fixed
