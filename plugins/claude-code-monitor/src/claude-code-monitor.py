@@ -442,6 +442,17 @@ class InstanceTracker:
                         inst.done_since = 0.0
                     changed = True
 
+        # Proactively resolve hwnd for instances that don't have one yet
+        if IS_WINDOWS:
+            missing_hwnd = [inst for inst in self.instances.values()
+                            if not inst.hwnd and inst.pid in seen_pids]
+            if missing_hwnd:
+                tree = build_process_tree()
+                for inst in missing_hwnd:
+                    hwnd = find_window_for_pid(inst.pid, tree, inst.cwd)
+                    if hwnd:
+                        inst.hwnd = hwnd
+
         # Remove instances whose PID is gone
         for pid in list(self.instances):
             if pid not in seen_pids:
