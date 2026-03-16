@@ -32,7 +32,9 @@ claude-code-monitor/
 ├── plugins/
 │   └── claude-code-monitor/
 │       ├── .claude-plugin/plugin.json
-│       ├── commands/monitor.md
+│       ├── commands/
+│       │   ├── monitor.md
+│       │   └── update.md          # /update-monitor slash command
 │       ├── hooks/hooks.json
 │       ├── src/
 │       │   ├── claude-code-monitor.py
@@ -41,6 +43,8 @@ claude-code-monitor/
 │       │   └── start.sh
 │       ├── install.py
 │       └── uninstall.py
+├── scripts/
+│   └── bump-version.py            # version bump utility
 ├── CHANGELOG.md
 ├── LICENSE
 └── README.md
@@ -193,6 +197,46 @@ All fields are optional — omitted fields use defaults.
 
 - Sound notifications use Windows `winsound.Beep` — not available on macOS/Linux
 - Set `"sound_enabled": false` in config.json to disable
+
+## Updating
+
+In Claude Code, use the slash command:
+
+```
+/update-monitor
+```
+
+This will pull the latest marketplace data, update the plugin, and guide you to restart the session.
+
+### Manual update
+
+Due to a [known Claude Code bug](https://github.com/anthropics/claude-code/issues/14061), `claude plugins update` may not pull the latest marketplace data. As a workaround:
+
+```bash
+# 1. Pull the latest marketplace clone
+cd ~/.claude/plugins/repos/<marketplace-clone-dir>
+git pull origin main
+
+# 2. Update the plugin
+claude plugins update claude-code-monitor
+```
+
+Restart your Claude Code session after updating.
+
+## Development
+
+### Version bumping
+
+Versions are tracked in 3 files. Use the bump script to keep them in sync:
+
+```bash
+python scripts/bump-version.py patch          # 0.0.2 -> 0.0.3
+python scripts/bump-version.py minor          # 0.0.2 -> 0.1.0
+python scripts/bump-version.py major          # 0.0.2 -> 1.0.0
+python scripts/bump-version.py 1.2.3          # set explicit version
+```
+
+CI will fail if any of the 3 version sources are out of sync.
 
 ## Uninstall
 

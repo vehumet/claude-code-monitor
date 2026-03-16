@@ -6,5 +6,11 @@
     "name": "vehumet"
   },
   "license": "MIT",
-  "keywords": ["monitor", "overlay", "status", "windows", "notification"]
+  "keywords": [
+    "monitor",
+    "overlay",
+    "status",
+    "windows",
+    "notification"
+  ]
 }

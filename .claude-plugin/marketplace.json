@@ -1,12 +1,17 @@
 {
   "name": "claude-code-monitor-marketplace",
+  "description": "Real-time overlay widget for monitoring Claude Code instances",
   "owner": {
     "name": "vehumet"
   },
   "plugins": [
     {
       "name": "claude-code-monitor",
-      "source": "./plugins/claude-code-monitor"
+      "description": "Always-on-top overlay widget showing real-time status of all active Claude Code instances",
+      "version": "0.0.2",
+      "source": "./plugins/claude-code-monitor",
+      "category": "monitoring",
+      "homepage": "https://github.com/vehumet/claude-code-monitor"
     }
   ]
 }

@@ -24,6 +24,43 @@ jobs:
           python -m py_compile plugins/claude-code-monitor/src/write-state.py
           python -m py_compile plugins/claude-code-monitor/install.py
           python -m py_compile plugins/claude-code-monitor/uninstall.py
+          python -m py_compile scripts/bump-version.py
+
+  version-sync:
+    name: Version sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all version strings match
+        run: |
+          python3 -c "
+          import json, re, sys
+
+          with open('plugins/claude-code-monitor/.claude-plugin/plugin.json') as f:
+              v_plugin = json.load(f)['version']
+
+          with open('.claude-plugin/marketplace.json') as f:
+              data = json.load(f)
+              v_market = None
+              for p in data.get('plugins', []):
+                  if p.get('name') == 'claude-code-monitor':
+                      v_market = p.get('version')
+                      break
+
+          with open('plugins/claude-code-monitor/src/claude-code-monitor.py') as f:
+              m = re.search(r'^__version__\s*=\s*\"([^\"]+)\"', f.read(), re.MULTILINE)
+              v_py = m.group(1) if m else None
+
+          print(f'plugin.json:          {v_plugin}')
+          print(f'marketplace.json:     {v_market}')
+          print(f'claude-code-monitor.py: {v_py}')
+
+          if v_plugin == v_market == v_py:
+              print('All versions match.')
+          else:
+              print('ERROR: Version mismatch detected!', file=sys.stderr)
+              sys.exit(1)
+          "
 
   json-check:
     name: JSON validation
