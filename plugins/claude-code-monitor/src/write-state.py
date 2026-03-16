@@ -266,28 +266,10 @@ def main():
         if pid is None:
             _log.debug("Phase 3.5: no ancestor match found")
 
-    # Phase 4: Last resort — most recent session file
+    # No match — do not write to an unrelated session
     if pid is None:
-        _log.debug("Phase 4: no match yet, falling back to most recent session file")
-        session_files = sorted(
-            glob.glob(os.path.join(sessions_dir, "*.json")),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        if session_files:
-            try:
-                basename = os.path.splitext(os.path.basename(session_files[0]))[0]
-                pid = int(basename)
-                with open(session_files[0], "r", encoding="utf-8") as f:
-                    sess = json.load(f)
-                    matched_cwd = sess.get("cwd", cwd)
-                _log.debug("Phase 4: fallback -> pid=%s", pid)
-            except Exception:
-                _log.debug("Phase 4: failed to read fallback session file")
-                sys.exit(0)
-        else:
-            _log.debug("Phase 4: no session files found")
-            sys.exit(0)
+        _log.debug("No session match found; skipping state write")
+        sys.exit(0)
 
     # Write state file
     state_file = os.path.join(state_dir, f"{pid}.json")
