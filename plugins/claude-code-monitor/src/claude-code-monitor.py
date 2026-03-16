@@ -8,7 +8,7 @@ Usage:
 No external dependencies — stdlib + tkinter + ctypes only.
 """
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 import json
 import logging
@@ -263,6 +263,15 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
             extra.add(p)
     pid_set |= extra
 
+    # Phase 1c: Windows 11 delegation model fallback
+    # WindowsTerminal.exe is NOT a descendant of the shell process.
+    # Add all WT PIDs so their windows become candidates.
+    wt_pids = {p for p, (parent, exe) in tree.items()
+                if exe == "windowsterminal.exe"}
+    if wt_pids:
+        _log.debug("  Phase 1c: adding %d WindowsTerminal PIDs as candidates", len(wt_pids))
+        pid_set |= wt_pids
+
     candidates = []  # list of (chain_index, owning_pid, hwnd, title)
 
     def enum_callback(hwnd, _lparam):
@@ -285,6 +294,9 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+
+    # Filter out "Program Manager" (explorer.exe desktop window — never correct)
+    candidates = [c for c in candidates if c[3] != "Program Manager"]
 
     _log.debug("  all candidates (%d):", len(candidates))
     for c in candidates:

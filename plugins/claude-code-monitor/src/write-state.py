@@ -69,7 +69,7 @@ def _norm_path(p):
 
 
 def _build_process_tree():
-    """Return dict mapping pid -> parent_pid. Windows only."""
+    """Return dict mapping pid -> (parent_pid, exe_name). Windows only."""
     if not IS_WINDOWS:
         return {}
     kernel32 = ctypes.windll.kernel32
@@ -82,7 +82,11 @@ def _build_process_tree():
     try:
         if kernel32.Process32First(snap, ctypes.byref(pe)):
             while True:
-                tree[pe.th32ProcessID] = pe.th32ParentProcessID
+                try:
+                    exe = pe.szExeFile.decode("utf-8", errors="replace")
+                except Exception:
+                    exe = ""
+                tree[pe.th32ProcessID] = (pe.th32ParentProcessID, exe.lower())
                 if not kernel32.Process32Next(snap, ctypes.byref(pe)):
                     break
     finally:
@@ -98,12 +102,21 @@ def _get_ancestor_pids(my_pid, tree):
     while pid and pid not in visited:
         visited.add(pid)
         ancestors.add(pid)
-        pid = tree.get(pid)
+        entry = tree.get(pid)
+        pid = entry[0] if entry else None
     return ancestors
 
 
-def _capture_foreground_hwnd(my_pid, tree):
-    """Capture foreground window HWND if it belongs to an ancestor process."""
+TERMINAL_HOSTS = {"windowsterminal.exe", "conhost.exe", "openconsole.exe"}
+
+
+def _capture_foreground_hwnd(my_pid, tree, is_user_prompt=False):
+    """Capture foreground window HWND if it belongs to an ancestor process.
+
+    When *is_user_prompt* is True (UserPromptSubmit hook — user just pressed
+    Enter, so the terminal is foreground), also accept windows owned by known
+    terminal host processes (WindowsTerminal, conhost, OpenConsole).
+    """
     if not IS_WINDOWS:
         return None
     try:
@@ -116,6 +129,11 @@ def _capture_foreground_hwnd(my_pid, tree):
         ancestors = _get_ancestor_pids(my_pid, tree)
         if owner_pid.value in ancestors:
             return hwnd
+        # Windows 11 delegation: terminal host is NOT an ancestor
+        if is_user_prompt:
+            owner_entry = tree.get(owner_pid.value)
+            if owner_entry and owner_entry[1] in TERMINAL_HOSTS:
+                return hwnd
         return None
     except Exception:
         return None
@@ -234,6 +252,20 @@ def main():
                 matched_cwd = sess.get("cwd", cwd)
                 _log.debug("Phase 3: startedAt fallback -> pid=%s", pid)
 
+    # Phase 3.5: ancestor PID matching (no CWD constraint)
+    if pid is None:
+        ancestors = _get_ancestor_pids(my_pid, tree)
+        _log.debug("Phase 3.5: trying ancestor match without CWD, ancestors=%s", ancestors)
+        for sf, basename, sess in sessions:
+            sess_pid = sess.get("pid", int(basename))
+            if sess_pid in ancestors:
+                pid = sess_pid
+                matched_cwd = sess.get("cwd", cwd)
+                _log.debug("Phase 3.5: ancestor match -> pid=%s file=%s", pid, basename)
+                break
+        if pid is None:
+            _log.debug("Phase 3.5: no ancestor match found")
+
     # Phase 4: Last resort — most recent session file
     if pid is None:
         _log.debug("Phase 4: no match yet, falling back to most recent session file")
@@ -261,7 +293,8 @@ def main():
     state_file = os.path.join(state_dir, f"{pid}.json")
     now = int(time.time())
 
-    captured_hwnd = _capture_foreground_hwnd(my_pid, tree)
+    is_user_prompt = "prompt" in hook_data
+    captured_hwnd = _capture_foreground_hwnd(my_pid, tree, is_user_prompt=is_user_prompt)
     if captured_hwnd is None:
         # 포커스가 IDE가 아닐 때 기존 HWND 보존
         try:

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.5] - 2026-03-17
+
+### Fixed
+
+- Fix PowerShell (Windows Terminal) focus failure — WT delegation model not detected by ancestor chain scan
+- Fix desktop app state leaking into PowerShell slot via blind Phase 4 fallback
+
+### Changed
+
+- `write-state.py`: process tree now stores exe name (`pid -> (parent_pid, exe)`)
+- `write-state.py`: accept terminal host HWND on UserPromptSubmit hook
+- `write-state.py`: add Phase 3.5 ancestor PID matching before Phase 4 fallback
+- `claude-code-monitor.py`: add Phase 1c global WindowsTerminal scan in `find_window_for_pid()`
+- `claude-code-monitor.py`: filter out "Program Manager" from window candidates
+
+## [0.0.4] - 2026-03-17
+
+### Fixed
+
+- Find WindowsTerminal window via terminal host descendant scan
+- Activate correct Cursor window when multiple instances share same PID
+
+### Added
+
+- Proactively resolve HWND for new instances in poll()
+
+### Changed
+
+- Update slash command and plugin update instructions to match plugin mode format
+
 ## [0.0.3] - 2026-03-17
 
 ### Changed
