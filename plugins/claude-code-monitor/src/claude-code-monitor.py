@@ -248,6 +248,21 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
                [(p, tree.get(p, (None, "?"))[1]) for p in chain])
 
     pid_set = set(chain)
+
+    # Phase 1b: Add terminal host processes that are descendants of our chain.
+    # Windows 11 terminal delegation: conhost.exe (child of shell) launches
+    # WindowsTerminal.exe, so the actual window owner is outside the ancestor chain.
+    TERMINAL_HOSTS = {"conhost.exe", "windowsterminal.exe", "openconsole.exe"}
+    extra = set()
+    for p, (parent, exe) in tree.items():
+        if parent in pid_set and exe in TERMINAL_HOSTS:
+            extra.add(p)
+    # Second pass: WindowsTerminal.exe may be a child of conhost.exe
+    for p, (parent, exe) in tree.items():
+        if parent in extra and exe in TERMINAL_HOSTS:
+            extra.add(p)
+    pid_set |= extra
+
     candidates = []  # list of (chain_index, owning_pid, hwnd, title)
 
     def enum_callback(hwnd, _lparam):
