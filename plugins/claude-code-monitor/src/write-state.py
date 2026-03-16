@@ -207,6 +207,50 @@ def main():
         if pid is None:
             _log.debug("Phase 2: no session_id match found")
 
+    # Phase 2.5: Self-register — fix session file when sessionId mismatches
+    if pid is None and session_id:
+        claude_pid = None
+        p = my_pid
+        visited_walk = set()
+        while p and p not in visited_walk:
+            visited_walk.add(p)
+            entry = tree.get(p)
+            if not entry:
+                break
+            if entry[1] == "claude.exe":
+                claude_pid = p
+                break
+            p = entry[0]
+
+        if claude_pid:
+            sess_file = os.path.join(sessions_dir, f"{claude_pid}.json")
+            try:
+                if os.path.exists(sess_file):
+                    with open(sess_file, "r", encoding="utf-8") as f:
+                        sess = json.load(f)
+                    if sess.get("sessionId") != session_id:
+                        sess["sessionId"] = session_id
+                        with open(sess_file, "w", encoding="utf-8") as f:
+                            json.dump(sess, f)
+                        _log.debug("Phase 2.5: updated sessionId in %s.json", claude_pid)
+                    pid = claude_pid
+                    matched_cwd = sess.get("cwd", cwd)
+                else:
+                    sess = {
+                        "pid": claude_pid,
+                        "sessionId": session_id,
+                        "cwd": cwd,
+                        "startedAt": int(time.time() * 1000),
+                    }
+                    os.makedirs(sessions_dir, exist_ok=True)
+                    with open(sess_file, "w", encoding="utf-8") as f:
+                        json.dump(sess, f)
+                    pid = claude_pid
+                    matched_cwd = cwd
+                    _log.debug("Phase 2.5: created session file %s.json", claude_pid)
+            except Exception:
+                _log.error("Phase 2.5: failed", exc_info=True)
+
     # Phase 3: Match by cwd (only if session_id didn't match)
     if pid is None and cwd:
         cwd_matches = [
@@ -241,16 +285,8 @@ def main():
                 pid = sess_pid
                 matched_cwd = sess.get("cwd", cwd)
             else:
-                # Fallback: pick the session with the most recent startedAt
-                _log.debug("Phase 3: no ancestor match, falling back to most recent startedAt")
-                cwd_matches.sort(
-                    key=lambda x: x[2].get("startedAt", ""),
-                    reverse=True,
-                )
-                sf, basename, sess = cwd_matches[0]
-                pid = sess.get("pid", int(basename))
-                matched_cwd = sess.get("cwd", cwd)
-                _log.debug("Phase 3: startedAt fallback -> pid=%s", pid)
+                _log.debug("Phase 3: no ancestor match among %d cwd matches, skipping",
+                           len(cwd_matches))
 
     # Phase 3.5: ancestor PID matching (no CWD constraint)
     if pid is None:
