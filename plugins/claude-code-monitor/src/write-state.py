@@ -119,6 +119,8 @@ def _capture_foreground_hwnd(my_pid, tree, is_user_prompt=False):
     """
     if not IS_WINDOWS:
         return None
+    if not is_user_prompt:
+        return None  # 포그라운드 윈도우는 UserPromptSubmit에서만 신뢰 가능
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
@@ -311,16 +313,23 @@ def main():
     state_file = os.path.join(state_dir, f"{pid}.json")
     now = int(time.time())
 
+    # Read existing state (for hwnd preservation and same-state skip)
+    existing = None
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        pass
+
     is_user_prompt = "prompt" in hook_data
     captured_hwnd = _capture_foreground_hwnd(my_pid, tree, is_user_prompt=is_user_prompt)
-    if captured_hwnd is None:
-        # 포커스가 IDE가 아닐 때 기존 HWND 보존
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            captured_hwnd = existing.get("hwnd")
-        except Exception:
-            captured_hwnd = None
+    if captured_hwnd is None and existing:
+        captured_hwnd = existing.get("hwnd")
+
+    # Skip write if state unchanged (catch-all이 매 도구마다 호출되므로 필수 최적화)
+    if existing and existing.get("state") == state:
+        _log.debug("=> State unchanged (%s), skipping write", state)
+        return
 
     state_data = {
         "pid": pid,
