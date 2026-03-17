@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.8] - 2026-03-17
+
+### Fixed
+
+- Fix question state not transitioning back to working after user answers
+- Add catch-all PreToolUse hook to ensure working state on every tool use
+- Add same-state skip optimization to avoid redundant file writes
+
 ## [0.0.7] - 2026-03-17
 
 ### Fixed
