@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.9] - 2026-03-17
+
+### Fixed
+
+- Prevent PreToolUse race condition where catch-all "working" hook overwrites "question" state set by specific matcher
+- Add 2-second timestamp guard in write-state.py to protect recently written question state
+
 ## [0.0.8] - 2026-03-17
 
 ### Fixed
