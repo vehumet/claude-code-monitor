@@ -77,6 +77,18 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/src/write-state.py\" \"interrupted\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

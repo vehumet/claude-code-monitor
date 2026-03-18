@@ -4,7 +4,7 @@
 Usage (from hook script):
     echo "$INPUT" | python write-state.py <state>
 
-States: working, done, question
+States: working, done, question, interrupted
 """
 import json
 import logging
@@ -18,6 +18,7 @@ import ctypes.wintypes as wintypes
 
 IS_WINDOWS = sys.platform == "win32"
 QUESTION_GUARD_SECONDS = 2  # catch-all "working"이 "question"과 레이스하는 것을 방지
+DONE_GUARD_SECONDS = 2  # idle_prompt가 정상 완료 후 "done"을 덮어쓰는 것을 방지
 
 # ── Windows constants (for process tree) ─────────────────────────
 TH32CS_SNAPPROCESS = 0x00000002
@@ -337,6 +338,18 @@ def main():
     ):
         _log.debug("=> Guard: skipping 'working' — 'question' was written %ds ago",
                     now - existing.get("updatedAt", 0))
+        return
+
+    # Guard: idle_prompt의 "interrupted"가 정상 완료된 "done"을 덮어쓰는 것을 방지
+    # Stop 훅이 "done"을 기록한 직후 idle_prompt가 발사될 수 있음
+    if (
+        state == "interrupted"
+        and existing
+        and existing.get("state") in ("done", "interrupted", "idle")
+        and (now - existing.get("updatedAt", 0)) < DONE_GUARD_SECONDS
+    ):
+        _log.debug("=> Guard: skipping 'interrupted' — '%s' was written %ds ago",
+                    existing.get("state"), now - existing.get("updatedAt", 0))
         return
 
     # Skip write if state unchanged (catch-all이 매 도구마다 호출되므로 필수 최적화)

@@ -88,6 +88,7 @@ LABELS = {
         "working": "Working",
         "done": "Done",
         "question": "Waiting",
+        "interrupted": "Interrupted",
         "idle": "Idle",
         "no_instances": "No instances",
     },
@@ -95,6 +96,7 @@ LABELS = {
         "working": "\uc791\uc5c5\uc911",
         "done": "\uc791\uc5c5\uc644\ub8cc",
         "question": "\uc9c8\ubb38\uc788\uc74c",
+        "interrupted": "\uc911\ub2e8\ub428",
         "idle": "\ub300\uae30\uc911",
         "no_instances": "\uc778\uc2a4\ud134\uc2a4 \uc5c6\uc74c",
     },
@@ -110,6 +112,7 @@ THEME = {
     "working":     "#a6e3a1",   # green
     "done":        "#89b4fa",   # blue
     "question":    "#f9e2af",   # yellow
+    "interrupted": "#fab387",   # peach/orange
     "idle":        "#585b70",   # grey
     "hover":       "#313244",
     "close_hover": "#f38ba8",   # red
@@ -461,11 +464,15 @@ class InstanceTracker:
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")
+                    elif state == "interrupted" and old_state != "interrupted":
+                        inst.done_since = time.monotonic()
+                        inst.blink_on = True
+                        events.append("interrupted")
                     elif state == "question" and old_state != "question":
                         inst.blink_on = True
                         inst.done_since = 0.0
                         events.append("question")
-                    elif state != "done":
+                    elif state not in ("done", "interrupted"):
                         inst.done_since = 0.0
                     changed = True
 
@@ -636,6 +643,7 @@ class MonitorOverlay:
         chimes = {
             "done": [(880, 80), (1175, 80), (1397, 120)],      # A5-D6-F6 rising major
             "question": [(1047, 100), (880, 130)],              # C6-A5 descending
+            "interrupted": [(880, 80), (660, 80), (440, 120)],  # A5-E5-A4 descending
         }
         seq = chimes.get(event)
         if seq:
@@ -656,6 +664,13 @@ class MonitorOverlay:
                     color = THEME["done"] if self._blink_phase else THEME["bg"]
                 else:
                     color = THEME["done"]
+                row["dot"].config(fg=color)
+                row["state"].config(fg=color)
+            elif inst.state == "interrupted":
+                if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
+                    color = THEME["interrupted"] if self._blink_phase else THEME["bg"]
+                else:
+                    color = THEME["interrupted"]
                 row["dot"].config(fg=color)
                 row["state"].config(fg=color)
             elif inst.state == "question":
