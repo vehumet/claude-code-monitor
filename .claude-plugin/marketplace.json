@@ -8,7 +8,7 @@
     {
       "name": "claude-code-monitor",
       "description": "Always-on-top overlay widget showing real-time status of all active Claude Code instances",
-      "version": "0.0.9",
+      "version": "0.0.10",
       "source": "./plugins/claude-code-monitor",
       "category": "monitoring",
       "homepage": "https://github.com/vehumet/claude-code-monitor"

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.10] - 2026-03-19
+
+### Added
+
+- Detect Ctrl+C / server error via Notification `idle_prompt` hook and show "interrupted" state
+- Orange (peach) color, blink animation, and descending chime for interrupted state
+- Done-guard in write-state.py to prevent idle_prompt from overwriting recent "done" state
+
+### Fixed
+
+- Use atomic write (tempfile + os.replace) for state files to prevent partial-read race conditions
+
 ## [0.0.9] - 2026-03-17
 
 ### Fixed
