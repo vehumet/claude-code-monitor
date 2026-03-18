@@ -11,6 +11,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 import time
 import glob
 import ctypes
@@ -369,8 +370,17 @@ def main():
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 
     try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state_data, f)
+        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state_data, f)
+            os.replace(tmp_path, state_file)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception:
         _log.error("Failed to write state file %s", state_file, exc_info=True)
 
