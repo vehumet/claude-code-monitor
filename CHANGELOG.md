@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.11] - 2026-03-19
+
+### Fixed
+
+- Replace time-based done guard (2s) with state-based guard to prevent `interrupted` from overwriting `done` after Windows sleep/standby delays
+
 ## [0.0.10] - 2026-03-19
 
 ### Added
