@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.12] - 2026-03-24
+
+### Fixed
+
+- Wrap `_poll_loop()` and `_blink_loop()` in try-except-finally to prevent unhandled exceptions from permanently killing the UI update loops
+- Protect ctypes calls (`build_process_tree` / `find_window_for_pid`) in `poll()` with try-except to catch sporadic Win32 API errors
+- Re-assert `-topmost` flag every poll cycle to recover from Windows losing the flag after display changes or sleep/wake
+
 ## [0.0.11] - 2026-03-19
 
 ### Fixed

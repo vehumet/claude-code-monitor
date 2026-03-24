@@ -481,11 +481,14 @@ class InstanceTracker:
             missing_hwnd = [inst for inst in self.instances.values()
                             if not inst.hwnd and inst.pid in seen_pids]
             if missing_hwnd:
-                tree = build_process_tree()
-                for inst in missing_hwnd:
-                    hwnd = find_window_for_pid(inst.pid, tree, inst.cwd)
-                    if hwnd:
-                        inst.hwnd = hwnd
+                try:
+                    tree = build_process_tree()
+                    for inst in missing_hwnd:
+                        hwnd = find_window_for_pid(inst.pid, tree, inst.cwd)
+                        if hwnd:
+                            inst.hwnd = hwnd
+                except Exception:
+                    _log.debug("hwnd resolution failed", exc_info=True)
 
         # Remove instances whose PID is gone
         for pid in list(self.instances):
@@ -627,13 +630,18 @@ class MonitorOverlay:
         self._save_position()
 
     def _poll_loop(self):
-        changed, events = self.tracker.poll()
-        if changed:
-            self._rebuild_rows()
-        if self.sound_enabled:
-            for ev in events:
-                self._play_sound(ev)
-        self.root.after(self.poll_ms, self._poll_loop)
+        try:
+            changed, events = self.tracker.poll()
+            if changed:
+                self._rebuild_rows()
+            if self.sound_enabled:
+                for ev in events:
+                    self._play_sound(ev)
+            self.root.wm_attributes("-topmost", True)
+        except Exception:
+            _log.exception("poll loop error")
+        finally:
+            self.root.after(self.poll_ms, self._poll_loop)
 
     @staticmethod
     def _play_sound(event: str):
@@ -653,30 +661,34 @@ class MonitorOverlay:
             threading.Thread(target=_play, daemon=True).start()
 
     def _blink_loop(self):
-        self._blink_phase = not self._blink_phase
-        now = time.monotonic()
-        for row in self.row_widgets:
-            inst: Instance = row.get("instance")
-            if not inst:
-                continue
-            if inst.state == "done":
-                if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
-                    color = THEME["done"] if self._blink_phase else THEME["bg"]
-                else:
-                    color = THEME["done"]
-                row["dot"].config(fg=color)
-                row["state"].config(fg=color)
-            elif inst.state == "interrupted":
-                if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
-                    color = THEME["interrupted"] if self._blink_phase else THEME["bg"]
-                else:
-                    color = THEME["interrupted"]
-                row["dot"].config(fg=color)
-                row["state"].config(fg=color)
-            elif inst.state == "question":
-                row["dot"].config(fg=THEME["question"])
-                row["state"].config(fg=THEME["question"])
-        self.root.after(self.blink_ms, self._blink_loop)
+        try:
+            self._blink_phase = not self._blink_phase
+            now = time.monotonic()
+            for row in self.row_widgets:
+                inst: Instance = row.get("instance")
+                if not inst:
+                    continue
+                if inst.state == "done":
+                    if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
+                        color = THEME["done"] if self._blink_phase else THEME["bg"]
+                    else:
+                        color = THEME["done"]
+                    row["dot"].config(fg=color)
+                    row["state"].config(fg=color)
+                elif inst.state == "interrupted":
+                    if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
+                        color = THEME["interrupted"] if self._blink_phase else THEME["bg"]
+                    else:
+                        color = THEME["interrupted"]
+                    row["dot"].config(fg=color)
+                    row["state"].config(fg=color)
+                elif inst.state == "question":
+                    row["dot"].config(fg=THEME["question"])
+                    row["state"].config(fg=THEME["question"])
+        except Exception:
+            _log.exception("blink loop error")
+        finally:
+            self.root.after(self.blink_ms, self._blink_loop)
 
     def _rebuild_rows(self):
         for row in self.row_widgets:
