@@ -88,6 +88,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/src/write-state.py\" \"question\"",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

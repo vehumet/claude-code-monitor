@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.13] - 2026-04-23
+
+### Fixed
+
+- Catch tool permission prompts (Bash/Write/Edit etc.) via `Notification:permission_prompt` matcher and surface them as the `question` state — previously only `AskUserQuestion`/`ExitPlanMode` PreToolUse matchers fired, so generic permission dialogs went unnoticed
+
 ## [0.0.12] - 2026-03-24
 
 ### Fixed
