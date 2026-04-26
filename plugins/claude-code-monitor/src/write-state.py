@@ -4,7 +4,10 @@
 Usage (from hook script):
     echo "$INPUT" | python write-state.py <state>
 
-States: working, done, question, interrupted
+Direct states: working, done, question, interrupted
+Meta-states (resolved from hook payload + prior state):
+    idle_prompt   — Notification:idle_prompt. interrupted if prev=working, else skip.
+    tool_failure  — PostToolUseFailure. interrupted only if is_interrupt=true.
 """
 import json
 import logging
@@ -327,6 +330,30 @@ def main():
     captured_hwnd = _capture_foreground_hwnd(my_pid, tree, is_user_prompt=is_user_prompt)
     if captured_hwnd is None and existing:
         captured_hwnd = existing.get("hwnd")
+
+    # Resolve meta-states based on prior state + payload
+    # idle_prompt: 텍스트 생성 중 ESC vs 단순 유휴 구분.
+    #   prev=working  → interrupted (ESC로 생성 중단된 것으로 추정)
+    #   prev=그 외    → skip (done/idle/question을 덮어쓰지 않음)
+    if state == "idle_prompt":
+        prev = existing.get("state") if existing else None
+        if prev == "working":
+            state = "interrupted"
+            _log.debug("=> idle_prompt resolved to 'interrupted' (prev=working)")
+        else:
+            _log.debug("=> idle_prompt skipped (prev=%s, not working)", prev)
+            return
+
+    # tool_failure: PostToolUseFailure 훅 payload의 is_interrupt 플래그로 분기.
+    #   is_interrupt=true → interrupted (도구 실행 중 ESC)
+    #   그 외             → skip (일반 도구 실패는 Claude가 이어감)
+    if state == "tool_failure":
+        if hook_data.get("is_interrupt"):
+            state = "interrupted"
+            _log.debug("=> tool_failure resolved to 'interrupted' (is_interrupt=true)")
+        else:
+            _log.debug("=> tool_failure skipped (is_interrupt not set)")
+            return
 
     # Guard: catch-all "working"이 동시 실행된 "question"을 덮어쓰는 것을 방지
     # PreToolUse에서 catch-all("working")과 specific("question") 훅이 동시에 실행됨

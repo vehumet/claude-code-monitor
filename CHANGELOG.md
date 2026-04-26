@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.14] - 2026-04-26
+
+### Added
+
+- `StopFailure` hook → `interrupted` state for API errors (rate limit, server error, billing, auth, etc.)
+- `PostToolUseFailure` hook → resolves to `interrupted` only when the payload carries `is_interrupt: true` (catches ESC during tool execution)
+
+### Changed
+
+- `Notification:idle_prompt` is now a meta-state: resolved to `interrupted` only when the prior state is `working` (likely ESC during text generation); skipped otherwise to stop overwriting `done`/`idle`/`question` with spurious "interrupted" after a session sits idle for ~60s
+
 ## [0.0.13] - 2026-04-23
 
 ### Fixed
