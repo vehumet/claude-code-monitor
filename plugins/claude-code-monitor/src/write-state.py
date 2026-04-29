@@ -444,6 +444,45 @@ def main():
 
     wezterm_info = _resolve_wezterm_info(existing)
 
+    # session_start: capture wezterm info immediately so click-to-focus works
+    # before the user sends any prompt. Don't change state — only attach the
+    # wezterm field. Outside wezterm this is a no-op.
+    if state == "session_start":
+        if wezterm_info is None:
+            _log.debug("=> session_start: not in wezterm, skipping")
+            return
+        if existing and existing.get("wezterm") == wezterm_info:
+            _log.debug("=> session_start: wezterm info unchanged, skipping")
+            return
+        if existing:
+            state_data = dict(existing)
+            state_data["wezterm"] = wezterm_info
+            state_data["updatedAt"] = now
+        else:
+            state_data = {
+                "pid": pid,
+                "state": "idle",
+                "cwd": matched_cwd,
+                "updatedAt": now,
+                "wezterm": wezterm_info,
+            }
+        _log.debug("=> session_start: writing wezterm info pid=%s", pid)
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f)
+                os.replace(tmp_path, state_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            _log.error("Failed to write state file %s", state_file, exc_info=True)
+        return
+
     # Skip write if state unchanged AND wezterm info unchanged
     # (catch-all이 매 도구마다 호출되므로 필수 최적화)
     if existing and existing.get("state") == state:
