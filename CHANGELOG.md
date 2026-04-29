@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.15] - 2026-04-29
+
+### Added
+
+- WezTerm click-to-focus: when a Claude Code instance runs inside a wezterm pane, the monitor now switches directly to that pane on click. Pane is identified via `WEZTERM_PANE`/`WEZTERM_UNIX_SOCKET` env vars and `wezterm cli list` query at hook time; click handler runs `wezterm cli activate-tab` with the captured socket and raises the GUI window via Win32. Falls back to the existing process-tree window search outside wezterm. Zero configuration — no wezterm.lua changes required.
+
 ## [0.0.14] - 2026-04-26
 
 ### Added
