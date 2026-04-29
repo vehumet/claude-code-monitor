@@ -13,6 +13,8 @@ import json
 import logging
 import logging.handlers
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -144,6 +146,68 @@ def _capture_foreground_hwnd(my_pid, tree, is_user_prompt=False):
         return None
     except Exception:
         return None
+
+
+_WEZTERM_CLI_TIMEOUT = 2
+_CREATE_NO_WINDOW = 0x08000000  # subprocess flag — suppress console flash on Windows
+
+
+def _resolve_wezterm_info(existing):
+    """If running inside wezterm, return {pane_id, tab_id, window_id, socket}.
+
+    Reuses cached info from *existing* state when pane_id+socket match, to avoid
+    re-running `wezterm cli list` on every hook invocation.
+    """
+    pane_id_str = os.environ.get("WEZTERM_PANE")
+    socket = os.environ.get("WEZTERM_UNIX_SOCKET")
+    if not pane_id_str or not socket:
+        return None
+    try:
+        pane_id = int(pane_id_str)
+    except (TypeError, ValueError):
+        return None
+
+    if existing and isinstance(existing.get("wezterm"), dict):
+        cached = existing["wezterm"]
+        if cached.get("pane_id") == pane_id and cached.get("socket") == socket:
+            return cached
+
+    try:
+        env = os.environ.copy()
+        env["WEZTERM_UNIX_SOCKET"] = socket
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": env,
+            "timeout": _WEZTERM_CLI_TIMEOUT,
+        }
+        if IS_WINDOWS:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["wezterm", "cli", "list", "--format", "json"], **kwargs
+        )
+        if result.returncode != 0:
+            _log.debug("wezterm cli list rc=%s stderr=%s",
+                       result.returncode, (result.stderr or "")[:200])
+            return None
+        panes = json.loads(result.stdout)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        _log.debug("wezterm cli list failed", exc_info=True)
+        return None
+
+    for p in panes:
+        if p.get("pane_id") == pane_id:
+            return {
+                "pane_id": pane_id,
+                "tab_id": p.get("tab_id"),
+                "window_id": p.get("window_id"),
+                "socket": socket,
+            }
+    return None
 
 
 def get_state_dir():
@@ -378,10 +442,15 @@ def main():
                     existing.get("state"))
         return
 
-    # Skip write if state unchanged (catch-all이 매 도구마다 호출되므로 필수 최적화)
+    wezterm_info = _resolve_wezterm_info(existing)
+
+    # Skip write if state unchanged AND wezterm info unchanged
+    # (catch-all이 매 도구마다 호출되므로 필수 최적화)
     if existing and existing.get("state") == state:
-        _log.debug("=> State unchanged (%s), skipping write", state)
-        return
+        existing_wt = existing.get("wezterm") if isinstance(existing.get("wezterm"), dict) else None
+        if wezterm_info == existing_wt:
+            _log.debug("=> State unchanged (%s), skipping write", state)
+            return
 
     state_data = {
         "pid": pid,
@@ -391,6 +460,8 @@ def main():
     }
     if captured_hwnd is not None:
         state_data["hwnd"] = captured_hwnd
+    if wezterm_info is not None:
+        state_data["wezterm"] = wezterm_info
 
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 

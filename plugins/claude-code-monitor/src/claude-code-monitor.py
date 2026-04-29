@@ -14,6 +14,8 @@ import json
 import logging
 import logging.handlers
 import os
+import re
+import subprocess
 import sys
 import glob
 import time
@@ -378,7 +380,7 @@ def short_cwd(cwd: str) -> str:
 
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
-                 "blink_on", "done_since", "hwnd")
+                 "blink_on", "done_since", "hwnd", "wezterm")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0):
         self.pid = pid
@@ -389,6 +391,7 @@ class Instance:
         self.blink_on = True
         self.done_since = 0.0
         self.hwnd = 0
+        self.wezterm = None
 
 
 class InstanceTracker:
@@ -450,12 +453,15 @@ class InstanceTracker:
                 state = st.get("state", "working")
                 updated_at = st.get("updatedAt", 0)
                 saved_hwnd = st.get("hwnd", 0)
+                saved_wezterm = st.get("wezterm")
             except Exception:
                 continue
 
             if pid in self.instances:
                 inst = self.instances[pid]
                 inst.hwnd = saved_hwnd or inst.hwnd
+                if isinstance(saved_wezterm, dict):
+                    inst.wezterm = saved_wezterm
                 if inst.state != state or inst.updated_at != updated_at:
                     old_state = inst.state
                     inst.state = state
@@ -767,6 +773,10 @@ class MonitorOverlay:
         try:
             inst = self.tracker.instances.get(claude_pid)
 
+            # wezterm 페인 우선 — pane_id 기반 정확 매칭
+            if inst and inst.wezterm and self._activate_wezterm_pane(inst.wezterm):
+                return
+
             # 저장된 HWND 우선 사용
             if inst and inst.hwnd:
                 user32 = ctypes.windll.user32
@@ -786,6 +796,81 @@ class MonitorOverlay:
                 _log.warning("_activate_terminal: no hwnd found for pid=%d", claude_pid)
         except Exception:
             _log.error("_activate_terminal failed for pid=%d", claude_pid, exc_info=True)
+
+    def _activate_wezterm_pane(self, wezterm_info: dict) -> bool:
+        """Activate wezterm tab via cli + raise GUI window. Returns True if tab activated."""
+        tab_id = wezterm_info.get("tab_id")
+        socket = wezterm_info.get("socket")
+        if tab_id is None or not socket:
+            return False
+
+        try:
+            env = os.environ.copy()
+            env["WEZTERM_UNIX_SOCKET"] = socket
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "env": env,
+                "timeout": 2,
+            }
+            if IS_WINDOWS:
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            result = subprocess.run(
+                ["wezterm", "cli", "activate-tab", "--tab-id", str(tab_id)], **kwargs
+            )
+            if result.returncode != 0:
+                _log.debug("wezterm activate-tab rc=%s stderr=%s",
+                           result.returncode, (result.stderr or "")[:200])
+                return False
+        except FileNotFoundError:
+            _log.debug("wezterm.exe not on PATH")
+            return False
+        except Exception:
+            _log.debug("wezterm activate-tab failed", exc_info=True)
+            return False
+
+        # OS 윈도우 raise — wezterm cli는 윈도우를 foreground로 올리지 않음 (issue #5855)
+        if IS_WINDOWS:
+            gui_pid = self._extract_wezterm_gui_pid(socket)
+            if gui_pid:
+                hwnd = self._find_wezterm_hwnd(gui_pid)
+                if hwnd:
+                    activate_window(hwnd)
+        return True
+
+    @staticmethod
+    def _extract_wezterm_gui_pid(socket_path: str) -> int | None:
+        """Parse 'gui-sock-<pid>' substring to recover wezterm-gui PID."""
+        m = re.search(r"gui-sock-(\d+)", socket_path or "")
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _find_wezterm_hwnd(gui_pid: int) -> int | None:
+        """Find a visible top-level window owned by the wezterm GUI process."""
+        if not IS_WINDOWS:
+            return None
+        user32 = ctypes.windll.user32
+        found = []
+
+        def cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetWindowTextLengthW(hwnd) <= 0:
+                return True
+            w_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+            if w_pid.value == gui_pid:
+                found.append(hwnd)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        try:
+            user32.EnumWindows(WNDENUMPROC(cb), 0)
+        except Exception:
+            return None
+        return found[0] if found else None
 
     def run(self):
         self.root.mainloop()
