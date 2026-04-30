@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.16] - 2026-04-30
+
+### Fixed
+
+- `question` state stuck after permission prompt approval: added `PostToolUse` catch-all matcher → `working`, so the overlay returns to `working` immediately when a permission-gated tool finishes (Claude Code does not expose a "user responded to permission_prompt" event, so the tool-completion signal is the earliest reliable hook for the approve case)
+
 ## [0.0.15] - 2026-04-29
 
 ### Added
