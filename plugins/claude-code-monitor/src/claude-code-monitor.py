@@ -8,7 +8,7 @@ Usage:
 No external dependencies — stdlib + tkinter + ctypes only.
 """
 
-__version__ = "0.0.15"
+__version__ = "0.0.16"
 
 import json
 import logging
