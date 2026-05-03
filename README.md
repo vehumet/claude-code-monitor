@@ -1,77 +1,35 @@
 # Claude Code Monitor
 
-> Real-time overlay widget showing the status of all active Claude Code instances.
+Always-on-top overlay widget that shows the live status of every Claude Code session running on your machine.
 
-![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)
+Built with Claude Code, for personal use. Tested on Windows; other platforms work in part but aren't a focus.
 
-![Claude Code Monitor Demo](docs/cm_demo.webp)
+![demo](docs/cm_demo.webp)
 
-## Features
+## What it shows
 
-- **4 states** displayed in real-time: Working (green), Done (blue), Waiting for input (yellow), Idle (grey)
-- **Sound notifications** when tasks complete or questions arise (Windows)
-- **Click to focus** — click any instance row to bring its terminal window to the foreground
-- **Drag to reposition** — position is saved between sessions
-- **Zero dependencies** — Python stdlib only (tkinter + ctypes)
-- **Multi-instance** — monitors all active Claude Code sessions simultaneously
+Each row is one Claude Code session: a colour dot for state, the project folder + slot number, a short Haiku-generated topic summary, and the state label.
 
-## Requirements
+| State | Meaning |
+|---|---|
+| Working | Claude is generating or running a tool |
+| Done | Response finished |
+| Waiting | Claude is asking you a question |
+| Interrupted | Stopped via ESC or error |
+| Idle | Session open, no activity |
 
-- **Python 3.10+** with tkinter (included in standard Python installers)
-- **Windows 10/11** (primary) | macOS/Linux (partial — no sound or window focus, **untested**)
-- **Claude Code CLI**
+Click a row to focus that terminal. Drag the bar to move the widget; the position is remembered.
 
-## Project Structure
+## Install
 
-```
-claude-code-monitor/
-├── .claude-plugin/
-│   └── marketplace.json
-├── plugins/
-│   └── claude-code-monitor/
-│       ├── .claude-plugin/plugin.json
-│       ├── commands/
-│       │   ├── monitor.md
-│       │   └── update.md          # /claude-code-monitor:update slash command
-│       ├── hooks/hooks.json
-│       ├── src/
-│       │   ├── claude-code-monitor.py
-│       │   ├── write-state.py
-│       │   ├── start-monitor.vbs
-│       │   └── start.sh
-│       ├── install.py
-│       └── uninstall.py
-├── scripts/
-│   └── bump-version.py            # version bump utility
-├── CHANGELOG.md
-├── LICENSE
-└── README.md
-```
-
-## Installation
-
-### Option A: Claude Code Plugin (Recommended)
-
-> Note: Plugin support depends on Claude Code's plugin system availability.
+Plugin install (recommended):
 
 ```bash
-# Add the marketplace
 claude plugin marketplace add vehumet/claude-code-monitor
-
-# Install the plugin
 claude plugin install claude-code-monitor
 ```
 
-Or test locally:
-
-```bash
-git clone https://github.com/vehumet/claude-code-monitor.git
-claude --plugin-dir ./claude-code-monitor
-```
-
-### Option B: Standalone Install
+Standalone install:
 
 ```bash
 git clone https://github.com/vehumet/claude-code-monitor.git
@@ -79,185 +37,48 @@ cd claude-code-monitor
 python plugins/claude-code-monitor/install.py
 ```
 
-This will:
-1. Copy monitor files to `~/.claude/monitor/`
-2. Copy the hook script to `~/.claude/hooks/`
-3. Merge hook entries into `~/.claude/settings.json` (with backup)
-4. Install the `/monitor` slash command
+Requires Python 3.10+ with tkinter (bundled with the standard installer) and the Claude Code CLI.
 
-Preview changes without modifying anything:
+## Run
 
-```bash
-python plugins/claude-code-monitor/install.py --dry-run
-```
-
-## Usage
-
-### Launch the monitor
-
-In Claude Code:
+In a Claude Code session:
 
 ```
-# Plugin mode
 /claude-code-monitor:monitor
-
-# Standalone mode
-/monitor
 ```
 
-Or manually:
+Or directly:
 
 ```bash
-# Windows (recommended — runs as independent process)
+# Windows — survives shell exit
 cscript //nologo "%USERPROFILE%\.claude\monitor\start-monitor.vbs"
 
 # Any platform
 pythonw ~/.claude/monitor/claude-code-monitor.py
 ```
 
-### How it works
+## Config
 
-```
-Claude Code Instance          Hooks (write-state.py)         Monitor Overlay
-┌──────────────────┐         ┌────────────────────┐         ┌──────────────┐
-│ User sends prompt│────────>│ UserPromptSubmit   │────────>│ ● project1   │
-│                  │         │   -> "working"     │         │   Working    │
-│ AI is working... │         │                    │         │              │
-│                  │         │ Stop               │         │ ● project2   │
-│ Task complete    │────────>│   -> "done"        │────────>│   Done       │
-│                  │         │                    │         │              │
-│ AI asks question │         │ PreToolUse         │         │              │
-│ (AskUserQuestion)│────────>│   -> "question"    │────────>│              │
-└──────────────────┘         └────────────────────┘         └──────────────┘
-                                    │                              ▲
-                                    │  ~/.claude/monitor/state/    │
-                                    │     {pid}.json               │
-                                    └──────────────────────────────┘
-                                          (polled every 500ms)
-```
-
-State files in `~/.claude/monitor/state/` are JSON:
-
-```json
-{"pid": 12345, "state": "working", "cwd": "/path/to/project", "updatedAt": 1710500000}
-```
-
-The overlay reads Claude Code session files (`~/.claude/sessions/*.json`) to discover instances, and state files to display their current status.
-
-## Configuration
-
-Create `~/.claude/monitor/config.json` to customize behavior:
+Optional `~/.claude/monitor/config.json`:
 
 ```json
 {
-  "language": "en",
+  "language": "ko",
   "opacity": 0.65,
-  "width": 260,
-  "poll_interval_ms": 500,
-  "blink_interval_ms": 600,
+  "summary_max_chars": 12,
   "sound_enabled": true
 }
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `language` | `"en"` | UI language: `"en"` or `"ko"` |
-| `opacity` | `0.65` | Window transparency (0.0 - 1.0) |
-| `width` | `260` | Overlay width in pixels |
-| `poll_interval_ms` | `500` | How often to check for state changes |
-| `blink_interval_ms` | `600` | Blink speed for new "Done" notifications |
-| `sound_enabled` | `true` | Play sound on Done/Question events (Windows only) |
-
-All fields are optional — omitted fields use defaults.
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_MONITOR_STATE_DIR` | `~/.claude/monitor/state/` | Override state file directory |
-
-## Troubleshooting
-
-### Monitor doesn't show any instances
-
-- Ensure Claude Code is running and has active sessions
-- Check that `~/.claude/sessions/` contains session JSON files
-- Verify Python has tkinter: `python -c "import tkinter"`
-
-### Hooks not triggering
-
-- Check `~/.claude/settings.json` contains the hook entries (search for `write-state.py`)
-- Verify `~/.claude/hooks/write-state.py` exists and is readable
-
-### Monitor closes when terminal closes (Windows)
-
-- Use the VBS launcher instead of running Python directly:
-  ```
-  cscript //nologo "%USERPROFILE%\.claude\monitor\start-monitor.vbs"
-  ```
-- The VBS script spawns an independent process that survives shell exit
-
-### Sound not working
-
-- Sound notifications use Windows `winsound.Beep` — not available on macOS/Linux
-- Set `"sound_enabled": false` in config.json to disable
-
-## Updating
-
-In Claude Code, use the slash command:
-
-```
-/claude-code-monitor:update
-```
-
-This will pull the latest marketplace data, update the plugin, and guide you to restart the session.
-
-### Manual update
-
-```bash
-# 1. Update the marketplace data
-claude plugin marketplace update claude-code-monitor-marketplace
-
-# 2. Update the plugin
-claude plugin update claude-code-monitor@claude-code-monitor-marketplace
-```
-
-Restart your Claude Code session after updating.
-
-## Development
-
-### Version bumping
-
-Versions are tracked in 3 files. Use the bump script to keep them in sync:
-
-```bash
-python scripts/bump-version.py patch          # 0.0.2 -> 0.0.3
-python scripts/bump-version.py minor          # 0.0.2 -> 0.1.0
-python scripts/bump-version.py major          # 0.0.2 -> 1.0.0
-python scripts/bump-version.py 1.2.3          # set explicit version
-```
-
-CI will fail if any of the 3 version sources are out of sync.
+Language is auto-detected from the OS locale (`ko` on Korean systems, `en` otherwise) — set it explicitly to override. `summary_max_chars` controls both the summary column width and the cap passed to Haiku.
 
 ## Uninstall
 
-### Plugin mode
-
 ```bash
 claude plugin uninstall claude-code-monitor
-claude plugin marketplace remove vehumet/claude-code-monitor
-```
-
-### Standalone mode
-
-```bash
-cd claude-code-monitor
+# or, for standalone:
 python plugins/claude-code-monitor/uninstall.py
 ```
-
-Options:
-- `--dry-run` — preview without modifying files
-- `--keep-config` — preserve `config.json` and `position.json`
 
 ## License
 
