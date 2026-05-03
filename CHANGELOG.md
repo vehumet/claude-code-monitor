@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.17] - 2026-05-03
+
+### Added
+
+- Per-cwd slot number anchor (`①` ~ `⑳`, fallback `[N]` above 20) assigned at first hook invocation and stable for the session lifetime. Replaces the legacy `(1)(2)` numeric suffix that was reassigned whenever sessions came and went.
+- Background Haiku 4.5 summarization on `Stop` hook: a detached subprocess re-invokes `write-state.py __summarize__ <pid>`, reads the session JSONL, calls `claude -p ... --model claude-haiku-4-5`, and merges a 12-character Korean noun-phrase label into the state file. Refresh policy: trim/empty → run on next Stop; existing Haiku label → re-run only if 5+ minutes have elapsed.
+- `UserPromptSubmit` interim label: when no Haiku label exists yet (or the previous label came from this same trim path), the first non-tag line of the user prompt is captured (≤18 chars, ellipsized) so the new session shows something meaningful before the first Stop fires.
+- Empty-session placeholder: brand-new sessions display `New` until either the trim or Haiku path stamps a real label.
+
+### Changed
+
+- Display format is now `folder · ① · subtitle` (subtitle = Haiku summary, trim fallback, or `New`). The slot glyph is always shown — even for a single session in a folder — to keep labels stable when a second session opens later.
+- State JSON gains `slot`, `summary`, `summarySource` (`new`/`trim`/`haiku`), `summaryAt`, `summaryMsgCount`, `summarySessionId`. Existing fields are preserved across writes.
+
 ## [0.0.16] - 2026-04-30
 
 ### Fixed
