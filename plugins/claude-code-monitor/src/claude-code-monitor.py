@@ -125,11 +125,44 @@ DONE_BLINK_SECONDS = 5  # "done" blinks for this long, then stays solid
 
 # ── Config ────────────────────────────────────────────────────────
 
+def _detect_system_language():
+    """Best-effort detect 'ko' for Korean systems, otherwise 'en'.
+
+    Tries Windows UI language → POSIX locale → LANG env var. Anything that
+    isn't recognisably Korean falls through to English.
+    """
+    if IS_WINDOWS:
+        try:
+            # LCID low byte 0x12 = Korean (Hangul)
+            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            if (lcid & 0xff) == 0x12:
+                return "ko"
+        except Exception:
+            pass
+    try:
+        import locale
+        loc = (locale.getlocale()[0] or "").lower()
+    except Exception:
+        loc = ""
+    if not loc:
+        for v in ("LC_ALL", "LC_MESSAGES", "LANG"):
+            val = os.environ.get(v, "")
+            if val:
+                loc = val.lower()
+                break
+    if "ko" in loc or "korean" in loc:
+        return "ko"
+    return "en"
+
+
 def _default_config():
     return {
-        "language": "en",
+        "language": _detect_system_language(),
         "opacity": 0.65,
-        "width": 260,
+        # Number of Korean-width chars reserved for the summary column.
+        # The widget width is derived from this; write-state.py reads the same
+        # value to cap Haiku output to what will actually fit on screen.
+        "summary_max_chars": 12,
         "poll_interval_ms": 500,
         "blink_interval_ms": 600,
         "sound_enabled": True,
@@ -194,6 +227,76 @@ def is_pid_alive(pid: int) -> bool:
             return False
         except PermissionError:
             return True  # process exists but we lack permission
+
+
+def is_claude_pid_alive(pid: int) -> bool:
+    """True iff PID is alive AND its exe is claude.exe (defends against reuse)."""
+    if not IS_WINDOWS:
+        return is_pid_alive(pid)
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        ec = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(ec)) or ec.value != STILL_ACTIVE:
+            return False
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return False
+        return buf.value.lower().endswith("claude.exe")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def load_nested_pids(state_root: str) -> set:
+    """Load PIDs marked nested by our summarizer; clean up stale markers."""
+    d = os.path.join(state_root, "nested-pids")
+    if not os.path.isdir(d):
+        return set()
+    alive = set()
+    for fn in os.listdir(d):
+        if not fn.endswith(".flag"):
+            continue
+        try:
+            pid = int(fn[:-5])
+        except ValueError:
+            continue
+        if is_pid_alive(pid):
+            alive.add(pid)
+        else:
+            try:
+                os.remove(os.path.join(d, fn))
+            except OSError:
+                pass
+    return alive
+
+
+def is_nested_claude_pid(pid: int, tree: dict, marker_pids: set) -> bool:
+    """True if PID is itself a marker or an ancestor is a marker / claude.exe.
+
+    Used to filter out short-lived `claude -p` subprocesses spawned by our
+    background summarizer — they create a sessions/*.json file but should
+    never appear as a top-level user instance.
+    """
+    if pid in marker_pids:
+        return True
+    if not tree or pid not in tree:
+        return False
+    visited = set()
+    cur = tree[pid][0]  # parent
+    while cur and cur not in visited:
+        visited.add(cur)
+        if cur in marker_pids:
+            return True
+        entry = tree.get(cur)
+        if not entry:
+            break
+        if entry[1] == "claude.exe":
+            return True
+        cur = entry[0]
+    return False
 
 
 def build_process_tree():
@@ -376,18 +479,50 @@ def short_cwd(cwd: str) -> str:
     return os.path.basename(cwd.rstrip("/\\"))
 
 
+_FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
+
+
+def slot_glyph(slot) -> str:
+    """Render a slot number as '(N)'; empty when slot is unset/zero."""
+    if not isinstance(slot, int) or slot < 1:
+        return ""
+    return f"({slot})"
+
+
+def build_folder_head(cwd, slot):
+    """Compose 'folder(N)' / 'folder' (folder capped to _FOLDER_MAX_CHARS)."""
+    base = short_cwd(cwd)
+    if len(base) > _FOLDER_MAX_CHARS:
+        base = base[:_FOLDER_MAX_CHARS - 3] + "..."
+    glyph = slot_glyph(slot)
+    return f"{base}{glyph}" if glyph else base
+
+
+def build_summary_text(summary):
+    """Subtitle text shown in the summary column."""
+    return (summary or "").strip() or "New"
+
+
+def build_display_name(cwd, slot, summary):
+    """Composite label used for sorting and tooltips."""
+    return f"{build_folder_head(cwd, slot)}  {build_summary_text(summary)}"
+
+
 # ── InstanceTracker ───────────────────────────────────────────────
 
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
-                 "blink_on", "done_since", "hwnd", "wezterm")
+                 "blink_on", "done_since", "hwnd", "wezterm",
+                 "slot", "summary")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0):
         self.pid = pid
         self.cwd = cwd
         self.state = state
         self.updated_at = updated_at
-        self.display_name = short_cwd(cwd)
+        self.slot = 0
+        self.summary = ""
+        self.display_name = build_display_name(cwd, 0, "")
         self.blink_on = True
         self.done_since = 0.0
         self.hwnd = 0
@@ -408,6 +543,9 @@ class InstanceTracker:
         changed = False
         events = []
         seen_pids = set()
+        proc_tree = build_process_tree() if IS_WINDOWS else {}
+        # nested-pids dir lives one level above state_dir (under monitor/)
+        marker_pids = load_nested_pids(os.path.dirname(self.state_dir))
 
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
             try:
@@ -420,7 +558,7 @@ class InstanceTracker:
             except Exception:
                 continue
 
-            if not is_pid_alive(pid):
+            if not is_claude_pid_alive(pid):
                 if pid in self.instances:
                     del self.instances[pid]
                     changed = True
@@ -435,6 +573,10 @@ class InstanceTracker:
                     pass
                 continue
 
+            # Skip nested `claude -p` subprocesses (e.g. our own summarizer).
+            if IS_WINDOWS and is_nested_claude_pid(pid, proc_tree, marker_pids):
+                continue
+
             seen_pids.add(pid)
 
             if pid not in self.instances:
@@ -442,7 +584,6 @@ class InstanceTracker:
                 changed = True
             elif self.instances[pid].cwd != cwd:
                 self.instances[pid].cwd = cwd
-                self.instances[pid].display_name = short_cwd(cwd)
                 changed = True
 
         for sf in glob.glob(os.path.join(self.state_dir, "*.json")):
@@ -454,7 +595,18 @@ class InstanceTracker:
                 updated_at = st.get("updatedAt", 0)
                 saved_hwnd = st.get("hwnd", 0)
                 saved_wezterm = st.get("wezterm")
+                saved_slot = st.get("slot", 0)
+                saved_summary = st.get("summary", "")
             except Exception:
+                continue
+
+            # Cleanup orphan state files for dead PIDs (sessions/*.json may have
+            # been removed earlier without removing the matching state JSON).
+            if not is_claude_pid_alive(pid):
+                try:
+                    os.remove(sf)
+                except OSError:
+                    pass
                 continue
 
             if pid in self.instances:
@@ -462,6 +614,12 @@ class InstanceTracker:
                 inst.hwnd = saved_hwnd or inst.hwnd
                 if isinstance(saved_wezterm, dict):
                     inst.wezterm = saved_wezterm
+                if isinstance(saved_slot, int) and saved_slot != inst.slot:
+                    inst.slot = saved_slot
+                    changed = True
+                if saved_summary != inst.summary:
+                    inst.summary = saved_summary
+                    changed = True
                 if inst.state != state or inst.updated_at != updated_at:
                     old_state = inst.state
                     inst.state = state
@@ -502,21 +660,9 @@ class InstanceTracker:
                 del self.instances[pid]
                 changed = True
 
-        # Deduplicate display names
-        name_counts: dict[str, int] = {}
+        # Compose display names from cwd + slot + summary
         for inst in self.instances.values():
-            base = short_cwd(inst.cwd)
-            name_counts[base] = name_counts.get(base, 0) + 1
-
-        name_seen: dict[str, int] = {}
-        for inst in sorted(self.instances.values(), key=lambda i: i.pid):
-            base = short_cwd(inst.cwd)
-            if name_counts[base] > 1:
-                idx = name_seen.get(base, 0) + 1
-                name_seen[base] = idx
-                new_name = f"{base} ({idx})"
-            else:
-                new_name = base
+            new_name = build_display_name(inst.cwd, inst.slot, inst.summary)
             if inst.display_name != new_name:
                 inst.display_name = new_name
                 changed = True
@@ -534,11 +680,14 @@ class MonitorOverlay:
     def __init__(self):
         self.poll_ms = CONFIG.get("poll_interval_ms", 500)
         self.blink_ms = CONFIG.get("blink_interval_ms", 600)
-        self.width = CONFIG.get("width", 260)
+        self.summary_max_chars = max(4, int(CONFIG.get("summary_max_chars", 12)))
         self.sound_enabled = CONFIG.get("sound_enabled", True)
-        self.row_height = 28
-        self.header_height = 24
-        self.padding = 6
+        # Suppress sound + blink for whatever state already exists when the
+        # widget first opens — those events happened before we were watching.
+        self._first_poll = True
+        self.row_height = 22
+        self.header_height = 22
+        self.padding = 4
 
         self.tracker = InstanceTracker()
         self.root = tk.Tk()
@@ -547,6 +696,59 @@ class MonitorOverlay:
         self.root.wm_attributes("-topmost", True)
         self.root.wm_attributes("-alpha", CONFIG.get("opacity", 0.65))
         self.root.configure(bg=THEME["bg"])
+
+        # Fonts (must precede width derivation that calls font.measure)
+        try:
+            self.font_title = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+            self.font_row = tkfont.Font(family="Segoe UI", size=9)
+            self.font_state = tkfont.Font(family="Segoe UI", size=8)
+            self.font_empty = tkfont.Font(family="Segoe UI", size=9, slant="italic")
+        except Exception:
+            self.font_title = tkfont.Font(size=9, weight="bold")
+            self.font_row = tkfont.Font(size=9)
+            self.font_state = tkfont.Font(size=8)
+            self.font_empty = tkfont.Font(size=9, slant="italic")
+
+        # Derive column widths and overall widget width.
+        # The widest possible folder head is "firstgame(99)" (folder cap + slot).
+        # The summary column reserves enough pixels for `summary_max_chars` of
+        # CJK width — the same N is passed to write-state.py so Haiku stays
+        # within the column.
+        self.col_dot_w = self.font_row.measure("●  ")
+        self.col_folder_w = self.font_row.measure("firstgame(99)") + 8
+        # No ellipsis padding — overflow is hidden via grid_propagate(False).
+        self.col_summary_w = self.font_row.measure("가") * self.summary_max_chars
+        self.col_state_w = self.font_state.measure("Working") + 12
+        self.outer_pad = 12
+        self.width = (
+            self.col_dot_w + self.col_folder_w
+            + self.col_summary_w + self.col_state_w + self.outer_pad
+        )
+
+        # Persist max-chars so write-state.py reads the same source-of-truth.
+        try:
+            cfg_path = os.path.join(
+                os.path.expanduser("~"), ".claude", "monitor", "config.json"
+            )
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cur = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                cur = {}
+            lang = CONFIG.get("language", "en")
+            dirty = False
+            if cur.get("summary_max_chars") != self.summary_max_chars:
+                cur["summary_max_chars"] = self.summary_max_chars
+                dirty = True
+            if cur.get("language") != lang:
+                cur["language"] = lang
+                dirty = True
+            if dirty:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(cur, f)
+        except Exception:
+            _log.debug("could not persist summary_max_chars", exc_info=True)
 
         # Position: load saved or default to bottom-right
         saved = self._load_position()
@@ -558,18 +760,6 @@ class MonitorOverlay:
             x = screen_w - self.width - 16
             y = screen_h - 200
         self.root.geometry(f"{self.width}x120+{x}+{y}")
-
-        # Fonts
-        try:
-            self.font_title = tkfont.Font(family="Segoe UI", size=9, weight="bold")
-            self.font_row = tkfont.Font(family="Segoe UI", size=9)
-            self.font_state = tkfont.Font(family="Segoe UI", size=8)
-            self.font_empty = tkfont.Font(family="Segoe UI", size=9, slant="italic")
-        except Exception:
-            self.font_title = tkfont.Font(size=9, weight="bold")
-            self.font_row = tkfont.Font(size=9)
-            self.font_state = tkfont.Font(size=8)
-            self.font_empty = tkfont.Font(size=9, slant="italic")
 
         # Top bar (close button only)
         self.header = tk.Frame(self.root, bg=THEME["bg"], height=20)
@@ -638,6 +828,14 @@ class MonitorOverlay:
     def _poll_loop(self):
         try:
             changed, events = self.tracker.poll()
+            if self._first_poll:
+                # Quench any state we inherited at startup so it doesn't blink
+                # or chime on the user.
+                for inst in self.tracker.instances.values():
+                    inst.done_since = 0.0
+                    inst.blink_on = False
+                events = []
+                self._first_poll = False
             if changed:
                 self._rebuild_rows()
             if self.sound_enabled:
@@ -701,7 +899,10 @@ class MonitorOverlay:
             row["frame"].destroy()
         self.row_widgets.clear()
 
-        instances = sorted(self.tracker.instances.values(), key=lambda i: i.pid)
+        instances = sorted(
+            self.tracker.instances.values(),
+            key=lambda i: (i.display_name.lower(), i.pid),
+        )
 
         if not instances:
             frame = tk.Frame(self.content, bg=THEME["bg"])
@@ -717,42 +918,84 @@ class MonitorOverlay:
                 self._add_row(inst)
 
         row_count = max(len(instances), 1)
-        height = self.header_height + row_count * self.row_height + self.padding + 6
+        height = self.header_height + row_count * self.row_height + self.padding
         geo = self.root.geometry()
         parts = geo.split("+")
         x_pos = parts[1] if len(parts) > 1 else "0"
         y_pos = parts[2] if len(parts) > 2 else "0"
         self.root.geometry(f"{self.width}x{height}+{x_pos}+{y_pos}")
 
+    def _fit_label(self, text: str, max_pixels: int) -> str:
+        """Trim text with '\u2026' if it would exceed max_pixels rendered in font_row."""
+        font = self.font_row
+        if max_pixels <= 0 or font.measure(text) <= max_pixels:
+            return text
+        while text and font.measure(text + "\u2026") > max_pixels:
+            text = text[:-1]
+        return text.rstrip() + "\u2026"
+
     def _add_row(self, inst: Instance):
         state_color = THEME.get(inst.state, THEME["idle"])
         state_text = get_label(inst.state)
 
         frame = tk.Frame(self.content, bg=THEME["bg"], cursor="hand2")
-        frame.pack(fill=tk.X, pady=1)
+        frame.pack(fill=tk.X, pady=0)
+
+        # Grid columns: dot | folder(N) | summary | state
+        frame.grid_columnconfigure(0, minsize=self.col_dot_w)
+        frame.grid_columnconfigure(1, minsize=self.col_folder_w)
+        frame.grid_columnconfigure(2, minsize=self.col_summary_w, weight=1)
+        frame.grid_columnconfigure(3, minsize=self.col_state_w)
 
         dot = tk.Label(
             frame, text="\u25cf", font=self.font_row,
-            bg=THEME["bg"], fg=state_color, width=2,
+            bg=THEME["bg"], fg=state_color,
         )
-        dot.pack(side=tk.LEFT)
+        dot.grid(row=0, column=0, sticky="w", padx=(4, 0))
 
-        name_lbl = tk.Label(
-            frame, text=inst.display_name, font=self.font_row,
-            bg=THEME["bg"], fg=THEME["fg"], anchor="w",
+        cell_h = self.row_height - 2
+
+        folder_box = tk.Frame(
+            frame, bg=THEME["bg"],
+            width=self.col_folder_w, height=cell_h,
         )
-        name_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        folder_box.grid(row=0, column=1, sticky="w")
+        folder_box.grid_propagate(False)
+        folder_box.pack_propagate(False)
+        folder_lbl = tk.Label(
+            folder_box, text=build_folder_head(inst.cwd, inst.slot),
+            font=self.font_row, bg=THEME["bg"], fg=THEME["fg"], anchor="w",
+        )
+        folder_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        summary_box = tk.Frame(
+            frame, bg=THEME["bg"],
+            width=self.col_summary_w, height=cell_h,
+        )
+        summary_box.grid(row=0, column=2, sticky="w")
+        summary_box.grid_propagate(False)
+        summary_box.pack_propagate(False)
+        summary_lbl = tk.Label(
+            summary_box, text=build_summary_text(inst.summary),
+            font=self.font_row, bg=THEME["bg"], fg=THEME["dim"], anchor="w",
+        )
+        summary_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         state_lbl = tk.Label(
             frame, text=state_text, font=self.font_state,
-            bg=THEME["bg"], fg=state_color, anchor="e", padx=4,
+            bg=THEME["bg"], fg=state_color, anchor="e",
         )
-        state_lbl.pack(side=tk.RIGHT)
+        state_lbl.grid(row=0, column=3, sticky="e", padx=(0, 6))
+
+        # Backwards-compat: hover handlers expect a single `name` widget; reuse
+        # `summary_lbl` since that's the column users mostly read.
+        name_lbl = summary_lbl
 
         def on_click(_event, pid=inst.pid):
             self._activate_terminal(pid)
 
-        for w in (frame, dot, name_lbl, state_lbl):
+        for w in (frame, dot, folder_box, folder_lbl,
+                  summary_box, summary_lbl, state_lbl):
             w.bind("<Button-1>", on_click)
             w.bind("<Enter>", lambda _e, f=frame, d=dot, n=name_lbl, s=state_lbl:
                    self._row_hover(f, d, n, s, True))

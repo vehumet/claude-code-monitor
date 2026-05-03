@@ -218,6 +218,98 @@ def get_state_dir():
     )
 
 
+# Carry-over fields preserved across writes (slot is stable for session lifetime;
+# summary is updated by Stop hook / UserPromptSubmit fallback)
+_PRESERVED_FIELDS = (
+    "slot", "summary", "summarySource",
+    "summaryAt", "summaryMsgCount", "summarySessionId",
+)
+
+
+def _pid_is_claude(pid):
+    """True iff PID currently belongs to a live claude.exe.
+
+    Defends against PID reuse: when a Claude Code session exits, Windows is
+    free to recycle its PID into an unrelated process (browser, Slack, etc.).
+    A naive alive check would treat the recycled process as the original
+    session and let its slot stay reserved indefinitely.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if not IS_WINDOWS:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        ec = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(ec)) or ec.value != 259:
+            return False
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return False
+        return buf.value.lower().endswith("claude.exe")
+    finally:
+        k32.CloseHandle(h)
+
+
+def _allocate_slot(state_dir, my_pid, my_cwd):
+    """Pick the lowest unused positive integer among *live* state files in same cwd.
+
+    Dead PIDs are excluded so slots compact back down as sessions exit.
+    """
+    norm_my = _norm_path(my_cwd)
+    used = set()
+    for sf in glob.glob(os.path.join(state_dir, "*.json")):
+        try:
+            base = os.path.splitext(os.path.basename(sf))[0]
+            other_pid = int(base)
+        except (ValueError, OSError):
+            continue
+        if other_pid == my_pid:
+            continue
+        if not _pid_is_claude(other_pid):
+            continue
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if _norm_path(d.get("cwd", "")) != norm_my:
+            continue
+        s = d.get("slot")
+        if isinstance(s, int) and s >= 1:
+            used.add(s)
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def _truncate_label(text, max_chars=20):
+    """Trim text for display: first non-empty line, collapsed whitespace, max_chars."""
+    if not text:
+        return ""
+    # Strip lone surrogates that may sneak in from stdin decoding edge cases.
+    text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("<"):
+            line = re.sub(r"\s+", " ", line)
+            if len(line) <= max_chars:
+                return line
+            return line[:max_chars].rstrip() + "…"
+    return ""
+
+
 def _load_sessions(sessions_dir):
     """Load all session files. Returns list of (filepath, basename, data) tuples."""
     sessions = []
@@ -232,8 +324,344 @@ def _load_sessions(sessions_dir):
     return sessions
 
 
+def _encoded_cwd(cwd):
+    """Mimic Claude Code's project directory encoding.
+
+    Examples:
+        C:\\Users\\vehum\\proj    → C--Users-vehum-proj
+        C:\\Users\\my_repo       → C--Users-my-repo
+        /home/user/proj         → -home-user-proj
+    """
+    if len(cwd) >= 2 and cwd[1] == ":":
+        head = cwd[0] + "--"
+        tail = cwd[2:].lstrip("\\/")
+    else:
+        head = ""
+        tail = cwd
+    return head + tail.replace("\\", "-").replace("/", "-").replace("_", "-")
+
+
+def _find_session_jsonl(home, cwd, session_id):
+    if not (cwd and session_id):
+        return None
+    proj_root = os.path.join(home, ".claude", "projects")
+    if not os.path.isdir(proj_root):
+        return None
+    target = _encoded_cwd(cwd).lower()
+    try:
+        for d in os.listdir(proj_root):
+            if d.lower() == target:
+                fp = os.path.join(proj_root, d, f"{session_id}.jsonl")
+                if os.path.exists(fp):
+                    return fp
+    except OSError:
+        return None
+    return None
+
+
+def _iter_user_messages(jsonl_fp):
+    """Yield (text,) for each meaningful user message in a JSONL session file."""
+    if not jsonl_fp or not os.path.exists(jsonl_fp):
+        return
+    try:
+        with open(jsonl_fp, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                msg = d.get("message")
+                c = msg.get("content") if isinstance(msg, dict) else None
+                txt = None
+                if isinstance(c, str):
+                    txt = c
+                elif isinstance(c, list) and c and isinstance(c[0], dict):
+                    txt = c[0].get("text", "")
+                if not txt or txt.startswith("<"):
+                    continue
+                yield txt
+    except OSError:
+        return
+
+
+def _nested_pids_dir():
+    return os.path.join(os.path.expanduser("~"), ".claude", "monitor", "nested-pids")
+
+
+def _mark_nested_pid(pid):
+    """Touch a marker file so the overlay can recognise this PID as ours."""
+    try:
+        d = _nested_pids_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{pid}.flag"), "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        _log.error("failed to mark nested pid %s", pid, exc_info=True)
+
+
+def _spawn_summarizer(target_pid):
+    """Re-invoke ourselves detached in __summarize__ mode for the given PID."""
+    cmd = [sys.executable, os.path.abspath(__file__),
+           "__summarize__", str(target_pid)]
+    env = os.environ.copy()
+    env["CLAUDE_MONITOR_NESTED"] = "1"
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | _CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        _mark_nested_pid(proc.pid)
+        _log.debug("=> Spawned summarizer for pid=%d (child=%d)", target_pid, proc.pid)
+    except Exception:
+        _log.error("Failed to spawn summarizer", exc_info=True)
+
+
+def _load_monitor_config():
+    """Read the widget's config (summary_max_chars + language)."""
+    cfg = os.path.join(os.path.expanduser("~"), ".claude", "monitor", "config.json")
+    try:
+        with open(cfg, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {
+            "summary_max_chars": max(4, int(d.get("summary_max_chars", 12))),
+            "language": d.get("language", "en"),
+        }
+    except Exception:
+        return {"summary_max_chars": 12, "language": "en"}
+
+
+_HAIKU_PROMPT_KO = (
+    "다음은 Claude Code 세션에서 사용자가 보낸 메시지들이야. "
+    "이 세션의 작업 주제를 한국어 명사구 {n}자 이내로 요약해. "
+    "{n}자를 넘기면 잘려서 사용자가 알아볼 수 없으니 반드시 {n}자 이내로. "
+    "따옴표·접두사·마크다운(**, *, _, `, # 등) 없이 평문 한 줄만 출력."
+    "\n\n{transcript}"
+)
+
+_HAIKU_PROMPT_EN = (
+    "Below are user messages from a Claude Code session. "
+    "Summarize the session's task topic as a short English noun phrase, "
+    "max {words} words (under {n} characters). "
+    "It is rendered in a narrow widget column — exceeding the limit causes "
+    "the label to be cut off and unreadable. "
+    "Output plain text only — no quotes, prefixes, trailing punctuation, "
+    "or markdown (**, *, _, `, # etc)."
+    "\n\n{transcript}"
+)
+
+
+_MARKDOWN_MARKERS_RE = re.compile(r"(\*+|_+|`+|~+|^#+\s*)")
+
+
+def _strip_markdown(text):
+    """Remove common inline-markdown markers that occasionally leak into output."""
+    if not text:
+        return text
+    return _MARKDOWN_MARKERS_RE.sub("", text).strip()
+
+
+def _call_haiku(transcript):
+    """Run `claude -p ... --model claude-haiku-4-5`. Returns label or None."""
+    cfg = _load_monitor_config()
+    base_n = cfg["summary_max_chars"]
+    if cfg["language"] == "ko":
+        prompt = _HAIKU_PROMPT_KO.format(n=base_n, transcript=transcript[:4000])
+        cap = base_n
+    else:
+        # The summary column width is sized for `base_n` CJK glyphs; an
+        # English glyph is roughly half a CJK glyph in this font, so allow
+        # ~2× the character budget.
+        en_n = base_n * 2
+        words = max(2, en_n // 6)
+        prompt = _HAIKU_PROMPT_EN.format(n=en_n, words=words, transcript=transcript[:4000])
+        cap = en_n
+    cmd = [
+        "claude", "-p", prompt,
+        "--model", "claude-haiku-4-5",
+        "--output-format", "text",
+    ]
+    env = os.environ.copy()
+    env["CLAUDE_MONITOR_NESTED"] = "1"
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except FileNotFoundError:
+        _log.debug("haiku: `claude` CLI not found on PATH")
+        return None
+    except Exception:
+        _log.error("haiku spawn failed", exc_info=True)
+        return None
+    _mark_nested_pid(proc.pid)
+    try:
+        stdout, stderr = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        _log.debug("haiku: timeout")
+        return None
+    except Exception:
+        _log.error("haiku communicate failed", exc_info=True)
+        return None
+    if proc.returncode != 0:
+        try:
+            err = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else (stderr or "")
+        except Exception:
+            err = ""
+        _log.debug("haiku rc=%s stderr=%s", proc.returncode, err[:200])
+        return None
+    try:
+        out = stdout.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else (stdout or "")
+    except Exception:
+        out = ""
+    out = out.strip()
+    if not out:
+        return None
+    out = out.splitlines()[0].strip().strip('"').strip("'").strip()
+    out = _strip_markdown(out)
+    if len(out) > cap:
+        out = out[:cap].rstrip() + "…"
+    return out or None
+
+
+def _do_summarize(target_pid):
+    """Background mode: read jsonl, call Haiku, merge result into state file."""
+    # Mark ourselves so the overlay knows to skip our PID and any descendants.
+    _mark_nested_pid(os.getpid())
+    home = os.path.expanduser("~")
+    state_dir = get_state_dir()
+    state_file = os.path.join(state_dir, f"{target_pid}.json")
+    sess_file = os.path.join(home, ".claude", "sessions", f"{target_pid}.json")
+
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+    except Exception:
+        _log.debug("summarizer: no state file for pid=%d", target_pid)
+        return
+    cwd = state_data.get("cwd", "")
+
+    session_id = None
+    try:
+        with open(sess_file, "r", encoding="utf-8") as f:
+            session_id = json.load(f).get("sessionId")
+    except Exception:
+        pass
+    if not session_id:
+        _log.debug("summarizer: no sessionId for pid=%d", target_pid)
+        return
+
+    jsonl = _find_session_jsonl(home, cwd, session_id)
+    if not jsonl:
+        _log.debug("summarizer: jsonl not found cwd=%s sid=%s", cwd, session_id)
+        return
+
+    msgs = list(_iter_user_messages(jsonl))
+    if not msgs:
+        return
+    full_count = len(msgs)
+    # First user messages carry the richest context (initial task description);
+    # later short answers like "진행해" / "응" dilute the topic. Sample the first
+    # ones, falling back to all msgs when the session is short.
+    sample = msgs[:5] if full_count >= 5 else msgs
+    transcript = "\n\n---\n\n".join(m[:400] for m in sample)
+    label = _call_haiku(transcript)
+    if not label:
+        return
+
+    # Re-read for concurrent-write safety, then merge.
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            cur = json.load(f)
+    except Exception:
+        cur = state_data
+    cur["summary"] = label
+    cur["summarySource"] = "haiku"
+    cur["summaryAt"] = int(time.time())
+    cur["summaryMsgCount"] = full_count
+    cur["summarySessionId"] = session_id
+
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cur, f)
+            os.replace(tmp_path, state_file)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        _log.error("summarizer: failed to write state", exc_info=True)
+        return
+    _log.debug("=> haiku summary written: pid=%d %r (msgs=%d)",
+               target_pid, label, full_count)
+
+
+# Refresh policy for Haiku summarization (seconds).
+# trim/empty → spawn immediately; haiku → require both gap + new messages.
+_HAIKU_REFRESH_SECONDS = 300
+_HAIKU_REFRESH_NEW_MSGS = 3
+
+
+def _should_summarize(state_data):
+    """Return True if Stop-hook should spawn a Haiku summarizer."""
+    src = state_data.get("summarySource")
+    if src in (None, "", "trim"):
+        return True
+    if src == "haiku":
+        last = state_data.get("summaryAt", 0)
+        now = int(time.time())
+        if now - last < _HAIKU_REFRESH_SECONDS:
+            return False
+        # Time elapsed; let summarizer re-evaluate against full message count.
+        return True
+    return False
+
+
 def main():
     if len(sys.argv) < 2:
+        sys.exit(0)
+
+    # Background summarizer mode (re-entry) — runs from a child env with the
+    # NESTED marker set; treat as the trusted summarizer path, not a hook.
+    if sys.argv[1] == "__summarize__" and len(sys.argv) >= 3:
+        try:
+            target_pid = int(sys.argv[2])
+        except ValueError:
+            sys.exit(0)
+        try:
+            _do_summarize(target_pid)
+        except Exception:
+            _log.error("summarizer crashed", exc_info=True)
+        return
+
+    # Skip hook firings inside any nested `claude` invocation we spawned for
+    # summarization, otherwise that child's hooks would create a transient
+    # session entry that the overlay flickers in and out of view.
+    if os.environ.get("CLAUDE_MONITOR_NESTED") == "1":
         sys.exit(0)
 
     state = sys.argv[1]  # working / done / question
@@ -244,9 +672,11 @@ def main():
 
     os.makedirs(state_dir, exist_ok=True)
 
-    # Read stdin JSON (hook event data)
+    # Read stdin JSON (hook event data) — force UTF-8 decode of raw bytes,
+    # since Windows default sys.stdin.encoding is cp949 and would mangle Korean
+    # text in the prompt payload (resulting in surrogate-escaped summaries).
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
         hook_data = json.loads(raw) if raw.strip() else {}
     except Exception:
         hook_data = {}
@@ -466,7 +896,10 @@ def main():
                 "updatedAt": now,
                 "wezterm": wezterm_info,
             }
-        _log.debug("=> session_start: writing wezterm info pid=%s", pid)
+        if "slot" not in state_data:
+            state_data["slot"] = _allocate_slot(state_dir, pid, matched_cwd)
+        _log.debug("=> session_start: writing wezterm info pid=%s slot=%s",
+                   pid, state_data.get("slot"))
         try:
             fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
             try:
@@ -485,9 +918,12 @@ def main():
 
     # Skip write if state unchanged AND wezterm info unchanged
     # (catch-all이 매 도구마다 호출되므로 필수 최적화)
+    # Exceptions: missing slot needs allocation; UserPromptSubmit may need to stamp
+    # a trim summary even when state stays "working" (e.g. consecutive prompts).
     if existing and existing.get("state") == state:
         existing_wt = existing.get("wezterm") if isinstance(existing.get("wezterm"), dict) else None
-        if wezterm_info == existing_wt:
+        has_slot = isinstance(existing.get("slot"), int)
+        if wezterm_info == existing_wt and has_slot and not is_user_prompt:
             _log.debug("=> State unchanged (%s), skipping write", state)
             return
 
@@ -501,6 +937,28 @@ def main():
         state_data["hwnd"] = captured_hwnd
     if wezterm_info is not None:
         state_data["wezterm"] = wezterm_info
+
+    # Preserve slot/summary across writes; assign slot on first sight
+    for k in _PRESERVED_FIELDS:
+        if existing and k in existing:
+            state_data[k] = existing[k]
+    if "slot" not in state_data:
+        state_data["slot"] = _allocate_slot(state_dir, pid, matched_cwd)
+        _log.debug("=> Allocated slot=%d for pid=%s cwd=%s",
+                   state_data["slot"], pid, matched_cwd)
+
+    # UserPromptSubmit fallback: stamp a trimmed first-line summary when none exists,
+    # or refresh if Haiku hasn't taken over yet (summarySource=="trim").
+    if is_user_prompt:
+        prompt_text = hook_data.get("prompt") or ""
+        trimmed = _truncate_label(prompt_text, max_chars=18)
+        if trimmed:
+            cur_src = state_data.get("summarySource")
+            if cur_src in (None, "trim"):
+                state_data["summary"] = trimmed
+                state_data["summarySource"] = "trim"
+                state_data["summaryAt"] = now
+                _log.debug("=> Trim summary set: %r", trimmed)
 
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 
@@ -518,6 +976,11 @@ def main():
             raise
     except Exception:
         _log.error("Failed to write state file %s", state_file, exc_info=True)
+        return
+
+    # On Stop hook ("done"), kick off a background Haiku summarizer if due.
+    if state == "done" and _should_summarize(state_data):
+        _spawn_summarizer(pid)
 
 
 if __name__ == "__main__":
