@@ -513,7 +513,7 @@ def build_display_name(cwd, slot, summary):
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
-                 "slot", "summary")
+                 "slot", "summary", "pinned_at")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0):
         self.pid = pid
@@ -527,6 +527,9 @@ class Instance:
         self.done_since = 0.0
         self.hwnd = 0
         self.wezterm = None
+        # None = unpinned. Set to time.monotonic() when pinned; pinned rows
+        # sort above unpinned rows, earliest-pinned first.
+        self.pinned_at = None
 
 
 class InstanceTracker:
@@ -714,7 +717,10 @@ class MonitorOverlay:
         # The summary column reserves enough pixels for `summary_max_chars` of
         # CJK width — the same N is passed to write-state.py so Haiku stays
         # within the column.
-        self.col_dot_w = self.font_row.measure("●  ")
+        self.col_dot_w = max(
+            self.font_row.measure("●  "),
+            self.font_row.measure("🔒  "),
+        )
         self.col_folder_w = self.font_row.measure("firstgame(99)") + 8
         # No ellipsis padding — overflow is hidden via grid_propagate(False).
         self.col_summary_w = self.font_row.measure("가") * self.summary_max_chars
@@ -901,7 +907,12 @@ class MonitorOverlay:
 
         instances = sorted(
             self.tracker.instances.values(),
-            key=lambda i: (i.display_name.lower(), i.pid),
+            key=lambda i: (
+                0 if i.pinned_at is not None else 1,
+                i.pinned_at if i.pinned_at is not None else 0.0,
+                i.display_name.lower(),
+                i.pid,
+            ),
         )
 
         if not instances:
@@ -947,13 +958,27 @@ class MonitorOverlay:
         frame.grid_columnconfigure(2, minsize=self.col_summary_w, weight=1)
         frame.grid_columnconfigure(3, minsize=self.col_state_w)
 
-        dot = tk.Label(
-            frame, text="\u25cf", font=self.font_row,
-            bg=THEME["bg"], fg=state_color,
-        )
-        dot.grid(row=0, column=0, sticky="w", padx=(4, 0))
-
         cell_h = self.row_height - 2
+
+        dot_glyph = "\ud83d\udd12" if inst.pinned_at is not None else "\u25cf"
+        dot_box = tk.Frame(
+            frame, bg=THEME["bg"],
+            width=self.col_dot_w, height=cell_h,
+        )
+        dot_box.grid(row=0, column=0, sticky="w", padx=(4, 0))
+        dot_box.grid_propagate(False)
+        dot_box.pack_propagate(False)
+        dot = tk.Label(
+            dot_box, text=dot_glyph, font=self.font_row,
+            bg=THEME["bg"], fg=state_color, cursor="hand2",
+        )
+        dot.pack(fill=tk.BOTH, expand=True)
+
+        def on_dot_click(_e, pid=inst.pid):
+            self._toggle_pin(pid)
+
+        dot_box.bind("<Button-1>", on_dot_click)
+        dot.bind("<Button-1>", on_dot_click)
 
         folder_box = tk.Frame(
             frame, bg=THEME["bg"],
@@ -994,9 +1019,13 @@ class MonitorOverlay:
         def on_click(_event, pid=inst.pid):
             self._activate_terminal(pid)
 
-        for w in (frame, dot, folder_box, folder_lbl,
+        # Dot already has its own pin-toggle handler; it still participates in
+        # row-hover recoloring via the generic Enter/Leave below.
+        for w in (frame, folder_box, folder_lbl,
                   summary_box, summary_lbl, state_lbl):
             w.bind("<Button-1>", on_click)
+        for w in (frame, dot_box, dot, folder_box, folder_lbl,
+                  summary_box, summary_lbl, state_lbl):
             w.bind("<Enter>", lambda _e, f=frame: self._row_hover(f, True))
             w.bind("<Leave>", lambda _e, f=frame: self._row_hover(f, False))
 
@@ -1004,6 +1033,14 @@ class MonitorOverlay:
             "frame": frame, "dot": dot, "name": name_lbl,
             "state": state_lbl, "instance": inst,
         })
+
+    def _toggle_pin(self, pid):
+        """Toggle pin state for the given instance and rerender rows."""
+        inst = self.tracker.instances.get(pid)
+        if not inst:
+            return
+        inst.pinned_at = None if inst.pinned_at is not None else time.monotonic()
+        self._rebuild_rows()
 
     def _row_hover(self, frame, entering):
         bg = THEME["hover"] if entering else THEME["bg"]
