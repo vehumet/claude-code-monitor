@@ -997,20 +997,27 @@ class MonitorOverlay:
         for w in (frame, dot, folder_box, folder_lbl,
                   summary_box, summary_lbl, state_lbl):
             w.bind("<Button-1>", on_click)
-            w.bind("<Enter>", lambda _e, f=frame, d=dot, n=name_lbl, s=state_lbl:
-                   self._row_hover(f, d, n, s, True))
-            w.bind("<Leave>", lambda _e, f=frame, d=dot, n=name_lbl, s=state_lbl, i=inst:
-                   self._row_hover(f, d, n, s, False, i))
+            w.bind("<Enter>", lambda _e, f=frame: self._row_hover(f, True))
+            w.bind("<Leave>", lambda _e, f=frame: self._row_hover(f, False))
 
         self.row_widgets.append({
             "frame": frame, "dot": dot, "name": name_lbl,
             "state": state_lbl, "instance": inst,
         })
 
-    def _row_hover(self, frame, dot, name, state, entering, inst=None):
+    def _row_hover(self, frame, entering):
         bg = THEME["hover"] if entering else THEME["bg"]
-        for w in (frame, dot, name, state):
-            w.config(bg=bg)
+        frame.config(bg=bg)
+        # Recolor every descendant — grid cells include nested boxes
+        # (folder_box → folder_lbl, summary_box → summary_lbl).
+        stack = list(frame.winfo_children())
+        while stack:
+            w = stack.pop()
+            try:
+                w.config(bg=bg)
+            except tk.TclError:
+                pass
+            stack.extend(w.winfo_children())
 
     def _activate_terminal(self, claude_pid: int):
         try:
