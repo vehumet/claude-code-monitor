@@ -20,6 +20,10 @@ Each row is one Claude Code session: a colour dot for state, the project folder 
 
 Click a row to focus that terminal. Drag the bar to move the widget; the position is remembered.
 
+## How the summary is generated
+
+The topic label in each row is generated automatically by **Claude Haiku 4.5** (`claude -p --model claude-haiku-4-5`) on the Stop hook, using whichever signal is richest — in priority order: the session's ai-title (mirrors the wezterm tab), a `/rename` slug, the most recent recap, or the first user messages. Output language follows the OS locale (Korean → Korean, otherwise English). Calls are debounced (5-minute cooldown per session) and run as a detached subprocess so they don't block your interactive session, but they do consume your Claude usage like any other `claude` invocation.
+
 ## Install
 
 Plugin install (recommended):
