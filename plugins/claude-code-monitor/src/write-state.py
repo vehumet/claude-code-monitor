@@ -359,6 +359,51 @@ def _find_session_jsonl(home, cwd, session_id):
     return None
 
 
+def _latest_ai_title(jsonl_fp):
+    """Return the last `type:'ai-title'` aiTitle (mirrors wezterm tab label)."""
+    if not jsonl_fp or not os.path.exists(jsonl_fp):
+        return None
+    last = None
+    try:
+        with open(jsonl_fp, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") == "ai-title":
+                    t = d.get("aiTitle")
+                    if isinstance(t, str) and t.strip():
+                        last = t.strip()
+    except OSError:
+        return None
+    return last or None
+
+
+def _latest_away_summary(jsonl_fp):
+    """Return the last `system/away_summary` content (Claude Code recap), or None."""
+    if not jsonl_fp or not os.path.exists(jsonl_fp):
+        return None
+    last = None
+    try:
+        with open(jsonl_fp, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") == "system" and d.get("subtype") == "away_summary":
+                    c = d.get("content")
+                    if isinstance(c, str) and c.strip():
+                        last = c
+    except OSError:
+        return None
+    if last:
+        # Drop the "(disable recaps in /config)" footer Claude Code appends.
+        last = re.sub(r"\s*\(disable recaps in /config\)\s*$", "", last).strip()
+    return last or None
+
+
 def _iter_user_messages(jsonl_fp):
     """Yield (text,) for each meaningful user message in a JSONL session file."""
     if not jsonl_fp or not os.path.exists(jsonl_fp):
@@ -477,7 +522,6 @@ def _call_haiku(transcript):
     base_n = cfg["summary_max_chars"]
     if cfg["language"] == "ko":
         prompt = _HAIKU_PROMPT_KO.format(n=base_n, transcript=transcript[:4000])
-        cap = base_n
     else:
         # The summary column width is sized for `base_n` CJK glyphs; an
         # English glyph is roughly half a CJK glyph in this font, so allow
@@ -485,7 +529,6 @@ def _call_haiku(transcript):
         en_n = base_n * 2
         words = max(2, en_n // 6)
         prompt = _HAIKU_PROMPT_EN.format(n=en_n, words=words, transcript=transcript[:4000])
-        cap = en_n
     cmd = [
         "claude", "-p", prompt,
         "--model", "claude-haiku-4-5",
@@ -539,8 +582,9 @@ def _call_haiku(transcript):
         return None
     out = out.splitlines()[0].strip().strip('"').strip("'").strip()
     out = _strip_markdown(out)
-    if len(out) > cap:
-        out = out[:cap].rstrip() + "…"
+    # No length cap — the widget's summary cell clips overflow on its own
+    # (grid + width-clamped Frame with propagate disabled). Trailing "…" was
+    # confusing because it suggested truncation we'd applied vs the widget did.
     return out or None
 
 
@@ -562,9 +606,12 @@ def _do_summarize(target_pid):
     cwd = state_data.get("cwd", "")
 
     session_id = None
+    name = None
     try:
         with open(sess_file, "r", encoding="utf-8") as f:
-            session_id = json.load(f).get("sessionId")
+            sd = json.load(f)
+        session_id = sd.get("sessionId")
+        name = sd.get("name") or None
     except Exception:
         pass
     if not session_id:
@@ -576,18 +623,34 @@ def _do_summarize(target_pid):
         _log.debug("summarizer: jsonl not found cwd=%s sid=%s", cwd, session_id)
         return
 
+    # full_count is used downstream as a refresh-policy signal.
     msgs = list(_iter_user_messages(jsonl))
-    if not msgs:
-        return
     full_count = len(msgs)
-    # First user messages carry the richest context (initial task description);
-    # later short answers like "진행해" / "응" dilute the topic. Sample the first
-    # ones, falling back to all msgs when the session is short.
-    sample = msgs[:5] if full_count >= 5 else msgs
-    transcript = "\n\n---\n\n".join(m[:400] for m in sample)
+
+    # Signal priority — pick exactly one, hand it to Haiku for length/language
+    # normalization. (1) jsonl ai-title (the same source wezterm tab labels
+    # use); (2) sessions/{pid}.json `name` (user `/rename`); (3) latest
+    # away_summary recap; (4) first user messages.
+    if (ai_title := _latest_ai_title(jsonl)):
+        transcript = ai_title
+        signal_kind = "ai_title"
+    elif name:
+        transcript = name
+        signal_kind = "name"
+    elif (away := _latest_away_summary(jsonl)):
+        transcript = away[:1000]
+        signal_kind = "away_summary"
+    elif msgs:
+        sample = msgs[:5] if full_count >= 5 else msgs
+        transcript = "\n\n---\n\n".join(m[:400] for m in sample)
+        signal_kind = "user_msgs"
+    else:
+        return
+
     label = _call_haiku(transcript)
     if not label:
         return
+    _log.debug("=> haiku signal=%s -> %r", signal_kind, label)
 
     # Re-read for concurrent-write safety, then merge.
     try:
@@ -947,18 +1010,18 @@ def main():
         _log.debug("=> Allocated slot=%d for pid=%s cwd=%s",
                    state_data["slot"], pid, matched_cwd)
 
-    # UserPromptSubmit fallback: stamp a trimmed first-line summary when none exists,
-    # or refresh if Haiku hasn't taken over yet (summarySource=="trim").
+    # UserPromptSubmit fallback: stamp a trimmed first-line summary ONLY when
+    # the row currently has no summary at all. Subsequent prompts must not
+    # overwrite the stamped value — otherwise the label would jitter to each
+    # latest message until the next Stop fires the Haiku summarizer.
     if is_user_prompt:
         prompt_text = hook_data.get("prompt") or ""
         trimmed = _truncate_label(prompt_text, max_chars=18)
-        if trimmed:
-            cur_src = state_data.get("summarySource")
-            if cur_src in (None, "trim"):
-                state_data["summary"] = trimmed
-                state_data["summarySource"] = "trim"
-                state_data["summaryAt"] = now
-                _log.debug("=> Trim summary set: %r", trimmed)
+        if trimmed and not state_data.get("summary"):
+            state_data["summary"] = trimmed
+            state_data["summarySource"] = "trim"
+            state_data["summaryAt"] = now
+            _log.debug("=> Trim summary set: %r", trimmed)
 
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 
