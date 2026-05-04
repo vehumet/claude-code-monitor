@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.18] - 2026-05-04
+
+### Added
+
+- Prioritised signal sources for the summary label, picked one at a time and handed to Haiku for length/language normalisation: jsonl `type:"ai-title"` (wezterm tab parity) → `sessions/{pid}.json` `name` (`/rename` slug) → latest `system/away_summary` recap → first user messages. Includes a regex sweep of the `(disable recaps in /config)` footer and stray markdown markers (`**`, `*`, `_`, `` ` ``, `#`).
+
+### Changed
+
+- Trim fallback (`UserPromptSubmit` first-line snippet) now stamps once when the row is empty and is not refreshed by subsequent prompts, so the label stops jittering with each new message until Haiku takes over.
+- Haiku output is no longer truncated with `…` in post-processing — the widget's grid cells already clip overflow, and the trailing ellipsis was misattributing widget clipping to model truncation.
+- Hover background now recolours folder column too — the new grid layout's nested folder/summary boxes were missed by the previous hover handler.
+
 ## [0.0.17] - 2026-05-03
 
 ### Added
