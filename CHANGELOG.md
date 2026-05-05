@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.19] - 2026-05-05
+
+### Added
+
+- Pin a row by clicking the colored dot at the start of the row. Pinned rows sort above unpinned ones with earliest-pinned first; the dot swaps to a lock glyph (🔒) so the pinned state is visible. Pin state is in-memory only and resets when the overlay restarts.
+
+### Fixed
+
+- Recognize `claude.exe.old.<timestamp>` as a live Claude Code process. When Claude Code self-updates, Windows renames the in-use binary to `claude.exe.old.<ts>` and any already-running session keeps that path until it exits. The previous `endswith("claude.exe")` check rejected every running session after an update, which made the overlay empty itself out and the slot allocator stop reusing slots properly.
+- Preserve the home cwd recorded in `state/{pid}.json` instead of overwriting it with the tool cwd of every hook fire. Hooks fire with whatever cwd the current tool is running in (e.g. a PowerShell call inside `.../src/`), and that was leaking into the row label as `src(N)`. Phase 2.5 self-register also now reuses the existing state cwd when rebuilding a `sessions/{pid}.json` that was wiped during a self-update.
+
 ## [0.0.18] - 2026-05-04
 
 ### Added
