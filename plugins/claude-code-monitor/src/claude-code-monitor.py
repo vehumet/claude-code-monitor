@@ -229,8 +229,16 @@ def is_pid_alive(pid: int) -> bool:
             return True  # process exists but we lack permission
 
 
+def _is_claude_basename(name: str) -> bool:
+    """Match 'claude.exe' and the rename pattern Claude Code uses during
+    self-update, e.g. 'claude.exe.old.1777936237180'. Already-running
+    sessions retain the .old.* path until they exit."""
+    n = name.lower()
+    return n == "claude.exe" or n.startswith("claude.exe.old")
+
+
 def is_claude_pid_alive(pid: int) -> bool:
-    """True iff PID is alive AND its exe is claude.exe (defends against reuse)."""
+    """True iff PID is alive AND its exe is a Claude Code binary (live or .old)."""
     if not IS_WINDOWS:
         return is_pid_alive(pid)
     kernel32 = ctypes.windll.kernel32
@@ -245,7 +253,7 @@ def is_claude_pid_alive(pid: int) -> bool:
         size = wintypes.DWORD(260)
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
             return False
-        return buf.value.lower().endswith("claude.exe")
+        return _is_claude_basename(os.path.basename(buf.value))
     finally:
         kernel32.CloseHandle(handle)
 
@@ -293,7 +301,7 @@ def is_nested_claude_pid(pid: int, tree: dict, marker_pids: set) -> bool:
         entry = tree.get(cur)
         if not entry:
             break
-        if entry[1] == "claude.exe":
+        if _is_claude_basename(entry[1]):
             return True
         cur = entry[0]
     return False
@@ -600,6 +608,7 @@ class InstanceTracker:
                 saved_wezterm = st.get("wezterm")
                 saved_slot = st.get("slot", 0)
                 saved_summary = st.get("summary", "")
+                saved_cwd = st.get("cwd") or ""
             except Exception:
                 continue
 
@@ -622,6 +631,12 @@ class InstanceTracker:
                     changed = True
                 if saved_summary != inst.summary:
                     inst.summary = saved_summary
+                    changed = True
+                # state JSON wins for cwd: sessions/*.json may have been
+                # rebuilt with a stale subdirectory cwd after a Claude Code
+                # self-update; state JSON preserves the home cwd.
+                if saved_cwd and saved_cwd != inst.cwd:
+                    inst.cwd = saved_cwd
                     changed = True
                 if inst.state != state or inst.updated_at != updated_at:
                     old_state = inst.state

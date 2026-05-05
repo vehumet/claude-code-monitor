@@ -227,7 +227,9 @@ _PRESERVED_FIELDS = (
 
 
 def _pid_is_claude(pid):
-    """True iff PID currently belongs to a live claude.exe.
+    """True iff PID currently belongs to a live claude.exe (or claude.exe.old.*
+    after a Claude Code self-update, since already-running sessions keep the
+    renamed path until they exit).
 
     Defends against PID reuse: when a Claude Code session exits, Windows is
     free to recycle its PID into an unrelated process (browser, Slack, etc.).
@@ -256,7 +258,8 @@ def _pid_is_claude(pid):
         size = wintypes.DWORD(260)
         if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
             return False
-        return buf.value.lower().endswith("claude.exe")
+        name = os.path.basename(buf.value).lower()
+        return name == "claude.exe" or name.startswith("claude.exe.old")
     finally:
         k32.CloseHandle(h)
 
@@ -781,7 +784,8 @@ def main():
             entry = tree.get(p)
             if not entry:
                 break
-            if entry[1] == "claude.exe":
+            exe = entry[1]
+            if exe == "claude.exe" or exe.startswith("claude.exe.old"):
                 claude_pid = p
                 break
             p = entry[0]
@@ -800,17 +804,27 @@ def main():
                     pid = claude_pid
                     matched_cwd = sess.get("cwd", cwd)
                 else:
+                    # Prefer the cwd already recorded in our state file (the
+                    # home cwd captured at first hook fire) over the current
+                    # tool cwd, which may be a subdirectory.
+                    home_cwd = cwd
+                    state_fp = os.path.join(state_dir, f"{claude_pid}.json")
+                    try:
+                        with open(state_fp, "r", encoding="utf-8") as fh:
+                            home_cwd = json.load(fh).get("cwd") or cwd
+                    except Exception:
+                        pass
                     sess = {
                         "pid": claude_pid,
                         "sessionId": session_id,
-                        "cwd": cwd,
+                        "cwd": home_cwd,
                         "startedAt": int(time.time() * 1000),
                     }
                     os.makedirs(sessions_dir, exist_ok=True)
                     with open(sess_file, "w", encoding="utf-8") as f:
                         json.dump(sess, f)
                     pid = claude_pid
-                    matched_cwd = cwd
+                    matched_cwd = home_cwd
                     _log.debug("Phase 2.5: created session file %s.json", claude_pid)
             except Exception:
                 _log.error("Phase 2.5: failed", exc_info=True)
@@ -990,10 +1004,16 @@ def main():
             _log.debug("=> State unchanged (%s), skipping write", state)
             return
 
+    # Preserve cwd once it's been recorded — hooks fire from arbitrary tool
+    # cwds (e.g. a PowerShell call inside a subdirectory), but the session's
+    # home cwd is set once at startup and shouldn't drift to whichever
+    # subdirectory a tool happens to run in.
+    final_cwd = (existing.get("cwd") if existing and existing.get("cwd") else matched_cwd)
+
     state_data = {
         "pid": pid,
         "state": state,
-        "cwd": matched_cwd,
+        "cwd": final_cwd,
         "updatedAt": now,
     }
     if captured_hwnd is not None:
