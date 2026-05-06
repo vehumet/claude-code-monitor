@@ -687,9 +687,8 @@ def _do_summarize(target_pid):
 
 
 # Refresh policy for Haiku summarization (seconds).
-# trim/empty → spawn immediately; haiku → require both gap + new messages.
+# trim/empty → spawn immediately; haiku → require gap.
 _HAIKU_REFRESH_SECONDS = 300
-_HAIKU_REFRESH_NEW_MSGS = 3
 
 
 def _should_summarize(state_data):
