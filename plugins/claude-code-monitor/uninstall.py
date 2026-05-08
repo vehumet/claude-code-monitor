@@ -136,7 +136,7 @@ def remove_hooks(settings: dict) -> bool:
 
 
 def uninstall(dry_run=False, keep_config=False):
-    print("Claude Code Monitor — Uninstaller")
+    print("Claude Code Monitor - Uninstaller")
     print("=" * 35)
     print()
 
@@ -222,7 +222,7 @@ def uninstall(dry_run=False, keep_config=False):
 
     print()
     if dry_run:
-        print("DRY RUN complete — no files were modified.")
+        print("DRY RUN complete - no files were modified.")
     else:
         print("Uninstall complete!")
         if keep_config:

@@ -213,7 +213,7 @@ def merge_codex_hooks(dry_run=False) -> bool:
     """Install Codex hook marker block + feature flag. Returns True if
     config.toml was modified (or would be, in dry-run)."""
     if not os.path.isdir(CODEX_DIR):
-        print("  ~/.codex not found — skipping Codex hooks.")
+        print("  ~/.codex not found - skipping Codex hooks.")
         return False
     text = ""
     if os.path.exists(CODEX_CONFIG):
@@ -228,9 +228,9 @@ def merge_codex_hooks(dry_run=False) -> bool:
         # it's on the deprecated `codex_hooks` name (Codex 0.128+ warns).
         migrated, modified, _ = _ensure_codex_hooks_flag(text)
         if not modified:
-            print("  Codex hooks marker already present — skipping (idempotent).")
+            print("  Codex hooks marker already present - skipping (idempotent).")
             return False
-        print(f"  Migrating deprecated codex_hooks flag → hooks in {CODEX_CONFIG}")
+        print(f"  Migrating deprecated codex_hooks flag -> hooks in {CODEX_CONFIG}")
         if dry_run:
             return True
         ts = int(time.time())
@@ -308,7 +308,7 @@ def merge_hooks(settings: dict) -> bool:
 
 
 def install(dry_run=False, skip_codex_hooks=False):
-    print("Claude Code Monitor — Standalone Installer")
+    print("Claude Code Monitor - Standalone Installer")
     print("=" * 45)
     print()
 
@@ -387,13 +387,13 @@ def install(dry_run=False, skip_codex_hooks=False):
     print()
     print("Codex CLI hooks...")
     if skip_codex_hooks:
-        print("  --skip-codex-hooks set — leaving ~/.codex/config.toml alone.")
+        print("  --skip-codex-hooks set - leaving ~/.codex/config.toml alone.")
     else:
         merge_codex_hooks(dry_run=dry_run)
 
     print()
     if dry_run:
-        print("DRY RUN complete — no files were modified.")
+        print("DRY RUN complete - no files were modified.")
     else:
         print("Installation complete!")
         print()
