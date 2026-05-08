@@ -22,9 +22,21 @@ jobs:
         run: |
           python -m py_compile plugins/claude-code-monitor/src/claude-code-monitor.py
           python -m py_compile plugins/claude-code-monitor/src/write-state.py
+          python -m py_compile plugins/claude-code-monitor/src/codex_rollout_poller.py
           python -m py_compile plugins/claude-code-monitor/install.py
           python -m py_compile plugins/claude-code-monitor/uninstall.py
           python -m py_compile scripts/bump-version.py
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
 
   version-sync:
     name: Version sync check

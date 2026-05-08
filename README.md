@@ -51,7 +51,7 @@ Requires Python 3.10+ with tkinter (bundled with the standard installer) and the
 
 ### Codex CLI support
 
-When `~/.codex/` is present, the installer appends a marker-fenced block to `~/.codex/config.toml` that enables `[features] codex_hooks = true` and registers `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PermissionRequest` / `Stop` hooks calling `write-state.py --provider codex <state>`. The block is idempotent on rerun and `~/.codex/config.toml` is backed up to `config.toml.bak.<unix_ts>` before any change. `python uninstall.py` removes the block cleanly.
+When `~/.codex/` is present, the installer appends a marker-fenced block to `~/.codex/config.toml` that enables `[features] hooks = true` and registers `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PermissionRequest` / `Stop` hooks calling `write-state.py --provider codex <state>`. The block is idempotent on rerun and `~/.codex/config.toml` is backed up to `config.toml.bak.<unix_ts>` before any change. `python uninstall.py` removes the block cleanly.
 
 If you'd rather wire the hooks yourself or run Codex with hooks disabled, the overlay still picks up Codex sessions through the rollout JSONL fallback poller — sessions are scanned from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and shown as PID-less rows (clicks won't focus the terminal, but state and folder are visible). Pass `--skip-codex-hooks` to opt out of the auto-injection.
 

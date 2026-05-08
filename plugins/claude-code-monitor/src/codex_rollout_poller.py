@@ -29,6 +29,7 @@ next tick.
 import glob
 import json
 import os
+import tempfile
 import time
 
 # Cap the rollout walk: rollouts older than 24h are unlikely to be active
@@ -123,19 +124,39 @@ def _infer_state(mtime, started, completed, failed):
 
 
 def _atomic_write_json(path, data):
-    """Best-effort atomic write — tempfile + os.replace."""
-    tmp = f"{path}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-        return True
-    except OSError:
+    """Best-effort atomic write — unique tempfile + os.replace retry."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp = None
+    for attempt in range(5):
         try:
-            os.unlink(tmp)
+            fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+                tmp = None
+                return True
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        except PermissionError:
+            if attempt == 4:
+                break
+            time.sleep(0.03 * (attempt + 1))
         except OSError:
-            pass
-        return False
+            break
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            tmp = None
+    return False
 
 
 def _read_existing(path):
@@ -274,12 +295,6 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
 
         seen_virtual_ids.add(vid)
 
-        if cache_hit:
-            # Files on disk already reflect this rollout — no write needed.
-            # Skipping here also stops the overlay from picking up phantom
-            # mtime bumps every tick and re-reading state JSON unnecessarily.
-            continue
-
         state = _infer_state(mtime, started, completed, failed)
 
         sess_record = {
@@ -290,7 +305,6 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             "startedAt": int(mtime * 1000),
             "provider": "codex",
         }
-        _atomic_write_json(sess_path, sess_record)
 
         existing = _read_existing(state_path)
         new_state = {
@@ -309,6 +323,25 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                 new_state[k] = existing[k]
         if "slot" not in new_state:
             new_state["slot"] = _allocate_slot(state_dir, vid, cwd)
+
+        if cache_hit:
+            # Normal steady state: unchanged rollout already has matching disk
+            # files. Still repair missing/corrupt files so manual cleanup or a
+            # failed prior write does not hide the row until the next rollout
+            # append.
+            sess_existing = _read_existing(sess_path)
+            state_existing = _read_existing(state_path)
+            if sess_existing.get("sessionId") != session_id:
+                _atomic_write_json(sess_path, sess_record)
+            if (
+                state_existing.get("pid") != vid
+                or state_existing.get("rolloutMtime") != int(mtime)
+                or state_existing.get("state") != state
+            ):
+                _atomic_write_json(state_path, new_state)
+            continue
+
+        _atomic_write_json(sess_path, sess_record)
         _atomic_write_json(state_path, new_state)
 
     # Stale eviction: remove virtual files whose source rollout vanished

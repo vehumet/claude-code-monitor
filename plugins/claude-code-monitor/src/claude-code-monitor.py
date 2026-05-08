@@ -585,22 +585,27 @@ def short_cwd(cwd: str) -> str:
 
 _FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
 
-# Provider glyphs prefixed to the folder column so users can tell Claude vs
-# Codex rows at a glance. Both characters are in the BMP (U+25B3, U+25C6) so
-# the default Tk font on Windows renders them without a fallback.
+# Provider glyphs shown in the left marker column so users can tell Claude vs
+# Codex rows at a glance. Filled shapes survive small UI sizes better than
+# hollow outlines.
 # CLAUDE_MONITOR_ASCII_GLYPH=1 swaps in ASCII fallbacks for terminals/fonts
 # that can't render the geometric shapes cleanly.
-_GLYPH_UNICODE = {"claude": "△", "codex": "◆"}
+_GLYPH_UNICODE = {"claude": "●", "codex": "◆"}
 _GLYPH_ASCII = {"claude": "[C]", "codex": "[X]"}
 
 
 def provider_glyph(provider) -> str:
     """Short visual prefix identifying which LLM CLI a row belongs to."""
+    glyph = provider_marker(provider)
+    return f"{glyph} " if glyph else ""
+
+
+def provider_marker(provider) -> str:
+    """Single-character row marker identifying which LLM CLI owns the row."""
     if not provider:
         return ""
     table = _GLYPH_ASCII if os.environ.get("CLAUDE_MONITOR_ASCII_GLYPH") == "1" else _GLYPH_UNICODE
-    glyph = table.get(provider)
-    return f"{glyph} " if glyph else ""
+    return table.get(provider, "")
 
 
 def slot_glyph(slot) -> str:
@@ -611,13 +616,12 @@ def slot_glyph(slot) -> str:
 
 
 def build_folder_head(cwd, slot, provider="claude"):
-    """Compose '△ folder(N)' / '◆ folder' (folder capped to _FOLDER_MAX_CHARS)."""
+    """Compose 'folder(N)' (folder capped to _FOLDER_MAX_CHARS)."""
     base = short_cwd(cwd)
     if len(base) > _FOLDER_MAX_CHARS:
         base = base[:_FOLDER_MAX_CHARS - 3] + "..."
     glyph = slot_glyph(slot)
-    head = f"{base}{glyph}" if glyph else base
-    return f"{provider_glyph(provider)}{head}"
+    return f"{base}{glyph}" if glyph else base
 
 
 def build_summary_text(summary):
@@ -635,11 +639,12 @@ def build_display_name(cwd, slot, summary, provider="claude"):
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
-                 "slot", "summary", "pinned_at", "provider")
+                 "slot", "summary", "pinned_at", "provider", "session_id")
 
-    def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude"):
+    def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude", session_id=""):
         self.pid = pid
         self.cwd = cwd
+        self.session_id = session_id or ""
         self.state = state
         self.updated_at = updated_at
         self.slot = 0
@@ -658,6 +663,10 @@ class Instance:
 class InstanceTracker:
     """Polls session + state files to maintain live instance list."""
 
+    PINS_FILE = os.path.join(
+        os.path.expanduser("~"), ".claude", "monitor", "pins.json"
+    )
+
     def __init__(self):
         home = os.path.expanduser("~")
         self.sessions_dir = os.path.join(home, ".claude", "sessions")
@@ -669,6 +678,41 @@ class InstanceTracker:
         # metadata (cwd, sessionId) keyed by file path so we don't re-parse
         # the first line of every rollout JSONL on every poll.
         self._codex_rollout_cache: dict = {}
+        self.pins = self._load_pins()
+
+    @staticmethod
+    def pin_key(inst: Instance) -> str:
+        return inst.session_id or str(inst.pid)
+
+    def _load_pins(self) -> dict:
+        try:
+            with open(self.PINS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {
+                    str(k): float(v)
+                    for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, (int, float))
+                }
+        except Exception:
+            pass
+        return {}
+
+    def save_pins(self):
+        data = {
+            self.pin_key(inst): inst.pinned_at
+            for inst in self.instances.values()
+            if inst.pinned_at is not None
+        }
+        try:
+            os.makedirs(os.path.dirname(self.PINS_FILE), exist_ok=True)
+            tmp = f"{self.PINS_FILE}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.PINS_FILE)
+            self.pins = data
+        except Exception:
+            _log.debug("failed to save pins", exc_info=True)
 
     def poll(self):
         """Refresh instance list. Returns (changed, events)."""
@@ -720,6 +764,7 @@ class InstanceTracker:
             try:
                 pid = sess.get("pid")
                 cwd = sess.get("cwd", "")
+                session_id = sess.get("sessionId", "") or ""
                 if pid is None:
                     continue
             except Exception:
@@ -753,10 +798,18 @@ class InstanceTracker:
             seen_pids.add(pid)
 
             if pid not in self.instances:
-                self.instances[pid] = Instance(pid, cwd)
+                self.instances[pid] = Instance(pid, cwd, session_id=session_id)
+                key = self.pin_key(self.instances[pid])
+                if key in self.pins:
+                    self.instances[pid].pinned_at = self.pins[key]
                 changed = True
             elif self.instances[pid].cwd != cwd:
                 self.instances[pid].cwd = cwd
+                changed = True
+            if self.instances[pid].session_id != session_id:
+                self.instances[pid].session_id = session_id
+                key = self.pin_key(self.instances[pid])
+                self.instances[pid].pinned_at = self.pins.get(key)
                 changed = True
 
         for sf in glob.glob(os.path.join(self.state_dir, "*.json")):
@@ -908,16 +961,12 @@ class MonitorOverlay:
         # CJK width — the same N is passed to write-state.py so Haiku stays
         # within the column.
         self.col_dot_w = max(
-            self.font_row.measure("●  "),
-            self.font_row.measure("🔒  "),
+            self.font_row.measure("◆  "),
+            self.font_row.measure("[X] "),
         )
-        # Reserve extra width for the provider glyph prefix ('◆ ' / '[X] ').
-        # Both unicode and ASCII fallbacks are sized so users can flip
-        # CLAUDE_MONITOR_ASCII_GLYPH without re-measuring on next launch.
-        self.col_folder_w = max(
-            self.font_row.measure("◆ firstgame(99)"),
-            self.font_row.measure("[X] firstgame(99)"),
-        ) + 8
+        # Folder column no longer carries the provider glyph; the left marker
+        # column owns provider identity so names stay aligned.
+        self.col_folder_w = self.font_row.measure("firstgame(99)") + 8
         # No ellipsis padding — overflow is hidden via grid_propagate(False).
         self.col_summary_w = self.font_row.measure("가") * self.summary_max_chars
         self.col_state_w = self.font_state.measure("Working") + 12
@@ -1107,7 +1156,7 @@ class MonitorOverlay:
                 0 if i.pinned_at is not None else 1,
                 i.pinned_at if i.pinned_at is not None else 0.0,
                 i.display_name.lower(),
-                i.pid,
+                str(i.pid),
             ),
         )
 
@@ -1156,7 +1205,7 @@ class MonitorOverlay:
 
         cell_h = self.row_height - 2
 
-        dot_glyph = "\ud83d\udd12" if inst.pinned_at is not None else "\u25cf"
+        dot_glyph = provider_marker(inst.provider) or "\u25cf"
         dot_box = tk.Frame(
             frame, bg=THEME["bg"],
             width=self.col_dot_w, height=cell_h,
@@ -1164,9 +1213,10 @@ class MonitorOverlay:
         dot_box.grid(row=0, column=0, sticky="w", padx=(4, 0))
         dot_box.grid_propagate(False)
         dot_box.pack_propagate(False)
+        marker_fg = state_color if inst.pinned_at is None else THEME["fg"]
         dot = tk.Label(
             dot_box, text=dot_glyph, font=self.font_row,
-            bg=THEME["bg"], fg=state_color, cursor="hand2",
+            bg=THEME["bg"], fg=marker_fg, cursor="hand2",
         )
         dot.pack(fill=tk.BOTH, expand=True)
 
@@ -1235,7 +1285,8 @@ class MonitorOverlay:
         inst = self.tracker.instances.get(pid)
         if not inst:
             return
-        inst.pinned_at = None if inst.pinned_at is not None else time.monotonic()
+        inst.pinned_at = None if inst.pinned_at is not None else time.time()
+        self.tracker.save_pins()
         self._rebuild_rows()
 
     def _row_hover(self, frame, entering):

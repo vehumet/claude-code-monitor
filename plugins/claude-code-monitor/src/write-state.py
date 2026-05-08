@@ -375,6 +375,78 @@ def _load_sessions(sessions_dir):
     return sessions
 
 
+def _session_pid(sess, basename):
+    """Return the session's real PID, or its virtual session id.
+
+    Codex rollout fallback files are named like `codex-<sid8>.json` and do not
+    always carry a numeric pid. Avoid eager `int(basename)` conversions because
+    hook commands must tolerate those virtual rows while matching real sessions.
+    """
+    pid = sess.get("pid")
+    if pid is not None:
+        return pid
+    try:
+        return int(basename)
+    except (TypeError, ValueError):
+        return basename
+
+
+def _is_virtual_id(pid):
+    return isinstance(pid, str) and pid.startswith("codex-")
+
+
+def _find_ancestor_llm_pid(my_pid, tree):
+    p = my_pid
+    visited = set()
+    while p and p not in visited:
+        visited.add(p)
+        entry = tree.get(p)
+        if not entry:
+            break
+        if _basename_provider(entry[1]):
+            return p
+        p = entry[0]
+    return None
+
+
+def _atomic_write_json(path, data, log_label="json"):
+    """Write JSON via temp file + os.replace, retrying transient Windows races."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = None
+    for attempt in range(5):
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, path)
+                tmp_path = None
+                return True
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        except PermissionError:
+            if attempt == 4:
+                _log.error("%s: failed to replace %s", log_label, path, exc_info=True)
+                break
+            time.sleep(0.03 * (attempt + 1))
+        except Exception:
+            _log.error("%s: failed to write %s", log_label, path, exc_info=True)
+            break
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            tmp_path = None
+    return False
+
+
 def _encoded_cwd(cwd):
     """Mimic Claude Code's project directory encoding.
 
@@ -518,7 +590,7 @@ def _spawn_summarizer(target_pid):
     try:
         proc = subprocess.Popen(cmd, **kwargs)
         _mark_nested_pid(proc.pid)
-        _log.debug("=> Spawned summarizer for pid=%d (child=%d)", target_pid, proc.pid)
+        _log.debug("=> Spawned summarizer for pid=%s (child=%d)", target_pid, proc.pid)
     except Exception:
         _log.error("Failed to spawn summarizer", exc_info=True)
 
@@ -641,6 +713,52 @@ def _scan_codex_rollout(rollout_path):
     except OSError:
         pass
     return out
+
+
+# Codex rollout event type markers — mirrors codex_rollout_poller.py's sets.
+_ROLLOUT_START_TYPES = {"task_started"}
+_ROLLOUT_COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
+
+
+def _codex_task_complete(session_id):
+    """True when the rollout JSONL confirms the Codex task is finished.
+
+    Codex fires Stop after each model turn in agentic mode, not only at
+    actual task completion.  Checking task_started vs task_complete counts
+    (same logic as codex_rollout_poller._infer_state) lets us tell apart
+    intermediate per-turn stops from the final one.
+
+    Fails safe — returns True (allow done) when rollout is unavailable or
+    has no markers yet.  Returns False (suppress done) only when
+    task_started > task_complete (task is clearly still in progress).
+    """
+    rollout = _find_codex_rollout(session_id)
+    if not rollout:
+        return True
+    started = 0
+    completed = 0
+    try:
+        with open(rollout, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "event_msg":
+                    continue
+                payload = d.get("payload") or {}
+                pt = payload.get("type") if isinstance(payload, dict) else None
+                if pt in _ROLLOUT_START_TYPES:
+                    started += 1
+                elif pt in _ROLLOUT_COMPLETE_TYPES:
+                    completed += 1
+    except OSError:
+        return True
+    if started == 0 and completed == 0:
+        return True  # no markers yet — conservative
+    return completed >= started
 
 
 # Default summarisation model for Codex sessions. `gpt-5.4-mini` is the
@@ -833,7 +951,7 @@ def _do_summarize(target_pid):
         with open(state_file, "r", encoding="utf-8") as f:
             state_data = json.load(f)
     except Exception:
-        _log.debug("summarizer: no state file for pid=%d", target_pid)
+        _log.debug("summarizer: no state file for pid=%s", target_pid)
         return
     cwd = state_data.get("cwd", "")
     provider = state_data.get("provider", "claude")
@@ -848,7 +966,7 @@ def _do_summarize(target_pid):
     except Exception:
         pass
     if not session_id:
-        _log.debug("summarizer: no sessionId for pid=%d", target_pid)
+        _log.debug("summarizer: no sessionId for pid=%s", target_pid)
         return
 
     if provider == "codex":
@@ -926,22 +1044,9 @@ def _do_summarize(target_pid):
     cur["summaryMsgCount"] = full_count
     cur["summarySessionId"] = session_id
 
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(cur, f)
-            os.replace(tmp_path, state_file)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception:
-        _log.error("summarizer: failed to write state", exc_info=True)
+    if not _atomic_write_json(state_file, cur, "summarizer"):
         return
-    _log.debug("=> %s summary written: pid=%d %r (msgs=%d)",
+    _log.debug("=> %s summary written: pid=%s %r (msgs=%d)",
                provider, target_pid, label, full_count)
 
 
@@ -1063,71 +1168,73 @@ def main():
     if not provider:
         provider = "claude"
 
+    llm_pid = _find_ancestor_llm_pid(my_pid, tree)
+    promoted_virtual_id = None
+
     # Phase 2: Match by session_id (full scan)
+    session_matched = False
     if session_id:
         for sf, basename, sess in sessions:
             if sess.get("sessionId") == session_id:
-                pid = sess.get("pid", int(basename))
+                session_matched = True
+                candidate_pid = _session_pid(sess, basename)
                 matched_cwd = sess.get("cwd", cwd)
-                _log.debug("Phase 2: session_id match -> pid=%s file=%s", pid, basename)
+                if provider == "codex" and _is_virtual_id(candidate_pid) and llm_pid:
+                    # A rollout fallback row exists for this session, but this
+                    # invocation came from a real Codex hook. Let Phase 2.5
+                    # register the real PID, then remove the virtual files.
+                    promoted_virtual_id = candidate_pid
+                    _log.debug("Phase 2: virtual session match -> promote %s via pid=%s",
+                               candidate_pid, llm_pid)
+                else:
+                    pid = candidate_pid
+                    _log.debug("Phase 2: session_id match -> pid=%s file=%s", pid, basename)
                 break
-        if pid is None:
+        if pid is None and not session_matched:
             _log.debug("Phase 2: no session_id match found")
 
     # Phase 2.5: Self-register — fix session file when sessionId mismatches
-    if pid is None and session_id:
-        llm_pid = None
-        p = my_pid
-        visited_walk = set()
-        while p and p not in visited_walk:
-            visited_walk.add(p)
-            entry = tree.get(p)
-            if not entry:
-                break
-            if _basename_provider(entry[1]):
-                llm_pid = p
-                break
-            p = entry[0]
-
-        if llm_pid:
-            claude_pid = llm_pid  # local alias kept for the rest of the block
-            sess_file = os.path.join(sessions_dir, f"{claude_pid}.json")
-            try:
-                if os.path.exists(sess_file):
-                    with open(sess_file, "r", encoding="utf-8") as f:
-                        sess = json.load(f)
-                    if sess.get("sessionId") != session_id:
-                        sess["sessionId"] = session_id
-                        with open(sess_file, "w", encoding="utf-8") as f:
-                            json.dump(sess, f)
-                        _log.debug("Phase 2.5: updated sessionId in %s.json", claude_pid)
-                    pid = claude_pid
-                    matched_cwd = sess.get("cwd", cwd)
-                else:
-                    # Prefer the cwd already recorded in our state file (the
-                    # home cwd captured at first hook fire) over the current
-                    # tool cwd, which may be a subdirectory.
-                    home_cwd = cwd
-                    state_fp = os.path.join(state_dir, f"{claude_pid}.json")
+    if pid is None and session_id and llm_pid:
+        real_pid = llm_pid
+        sess_file = os.path.join(sessions_dir, f"{real_pid}.json")
+        try:
+            if os.path.exists(sess_file):
+                with open(sess_file, "r", encoding="utf-8") as f:
+                    sess = json.load(f)
+                if sess.get("sessionId") != session_id:
+                    sess["sessionId"] = session_id
+                    _atomic_write_json(sess_file, sess, "session-register")
+                    _log.debug("Phase 2.5: updated sessionId in %s.json", real_pid)
+                pid = real_pid
+                matched_cwd = sess.get("cwd", cwd)
+            else:
+                # Prefer the cwd already recorded in our state file (the
+                # home cwd captured at first hook fire) over the current
+                # tool cwd, which may be a subdirectory.
+                home_cwd = matched_cwd or cwd
+                state_fps = [os.path.join(state_dir, f"{real_pid}.json")]
+                if promoted_virtual_id:
+                    state_fps.insert(0, os.path.join(state_dir, f"{promoted_virtual_id}.json"))
+                for state_fp in state_fps:
                     try:
                         with open(state_fp, "r", encoding="utf-8") as fh:
-                            home_cwd = json.load(fh).get("cwd") or cwd
+                            home_cwd = json.load(fh).get("cwd") or home_cwd
+                            break
                     except Exception:
                         pass
-                    sess = {
-                        "pid": claude_pid,
-                        "sessionId": session_id,
-                        "cwd": home_cwd,
-                        "startedAt": int(time.time() * 1000),
-                    }
-                    os.makedirs(sessions_dir, exist_ok=True)
-                    with open(sess_file, "w", encoding="utf-8") as f:
-                        json.dump(sess, f)
-                    pid = claude_pid
-                    matched_cwd = home_cwd
-                    _log.debug("Phase 2.5: created session file %s.json", claude_pid)
-            except Exception:
-                _log.error("Phase 2.5: failed", exc_info=True)
+                sess = {
+                    "pid": real_pid,
+                    "sessionId": session_id,
+                    "cwd": home_cwd,
+                    "startedAt": int(time.time() * 1000),
+                    "provider": provider,
+                }
+                _atomic_write_json(sess_file, sess, "session-register")
+                pid = real_pid
+                matched_cwd = home_cwd
+                _log.debug("Phase 2.5: created session file %s.json", real_pid)
+        except Exception:
+            _log.error("Phase 2.5: failed", exc_info=True)
 
     # Phase 3: Match by cwd (only if session_id didn't match)
     if pid is None and cwd:
@@ -1139,7 +1246,7 @@ def main():
 
         if len(cwd_matches) == 1:
             sf, basename, sess = cwd_matches[0]
-            pid = sess.get("pid", int(basename))
+            pid = _session_pid(sess, basename)
             matched_cwd = sess.get("cwd", cwd)
             _log.debug("Phase 3: unique cwd match -> pid=%s", pid)
 
@@ -1152,10 +1259,10 @@ def main():
 
             ancestor_match = None
             for sf, basename, sess in cwd_matches:
-                sess_pid = sess.get("pid", int(basename))
+                sess_pid = _session_pid(sess, basename)
                 if sess_pid in ancestors:
                     ancestor_match = (sf, basename, sess, sess_pid)
-                    _log.debug("Phase 3: ancestor match -> sess_pid=%d", sess_pid)
+                    _log.debug("Phase 3: ancestor match -> sess_pid=%s", sess_pid)
                     break
 
             if ancestor_match:
@@ -1171,7 +1278,7 @@ def main():
         ancestors = _get_ancestor_pids(my_pid, tree)
         _log.debug("Phase 3.5: trying ancestor match without CWD, ancestors=%s", ancestors)
         for sf, basename, sess in sessions:
-            sess_pid = sess.get("pid", int(basename))
+            sess_pid = _session_pid(sess, basename)
             if sess_pid in ancestors:
                 pid = sess_pid
                 matched_cwd = sess.get("cwd", cwd)
@@ -1187,15 +1294,27 @@ def main():
 
     # Write state file
     state_file = os.path.join(state_dir, f"{pid}.json")
+    promoted_state_file = (
+        os.path.join(state_dir, f"{promoted_virtual_id}.json")
+        if promoted_virtual_id else None
+    )
+    promoted_session_file = (
+        os.path.join(sessions_dir, f"{promoted_virtual_id}.json")
+        if promoted_virtual_id else None
+    )
     now = int(time.time())
 
     # Read existing state (for hwnd preservation and same-state skip)
     existing = None
-    try:
-        with open(state_file, "r", encoding="utf-8") as f:
-            existing = json.load(f)
-    except Exception:
-        pass
+    for existing_fp in (state_file, promoted_state_file):
+        if not existing_fp:
+            continue
+        try:
+            with open(existing_fp, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            break
+        except Exception:
+            pass
 
     is_user_prompt = "prompt" in hook_data
     captured_hwnd = _capture_foreground_hwnd(my_pid, tree, is_user_prompt=is_user_prompt)
@@ -1277,21 +1396,23 @@ def main():
             state_data["slot"] = _allocate_slot(state_dir, pid, matched_cwd)
         _log.debug("=> session_start: writing wezterm info pid=%s slot=%s",
                    pid, state_data.get("slot"))
-        try:
-            fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(state_data, f)
-                os.replace(tmp_path, state_file)
-            except BaseException:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-        except Exception:
-            _log.error("Failed to write state file %s", state_file, exc_info=True)
+        if _atomic_write_json(state_file, state_data, "state"):
+            for stale_fp in (promoted_state_file, promoted_session_file):
+                if stale_fp and stale_fp != state_file:
+                    try:
+                        os.remove(stale_fp)
+                    except OSError:
+                        pass
         return
+
+    # Codex Stop guard: each model turn ends with a Stop hook, so Stop fires
+    # multiple times during agentic execution, not just at task completion.
+    # Cross-check the rollout JSONL; if task_started > task_complete the task
+    # is still running — suppress this intermediate done.
+    if state == "done" and provider == "codex" and session_id:
+        if not _codex_task_complete(session_id):
+            _log.debug("=> Codex Stop: agentic turn boundary, not final done — suppressing")
+            return
 
     # Skip write if state unchanged AND wezterm info unchanged
     # (catch-all이 매 도구마다 호출되므로 필수 최적화)
@@ -1350,21 +1471,14 @@ def main():
 
     _log.debug("=> Writing state: pid=%s state=%s file=%s", pid, state, state_file)
 
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state_data, f)
-            os.replace(tmp_path, state_file)
-        except BaseException:
+    if not _atomic_write_json(state_file, state_data, "state"):
+        return
+    for stale_fp in (promoted_state_file, promoted_session_file):
+        if stale_fp and stale_fp != state_file:
             try:
-                os.unlink(tmp_path)
+                os.remove(stale_fp)
             except OSError:
                 pass
-            raise
-    except Exception:
-        _log.error("Failed to write state file %s", state_file, exc_info=True)
-        return
 
     # On Stop hook ("done"), kick off a background summarizer if due. The
     # summarizer reads provider from state JSON and shells out to either
