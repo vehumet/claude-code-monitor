@@ -219,67 +219,115 @@ def get_state_dir():
 
 
 # Carry-over fields preserved across writes (slot is stable for session lifetime;
-# summary is updated by Stop hook / UserPromptSubmit fallback)
+# summary is updated by Stop hook / UserPromptSubmit fallback). `provider` is
+# decided once on the first write and frozen so a later hook firing in an
+# unusual environment can't flip a row's identity.
 _PRESERVED_FIELDS = (
     "slot", "summary", "summarySource",
     "summaryAt", "summaryMsgCount", "summarySessionId",
+    "provider",
 )
 
 
-def _pid_is_claude(pid):
-    """True iff PID currently belongs to a live claude.exe (or claude.exe.old.*
-    after a Claude Code self-update, since already-running sessions keep the
-    renamed path until they exit).
+def _basename_provider(name):
+    """Map a process basename to a known-LLM provider id, or None.
 
-    Defends against PID reuse: when a Claude Code session exits, Windows is
-    free to recycle its PID into an unrelated process (browser, Slack, etc.).
-    A naive alive check would treat the recycled process as the original
-    session and let its slot stay reserved indefinitely.
+    'claude.exe' / 'claude.exe.old.*' (rename pattern Claude Code uses during
+    self-update; already-running sessions retain the .old.* path until they
+    exit) → 'claude'. 'codex.exe' → 'codex'. Anything else → None.
+    """
+    n = (name or "").lower()
+    if n == "claude.exe" or n.startswith("claude.exe.old"):
+        return "claude"
+    if n == "codex.exe" or n == "codex":
+        return "codex"
+    return None
+
+
+def _pid_is_known_llm(pid):
+    """Return provider id ('claude'/'codex') if PID is a live LLM CLI, else None.
+
+    Defends against PID reuse: when an LLM CLI session exits, Windows is free
+    to recycle its PID into an unrelated process (browser, Slack, etc.). A
+    naive alive check would treat the recycled process as the original session
+    and let its slot stay reserved indefinitely.
     """
     if not isinstance(pid, int) or pid <= 0:
-        return False
+        return None
     if not IS_WINDOWS:
+        # POSIX: read /proc/<pid>/comm (Linux) or ps -p <pid> -o comm= (macOS)
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
-            return False
+            return None
         except PermissionError:
-            return True
+            # process exists but we cannot inspect — assume known LLM to keep
+            # legacy behaviour conservative; falls through to claude default
+            return "claude"
+        comm = ""
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as f:
+                comm = f.read().strip()
+        except OSError:
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "comm="],
+                    stderr=subprocess.DEVNULL, timeout=1,
+                )
+                comm = out.decode("utf-8", errors="replace").strip()
+            except Exception:
+                comm = ""
+        return _basename_provider(os.path.basename(comm))
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
-        return False
+        return None
     try:
         ec = wintypes.DWORD()
         if not k32.GetExitCodeProcess(h, ctypes.byref(ec)) or ec.value != 259:
-            return False
+            return None
         buf = ctypes.create_unicode_buffer(260)
         size = wintypes.DWORD(260)
         if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return False
+            return None
         name = os.path.basename(buf.value).lower()
-        return name == "claude.exe" or name.startswith("claude.exe.old")
+        return _basename_provider(name)
     finally:
         k32.CloseHandle(h)
 
 
-def _allocate_slot(state_dir, my_pid, my_cwd):
-    """Pick the lowest unused positive integer among *live* state files in same cwd.
+def _pid_is_claude(pid):
+    """Back-compat wrapper — `_pid_is_known_llm` returning provider id is the
+    canonical check. Existing callers expect a bool for claude-only contexts
+    (slot allocation predates multi-provider support and treated any non-claude
+    PID as 'not ours' anyway)."""
+    return _pid_is_known_llm(pid) is not None
 
-    Dead PIDs are excluded so slots compact back down as sessions exit.
+
+def _allocate_slot(state_dir, my_pid, my_cwd):
+    """Pick the lowest unused positive integer among live state files in
+    the same cwd. Dead PIDs are excluded so slots compact back down as
+    sessions exit. Virtual rows (`codex-<sid8>.json`) are treated as alive
+    while their file exists — codex_rollout_poller evicts stale ones on
+    its own schedule and this helper honours that ownership.
     """
     norm_my = _norm_path(my_cwd)
     used = set()
     for sf in glob.glob(os.path.join(state_dir, "*.json")):
+        base = os.path.splitext(os.path.basename(sf))[0]
         try:
-            base = os.path.splitext(os.path.basename(sf))[0]
             other_pid = int(base)
-        except (ValueError, OSError):
+            is_alive = _pid_is_claude(other_pid)
+        except ValueError:
+            if not base.startswith("codex-"):
+                continue
+            other_pid = base
+            is_alive = True
+        except OSError:
             continue
-        if other_pid == my_pid:
+        if not is_alive:
             continue
-        if not _pid_is_claude(other_pid):
+        if str(other_pid) == str(my_pid):
             continue
         try:
             with open(sf, "r", encoding="utf-8") as f:
@@ -519,6 +567,185 @@ def _strip_markdown(text):
     return _MARKDOWN_MARKERS_RE.sub("", text).strip()
 
 
+def _find_codex_rollout(session_id):
+    """Locate Codex's rollout JSONL whose session_meta.id matches session_id.
+
+    Codex names rollouts ``rollout-<iso>-<sessionId>.jsonl``, so the glob
+    catches the file directly. The fallback scan is kept for older CLI
+    versions or if the naming convention shifts.
+    """
+    if not session_id:
+        return None
+    root = os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+    if not os.path.isdir(root):
+        return None
+    # Fast path: filename includes the sessionId.
+    for path in glob.glob(os.path.join(root, "*", "*", "*", f"rollout-*-{session_id}.jsonl")):
+        return path
+    # Fallback: read each rollout's session_meta header.
+    for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                d = json.loads(f.readline())
+            if d.get("type") == "session_meta" and (d.get("payload") or {}).get("id") == session_id:
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _scan_codex_rollout(rollout_path):
+    """Single-pass scan of a Codex rollout JSONL pulling out the signals
+    the summarizer cares about.
+
+    Returns a dict with:
+      - ``user_messages``: list[str] — every ``event_msg/user_message`` text.
+      - ``first_commentary``: str | None — the assistant's first
+        ``event_msg/agent_message`` with ``phase=commentary``. This is
+        usually the model's intro/plan for the turn, similar in spirit to
+        an ai-title.
+      - ``last_final_answer``: str | None — the most recent
+        ``event_msg/agent_message`` with ``phase=final_answer``. This is
+        Codex's analogue of Claude's away_summary and is the highest-quality
+        single-string label we can pull from a session.
+
+    Verified against Codex CLI 0.128.0 rollouts.
+    """
+    out = {"user_messages": [], "first_commentary": None, "last_final_answer": None}
+    if not rollout_path or not os.path.exists(rollout_path):
+        return out
+    try:
+        with open(rollout_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "event_msg":
+                    continue
+                payload = d.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                pt = payload.get("type")
+                msg = payload.get("message")
+                if not isinstance(msg, str) or not msg.strip():
+                    continue
+                if pt == "user_message":
+                    out["user_messages"].append(msg)
+                elif pt == "agent_message":
+                    phase = payload.get("phase")
+                    if phase == "final_answer":
+                        out["last_final_answer"] = msg
+                    elif phase == "commentary" and out["first_commentary"] is None:
+                        out["first_commentary"] = msg
+    except OSError:
+        pass
+    return out
+
+
+# Default summarisation model for Codex sessions. `gpt-5.4-mini` is the
+# cheapest model on the standard Codex profile; users can override via
+# config.json `codex_summary_model` or env var.
+_CODEX_DEFAULT_SUMMARY_MODEL = "gpt-5.4-mini"
+
+
+def _call_codex_summary(transcript):
+    """Run `codex exec` with --ephemeral + --ignore-user-config to get a
+    one-line summary without spawning a new persisted Codex session and
+    without re-firing our own hooks."""
+    cfg = _load_monitor_config()
+    base_n = cfg["summary_max_chars"]
+    if cfg["language"] == "ko":
+        prompt = _HAIKU_PROMPT_KO.format(n=base_n, transcript=transcript[:4000])
+    else:
+        en_n = base_n * 2
+        words = max(2, en_n // 6)
+        prompt = _HAIKU_PROMPT_EN.format(n=en_n, words=words, transcript=transcript[:4000])
+
+    model = (
+        os.environ.get("CLAUDE_MONITOR_CODEX_SUMMARY_MODEL")
+        or cfg.get("codex_summary_model")
+        or _CODEX_DEFAULT_SUMMARY_MODEL
+    )
+
+    fd, output_path = tempfile.mkstemp(suffix=".txt", prefix="codex-summary-")
+    os.close(fd)
+
+    cmd = [
+        "codex", "exec",
+        "--ephemeral",             # don't write a rollout JSONL
+        "--ignore-user-config",    # don't load our own hooks → no recursion
+        "--skip-git-repo-check",
+        "--color", "never",
+        "-m", model,
+        "-o", output_path,
+        prompt,
+    ]
+    env = os.environ.copy()
+    env["CLAUDE_MONITOR_NESTED"] = "1"  # belt-and-braces if hooks fire anyway
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+
+    def _cleanup():
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except FileNotFoundError:
+        _log.debug("codex summary: codex CLI not on PATH")
+        _cleanup()
+        return None
+    except Exception:
+        _log.error("codex summary spawn failed", exc_info=True)
+        _cleanup()
+        return None
+    _mark_nested_pid(proc.pid)
+    try:
+        proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        _log.debug("codex summary: timeout")
+        _cleanup()
+        return None
+    except Exception:
+        _log.error("codex summary communicate failed", exc_info=True)
+        _cleanup()
+        return None
+
+    if proc.returncode != 0:
+        _log.debug("codex summary rc=%s", proc.returncode)
+        _cleanup()
+        return None
+
+    try:
+        with open(output_path, "r", encoding="utf-8", errors="replace") as f:
+            out = f.read()
+    except OSError:
+        _cleanup()
+        return None
+    _cleanup()
+
+    out = out.strip()
+    if not out:
+        return None
+    out = out.splitlines()[0].strip().strip('"').strip("'").strip()
+    out = _strip_markdown(out)
+    return out or None
+
+
 def _call_haiku(transcript):
     """Run `claude -p ... --model claude-haiku-4-5`. Returns label or None."""
     cfg = _load_monitor_config()
@@ -592,7 +819,9 @@ def _call_haiku(transcript):
 
 
 def _do_summarize(target_pid):
-    """Background mode: read jsonl, call Haiku, merge result into state file."""
+    """Background mode: read transcript, call summariser, merge result into
+    state file. Provider is read from state JSON so the same entry point
+    handles both Claude and Codex sessions."""
     # Mark ourselves so the overlay knows to skip our PID and any descendants.
     _mark_nested_pid(os.getpid())
     home = os.path.expanduser("~")
@@ -607,6 +836,7 @@ def _do_summarize(target_pid):
         _log.debug("summarizer: no state file for pid=%d", target_pid)
         return
     cwd = state_data.get("cwd", "")
+    provider = state_data.get("provider", "claude")
 
     session_id = None
     name = None
@@ -621,39 +851,68 @@ def _do_summarize(target_pid):
         _log.debug("summarizer: no sessionId for pid=%d", target_pid)
         return
 
-    jsonl = _find_session_jsonl(home, cwd, session_id)
-    if not jsonl:
-        _log.debug("summarizer: jsonl not found cwd=%s sid=%s", cwd, session_id)
-        return
+    if provider == "codex":
+        rollout = _find_codex_rollout(session_id)
+        if not rollout:
+            _log.debug("summarizer: codex rollout not found sid=%s", session_id)
+            return
+        scan = _scan_codex_rollout(rollout)
+        msgs = scan["user_messages"]
+        full_count = len(msgs)
 
-    # full_count is used downstream as a refresh-policy signal.
-    msgs = list(_iter_user_messages(jsonl))
-    full_count = len(msgs)
-
-    # Signal priority — pick exactly one, hand it to Haiku for length/language
-    # normalization. (1) jsonl ai-title (the same source wezterm tab labels
-    # use); (2) sessions/{pid}.json `name` (user `/rename`); (3) latest
-    # away_summary recap; (4) first user messages.
-    if (ai_title := _latest_ai_title(jsonl)):
-        transcript = ai_title
-        signal_kind = "ai_title"
-    elif name:
-        transcript = name
-        signal_kind = "name"
-    elif (away := _latest_away_summary(jsonl)):
-        transcript = away[:1000]
-        signal_kind = "away_summary"
-    elif msgs:
-        sample = msgs[:5] if full_count >= 5 else msgs
-        transcript = "\n\n---\n\n".join(m[:400] for m in sample)
-        signal_kind = "user_msgs"
+        # Signal priority — pick the one the model can summarize best.
+        # Mirrors Claude's chain (ai_title → away_summary → user msgs):
+        # 1) most recent final_answer — Codex's "turn done" message;
+        # 2) first commentary — assistant's plan/intro for the current turn;
+        # 3) first few user messages (last-resort fallback when neither
+        #    agent_message has been emitted yet).
+        if scan["last_final_answer"]:
+            transcript = scan["last_final_answer"][:1500]
+            signal_kind = "codex_final_answer"
+        elif scan["first_commentary"]:
+            transcript = scan["first_commentary"][:1500]
+            signal_kind = "codex_commentary"
+        elif msgs:
+            sample = msgs[:5] if full_count >= 5 else msgs
+            transcript = "\n\n---\n\n".join(m[:400] for m in sample)
+            signal_kind = "codex_user_msgs"
+        else:
+            _log.debug("summarizer: codex rollout has no usable signals")
+            return
+        label = _call_codex_summary(transcript)
+        summary_source = "codex_mini"
     else:
-        return
+        jsonl = _find_session_jsonl(home, cwd, session_id)
+        if not jsonl:
+            _log.debug("summarizer: jsonl not found cwd=%s sid=%s", cwd, session_id)
+            return
+        msgs = list(_iter_user_messages(jsonl))
+        full_count = len(msgs)
+        # Signal priority — pick exactly one, hand it to Haiku for length/language
+        # normalization. (1) jsonl ai-title (the same source wezterm tab labels
+        # use); (2) sessions/{pid}.json `name` (user `/rename`); (3) latest
+        # away_summary recap; (4) first user messages.
+        if (ai_title := _latest_ai_title(jsonl)):
+            transcript = ai_title
+            signal_kind = "ai_title"
+        elif name:
+            transcript = name
+            signal_kind = "name"
+        elif (away := _latest_away_summary(jsonl)):
+            transcript = away[:1000]
+            signal_kind = "away_summary"
+        elif msgs:
+            sample = msgs[:5] if full_count >= 5 else msgs
+            transcript = "\n\n---\n\n".join(m[:400] for m in sample)
+            signal_kind = "user_msgs"
+        else:
+            return
+        label = _call_haiku(transcript)
+        summary_source = "haiku"
 
-    label = _call_haiku(transcript)
     if not label:
         return
-    _log.debug("=> haiku signal=%s -> %r", signal_kind, label)
+    _log.debug("=> %s signal=%s -> %r", provider, signal_kind, label)
 
     # Re-read for concurrent-write safety, then merge.
     try:
@@ -662,7 +921,7 @@ def _do_summarize(target_pid):
     except Exception:
         cur = state_data
     cur["summary"] = label
-    cur["summarySource"] = "haiku"
+    cur["summarySource"] = summary_source
     cur["summaryAt"] = int(time.time())
     cur["summaryMsgCount"] = full_count
     cur["summarySessionId"] = session_id
@@ -682,8 +941,8 @@ def _do_summarize(target_pid):
     except Exception:
         _log.error("summarizer: failed to write state", exc_info=True)
         return
-    _log.debug("=> haiku summary written: pid=%d %r (msgs=%d)",
-               target_pid, label, full_count)
+    _log.debug("=> %s summary written: pid=%d %r (msgs=%d)",
+               provider, target_pid, label, full_count)
 
 
 # Refresh policy for Haiku summarization (seconds).
@@ -692,11 +951,12 @@ _HAIKU_REFRESH_SECONDS = 300
 
 
 def _should_summarize(state_data):
-    """Return True if Stop-hook should spawn a Haiku summarizer."""
+    """Return True if Stop-hook should spawn a summarizer (Claude Haiku or
+    Codex mini)."""
     src = state_data.get("summarySource")
     if src in (None, "", "trim"):
         return True
-    if src == "haiku":
+    if src in ("haiku", "codex_mini"):
         last = state_data.get("summaryAt", 0)
         now = int(time.time())
         if now - last < _HAIKU_REFRESH_SECONDS:
@@ -707,15 +967,22 @@ def _should_summarize(state_data):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    if not args:
         sys.exit(0)
 
     # Background summarizer mode (re-entry) — runs from a child env with the
     # NESTED marker set; treat as the trusted summarizer path, not a hook.
-    if sys.argv[1] == "__summarize__" and len(sys.argv) >= 3:
+    if args[0] == "__summarize__" and len(args) >= 2:
+        raw = args[1]
+        # Accept both numeric PIDs (Claude / hook-registered Codex) and the
+        # `codex-<sid8>` string IDs codex_rollout_poller writes for hook-less
+        # sessions; downstream f-string formatting handles either.
         try:
-            target_pid = int(sys.argv[2])
+            target_pid = int(raw)
         except ValueError:
+            target_pid = raw
+        if not target_pid:
             sys.exit(0)
         try:
             _do_summarize(target_pid)
@@ -729,7 +996,18 @@ def main():
     if os.environ.get("CLAUDE_MONITOR_NESTED") == "1":
         sys.exit(0)
 
-    state = sys.argv[1]  # working / done / question
+    # Optional `--provider claude|codex` prefix injected by Codex hook commands
+    # (Codex's `~/.codex/config.toml` doesn't carry the same env conventions
+    # Claude's plugin runtime does, so we make provider explicit). Falls
+    # through to auto-detection below when omitted.
+    forced_provider = None
+    if args and args[0] == "--provider" and len(args) >= 2:
+        forced_provider = args[1]
+        args = args[2:]
+
+    if not args:
+        sys.exit(0)
+    state = args[0]  # working / done / question
     home = os.path.expanduser("~")
     state_dir = get_state_dir()
     sessions_dir = os.path.join(home, ".claude", "sessions")
@@ -762,6 +1040,29 @@ def main():
     matched_cwd = cwd
     tree = _build_process_tree()
 
+    # Provider precedence: --provider arg > env var > stdin hook_event_name >
+    # ancestor process tree > 'claude' default (back-compat). Frozen on first
+    # write via _PRESERVED_FIELDS so a stray fallback can't reclassify a row.
+    provider = forced_provider or os.environ.get("CLAUDE_MONITOR_PROVIDER") or None
+    if not provider and "hook_event_name" in hook_data:
+        # Codex hook payloads always include this key; Claude's never do.
+        provider = "codex"
+    if not provider:
+        p = my_pid
+        _visited = set()
+        while p and p not in _visited:
+            _visited.add(p)
+            entry = tree.get(p)
+            if not entry:
+                break
+            prov = _basename_provider(entry[1])
+            if prov:
+                provider = prov
+                break
+            p = entry[0]
+    if not provider:
+        provider = "claude"
+
     # Phase 2: Match by session_id (full scan)
     if session_id:
         for sf, basename, sess in sessions:
@@ -775,7 +1076,7 @@ def main():
 
     # Phase 2.5: Self-register — fix session file when sessionId mismatches
     if pid is None and session_id:
-        claude_pid = None
+        llm_pid = None
         p = my_pid
         visited_walk = set()
         while p and p not in visited_walk:
@@ -783,13 +1084,13 @@ def main():
             entry = tree.get(p)
             if not entry:
                 break
-            exe = entry[1]
-            if exe == "claude.exe" or exe.startswith("claude.exe.old"):
-                claude_pid = p
+            if _basename_provider(entry[1]):
+                llm_pid = p
                 break
             p = entry[0]
 
-        if claude_pid:
+        if llm_pid:
+            claude_pid = llm_pid  # local alias kept for the rest of the block
             sess_file = os.path.join(sessions_dir, f"{claude_pid}.json")
             try:
                 if os.path.exists(sess_file):
@@ -1014,6 +1315,11 @@ def main():
         "state": state,
         "cwd": final_cwd,
         "updatedAt": now,
+        "provider": provider,
+        # Marks this write as authoritative so the Codex rollout-JSONL poller
+        # (codex_rollout_poller.py) skips PIDs that a real hook just touched.
+        "lastSignalSource": "hook",
+        "lastSignalAt": now,
     }
     if captured_hwnd is not None:
         state_data["hwnd"] = captured_hwnd
@@ -1060,7 +1366,10 @@ def main():
         _log.error("Failed to write state file %s", state_file, exc_info=True)
         return
 
-    # On Stop hook ("done"), kick off a background Haiku summarizer if due.
+    # On Stop hook ("done"), kick off a background summarizer if due. The
+    # summarizer reads provider from state JSON and shells out to either
+    # `claude -p --model claude-haiku-4-5` or `codex exec -m gpt-5.4-mini
+    # --ephemeral --ignore-user-config`.
     if state == "done" and _should_summarize(state_data):
         _spawn_summarizer(pid)
 

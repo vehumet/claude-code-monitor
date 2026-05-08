@@ -8,7 +8,7 @@ Usage:
 No external dependencies — stdlib + tkinter + ctypes only.
 """
 
-__version__ = "0.0.19"
+__version__ = "0.0.20"
 
 import json
 import logging
@@ -22,6 +22,16 @@ import time
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
+
+# codex_rollout_poller lives next to this file; src/ isn't always on
+# sys.path when launched via the .vbs wrapper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from codex_rollout_poller import poll_codex_rollouts, is_virtual_id
+except ImportError:
+    poll_codex_rollouts = None  # standalone fallback: degrade gracefully
+    def is_virtual_id(_pid):  # type: ignore[no-redef]
+        return False
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -229,33 +239,66 @@ def is_pid_alive(pid: int) -> bool:
             return True  # process exists but we lack permission
 
 
+def _basename_provider(name: str):
+    """Map a process basename to its provider id ('claude'/'codex') or None.
+
+    Matches 'claude.exe' and the rename pattern Claude Code uses during
+    self-update, e.g. 'claude.exe.old.1777936237180' (already-running sessions
+    retain the .old.* path until they exit). Codex CLI installs as 'codex.exe'.
+    """
+    n = (name or "").lower()
+    if n == "claude.exe" or n.startswith("claude.exe.old"):
+        return "claude"
+    if n == "codex.exe" or n == "codex":
+        return "codex"
+    return None
+
+
 def _is_claude_basename(name: str) -> bool:
-    """Match 'claude.exe' and the rename pattern Claude Code uses during
-    self-update, e.g. 'claude.exe.old.1777936237180'. Already-running
-    sessions retain the .old.* path until they exit."""
-    n = name.lower()
-    return n == "claude.exe" or n.startswith("claude.exe.old")
+    """Back-compat: True iff basename is a Claude Code binary (live or .old).
+    `_basename_provider` is the multi-provider canonical check; this remains
+    for `is_nested_claude_pid` which is specifically scoped to Claude's
+    summarizer process tree (Codex never spawns nested Haiku invocations)."""
+    return _basename_provider(name) == "claude"
 
 
-def is_claude_pid_alive(pid: int) -> bool:
-    """True iff PID is alive AND its exe is a Claude Code binary (live or .old)."""
+def known_llm_pid_provider(pid: int):
+    """Return provider id ('claude'/'codex') if PID is a live LLM CLI, else None."""
     if not IS_WINDOWS:
-        return is_pid_alive(pid)
+        if not is_pid_alive(pid):
+            return None
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as f:
+                comm = f.read().strip()
+        except OSError:
+            try:
+                comm = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "comm="],
+                    stderr=subprocess.DEVNULL, timeout=1,
+                ).decode("utf-8", errors="replace").strip()
+            except Exception:
+                comm = ""
+        return _basename_provider(os.path.basename(comm)) or "claude"
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return False
+        return None
     try:
         ec = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(ec)) or ec.value != STILL_ACTIVE:
-            return False
+            return None
         buf = ctypes.create_unicode_buffer(260)
         size = wintypes.DWORD(260)
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            return False
-        return _is_claude_basename(os.path.basename(buf.value))
+            return None
+        return _basename_provider(os.path.basename(buf.value))
     finally:
         kernel32.CloseHandle(handle)
+
+
+def is_claude_pid_alive(pid: int) -> bool:
+    """True iff PID belongs to a live LLM CLI we recognise (claude or codex)."""
+    return known_llm_pid_provider(pid) is not None
 
 
 def load_nested_pids(state_root: str) -> set:
@@ -279,6 +322,59 @@ def load_nested_pids(state_root: str) -> set:
             except OSError:
                 pass
     return alive
+
+
+# Cooldown that mirrors write-state.py's _HAIKU_REFRESH_SECONDS so virtual
+# rows obey the same refresh cadence Claude Code's Stop-hook path does.
+_CODEX_SUMMARY_COOLDOWN_S = 300
+
+
+def _hooks_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".claude", "hooks")
+
+
+def _should_spawn_codex_summary(state_data: dict) -> bool:
+    """Same policy write-state.py applies on Stop hook fires."""
+    src = state_data.get("summarySource")
+    if src in (None, "", "trim"):
+        return True
+    if src in ("haiku", "codex_mini"):
+        return time.time() - state_data.get("summaryAt", 0) >= _CODEX_SUMMARY_COOLDOWN_S
+    return False
+
+
+def _spawn_codex_summary(virtual_id: str):
+    """Re-invoke write-state.py in __summarize__ mode for a PID-less row.
+
+    Hook-registered Codex sessions handle this themselves (Stop hook →
+    write-state.py main → _spawn_summarizer); PID-less rows have no hook,
+    so the overlay calls the same script directly when it sees the row
+    transition into 'done'.
+    """
+    write_state = os.path.join(_hooks_dir(), "write-state.py")
+    if not os.path.exists(write_state):
+        _log.debug("write-state.py not at %s; skipping codex summary spawn", write_state)
+        return
+    cmd = [sys.executable, write_state, "__summarize__", str(virtual_id)]
+    env = os.environ.copy()
+    env["CLAUDE_MONITOR_NESTED"] = "1"
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+        _log.debug("spawned codex summary for %s", virtual_id)
+    except Exception:
+        _log.error("failed to spawn codex summary", exc_info=True)
 
 
 def is_nested_claude_pid(pid: int, tree: dict, marker_pids: set) -> bool:
@@ -489,6 +585,23 @@ def short_cwd(cwd: str) -> str:
 
 _FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
 
+# Provider glyphs prefixed to the folder column so users can tell Claude vs
+# Codex rows at a glance. Both characters are in the BMP (U+25B3, U+25C6) so
+# the default Tk font on Windows renders them without a fallback.
+# CLAUDE_MONITOR_ASCII_GLYPH=1 swaps in ASCII fallbacks for terminals/fonts
+# that can't render the geometric shapes cleanly.
+_GLYPH_UNICODE = {"claude": "△", "codex": "◆"}
+_GLYPH_ASCII = {"claude": "[C]", "codex": "[X]"}
+
+
+def provider_glyph(provider) -> str:
+    """Short visual prefix identifying which LLM CLI a row belongs to."""
+    if not provider:
+        return ""
+    table = _GLYPH_ASCII if os.environ.get("CLAUDE_MONITOR_ASCII_GLYPH") == "1" else _GLYPH_UNICODE
+    glyph = table.get(provider)
+    return f"{glyph} " if glyph else ""
+
 
 def slot_glyph(slot) -> str:
     """Render a slot number as '(N)'; empty when slot is unset/zero."""
@@ -497,13 +610,14 @@ def slot_glyph(slot) -> str:
     return f"({slot})"
 
 
-def build_folder_head(cwd, slot):
-    """Compose 'folder(N)' / 'folder' (folder capped to _FOLDER_MAX_CHARS)."""
+def build_folder_head(cwd, slot, provider="claude"):
+    """Compose '△ folder(N)' / '◆ folder' (folder capped to _FOLDER_MAX_CHARS)."""
     base = short_cwd(cwd)
     if len(base) > _FOLDER_MAX_CHARS:
         base = base[:_FOLDER_MAX_CHARS - 3] + "..."
     glyph = slot_glyph(slot)
-    return f"{base}{glyph}" if glyph else base
+    head = f"{base}{glyph}" if glyph else base
+    return f"{provider_glyph(provider)}{head}"
 
 
 def build_summary_text(summary):
@@ -511,9 +625,9 @@ def build_summary_text(summary):
     return (summary or "").strip() or "New"
 
 
-def build_display_name(cwd, slot, summary):
+def build_display_name(cwd, slot, summary, provider="claude"):
     """Composite label used for sorting and tooltips."""
-    return f"{build_folder_head(cwd, slot)}  {build_summary_text(summary)}"
+    return f"{build_folder_head(cwd, slot, provider)}  {build_summary_text(summary)}"
 
 
 # ── InstanceTracker ───────────────────────────────────────────────
@@ -521,16 +635,17 @@ def build_display_name(cwd, slot, summary):
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
-                 "slot", "summary", "pinned_at")
+                 "slot", "summary", "pinned_at", "provider")
 
-    def __init__(self, pid, cwd, state="idle", updated_at=0):
+    def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude"):
         self.pid = pid
         self.cwd = cwd
         self.state = state
         self.updated_at = updated_at
         self.slot = 0
         self.summary = ""
-        self.display_name = build_display_name(cwd, 0, "")
+        self.provider = provider
+        self.display_name = build_display_name(cwd, 0, "", provider)
         self.blink_on = True
         self.done_since = 0.0
         self.hwnd = 0
@@ -547,7 +662,13 @@ class InstanceTracker:
         home = os.path.expanduser("~")
         self.sessions_dir = os.path.join(home, ".claude", "sessions")
         self.state_dir = get_state_dir()
-        self.instances: dict[int, Instance] = {}
+        # Keys are int PIDs for hook-driven rows and "codex:<sid8>" strings
+        # for the rollout poller's PID-less virtual rows.
+        self.instances: dict = {}
+        # Tick-over cache for codex_rollout_poller — keeps decoded session
+        # metadata (cwd, sessionId) keyed by file path so we don't re-parse
+        # the first line of every rollout JSONL on every poll.
+        self._codex_rollout_cache: dict = {}
 
     def poll(self):
         """Refresh instance list. Returns (changed, events)."""
@@ -558,10 +679,45 @@ class InstanceTracker:
         # nested-pids dir lives one level above state_dir (under monitor/)
         marker_pids = load_nested_pids(os.path.dirname(self.state_dir))
 
+        # First pass: read every sessions/*.json once, then hand the
+        # collected sessionIds to the codex rollout poller. The poller may
+        # write new virtual session files; we re-glob below to pick those
+        # up (the file load is cached in `sessions_data` so the same path
+        # isn't decoded twice).
+        sessions_data = {}
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
             try:
                 with open(sf, "r", encoding="utf-8") as f:
-                    sess = json.load(f)
+                    sessions_data[sf] = json.load(f)
+            except Exception:
+                continue
+
+        if poll_codex_rollouts is not None:
+            known_session_ids = {
+                sd["sessionId"]
+                for sf, sd in sessions_data.items()
+                if not os.path.basename(sf).startswith("codex-") and sd.get("sessionId")
+            }
+            try:
+                poll_codex_rollouts(
+                    known_session_ids,
+                    self._codex_rollout_cache,
+                    self.sessions_dir,
+                    self.state_dir,
+                )
+            except Exception:
+                _log.debug("codex rollout poller failed", exc_info=True)
+
+        for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
+            sess = sessions_data.get(sf)
+            if sess is None:
+                # File written by the poller in the call above; load it now.
+                try:
+                    with open(sf, "r", encoding="utf-8") as f:
+                        sess = json.load(f)
+                except Exception:
+                    continue
+            try:
                 pid = sess.get("pid")
                 cwd = sess.get("cwd", "")
                 if pid is None:
@@ -569,7 +725,12 @@ class InstanceTracker:
             except Exception:
                 continue
 
-            if not is_claude_pid_alive(pid):
+            if is_virtual_id(pid):
+                # Virtual rows are owned by codex_rollout_poller, which
+                # writes/evicts both files atomically. Don't attempt the
+                # alive check (no real PID) and don't delete on its behalf.
+                pass
+            elif not isinstance(pid, int) or not is_claude_pid_alive(pid):
                 if pid in self.instances:
                     del self.instances[pid]
                     changed = True
@@ -577,11 +738,12 @@ class InstanceTracker:
                     os.remove(sf)
                 except Exception:
                     pass
-                state_file = os.path.join(self.state_dir, f"{pid}.json")
-                try:
-                    os.remove(state_file)
-                except Exception:
-                    pass
+                if isinstance(pid, int):
+                    state_file = os.path.join(self.state_dir, f"{pid}.json")
+                    try:
+                        os.remove(state_file)
+                    except Exception:
+                        pass
                 continue
 
             # Skip nested `claude -p` subprocesses (e.g. our own summarizer).
@@ -609,12 +771,17 @@ class InstanceTracker:
                 saved_slot = st.get("slot", 0)
                 saved_summary = st.get("summary", "")
                 saved_cwd = st.get("cwd") or ""
+                saved_provider = st.get("provider", "claude")
             except Exception:
                 continue
 
             # Cleanup orphan state files for dead PIDs (sessions/*.json may have
             # been removed earlier without removing the matching state JSON).
-            if not is_claude_pid_alive(pid):
+            # Virtual rows skip the alive check — codex_rollout_poller owns
+            # eviction for those.
+            if is_virtual_id(pid):
+                pass
+            elif not isinstance(pid, int) or not is_claude_pid_alive(pid):
                 try:
                     os.remove(sf)
                 except OSError:
@@ -632,6 +799,9 @@ class InstanceTracker:
                 if saved_summary != inst.summary:
                     inst.summary = saved_summary
                     changed = True
+                if saved_provider and saved_provider != inst.provider:
+                    inst.provider = saved_provider
+                    changed = True
                 # state JSON wins for cwd: sessions/*.json may have been
                 # rebuilt with a stale subdirectory cwd after a Claude Code
                 # self-update; state JSON preserves the home cwd.
@@ -646,6 +816,10 @@ class InstanceTracker:
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")
+                        # PID-less codex rows have no Stop hook to spawn the
+                        # summarizer for them — do it here on the done edge.
+                        if is_virtual_id(pid) and _should_spawn_codex_summary(st):
+                            _spawn_codex_summary(pid)
                     elif state == "interrupted" and old_state != "interrupted":
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
@@ -661,7 +835,8 @@ class InstanceTracker:
         # Proactively resolve hwnd for instances that don't have one yet
         if IS_WINDOWS:
             missing_hwnd = [inst for inst in self.instances.values()
-                            if not inst.hwnd and inst.pid in seen_pids]
+                            if not inst.hwnd and inst.pid in seen_pids
+                            and isinstance(inst.pid, int)]
             if missing_hwnd:
                 try:
                     tree = build_process_tree()
@@ -678,9 +853,9 @@ class InstanceTracker:
                 del self.instances[pid]
                 changed = True
 
-        # Compose display names from cwd + slot + summary
+        # Compose display names from cwd + slot + summary + provider
         for inst in self.instances.values():
-            new_name = build_display_name(inst.cwd, inst.slot, inst.summary)
+            new_name = build_display_name(inst.cwd, inst.slot, inst.summary, inst.provider)
             if inst.display_name != new_name:
                 inst.display_name = new_name
                 changed = True
@@ -736,7 +911,13 @@ class MonitorOverlay:
             self.font_row.measure("●  "),
             self.font_row.measure("🔒  "),
         )
-        self.col_folder_w = self.font_row.measure("firstgame(99)") + 8
+        # Reserve extra width for the provider glyph prefix ('◆ ' / '[X] ').
+        # Both unicode and ASCII fallbacks are sized so users can flip
+        # CLAUDE_MONITOR_ASCII_GLYPH without re-measuring on next launch.
+        self.col_folder_w = max(
+            self.font_row.measure("◆ firstgame(99)"),
+            self.font_row.measure("[X] firstgame(99)"),
+        ) + 8
         # No ellipsis padding — overflow is hidden via grid_propagate(False).
         self.col_summary_w = self.font_row.measure("가") * self.summary_max_chars
         self.col_state_w = self.font_state.measure("Working") + 12
@@ -1003,7 +1184,7 @@ class MonitorOverlay:
         folder_box.grid_propagate(False)
         folder_box.pack_propagate(False)
         folder_lbl = tk.Label(
-            folder_box, text=build_folder_head(inst.cwd, inst.slot),
+            folder_box, text=build_folder_head(inst.cwd, inst.slot, inst.provider),
             font=self.font_row, bg=THEME["bg"], fg=THEME["fg"], anchor="w",
         )
         folder_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1071,12 +1252,21 @@ class MonitorOverlay:
                 pass
             stack.extend(w.winfo_children())
 
-    def _activate_terminal(self, claude_pid: int):
+    def _activate_terminal(self, claude_pid):
         try:
             inst = self.tracker.instances.get(claude_pid)
 
             # wezterm 페인 우선 — pane_id 기반 정확 매칭
             if inst and inst.wezterm and self._activate_wezterm_pane(inst.wezterm):
+                return
+
+            # Virtual codex rows from the rollout poller don't carry a real
+            # PID. Walk every live codex.exe and look for an ancestor window
+            # whose title matches the row's cwd (find_window_for_pid does
+            # the path-component disambiguation for us).
+            if not isinstance(claude_pid, int):
+                if IS_WINDOWS and inst and inst.cwd:
+                    self._activate_codex_pidless(inst.cwd)
                 return
 
             # 저장된 HWND 우선 사용
@@ -1098,6 +1288,23 @@ class MonitorOverlay:
                 _log.warning("_activate_terminal: no hwnd found for pid=%d", claude_pid)
         except Exception:
             _log.error("_activate_terminal failed for pid=%d", claude_pid, exc_info=True)
+
+    def _activate_codex_pidless(self, cwd: str):
+        """Best-effort window activation for a Codex row the rollout poller
+        registered without a PID. Tries every live codex.exe and lets
+        find_window_for_pid match by cwd path components."""
+        try:
+            tree = build_process_tree()
+            codex_pids = [p for p, (_, exe) in tree.items() if exe == "codex.exe"]
+            for cpid in codex_pids:
+                hwnd = find_window_for_pid(cpid, tree, cwd)
+                if hwnd:
+                    activate_window(hwnd)
+                    return
+            _log.debug("_activate_codex_pidless: no match for cwd=%s among %d codex.exe pids",
+                       cwd, len(codex_pids))
+        except Exception:
+            _log.error("_activate_codex_pidless failed", exc_info=True)
 
     def _activate_wezterm_pane(self, wezterm_info: dict) -> bool:
         """Activate wezterm tab via cli + raise GUI window. Returns True if tab activated."""
