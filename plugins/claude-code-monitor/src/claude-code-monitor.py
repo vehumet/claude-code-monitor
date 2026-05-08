@@ -1312,12 +1312,12 @@ class MonitorOverlay:
                 return
 
             # Virtual codex rows from the rollout poller don't carry a real
-            # PID. Walk every live codex.exe and look for an ancestor window
-            # whose title matches the row's cwd (find_window_for_pid does
-            # the path-component disambiguation for us).
+            # PID. Do not try to focus them; process/window ownership is
+            # ambiguous and WindowsTerminal fallback can raise an unrelated
+            # terminal. Hook-registered Codex rows have real PIDs and focus
+            # through the normal path below.
             if not isinstance(claude_pid, int):
-                if IS_WINDOWS and inst and inst.cwd:
-                    self._activate_codex_pidless(inst.cwd)
+                _log.debug("_activate_terminal: pid-less row has no focus target pid=%s", claude_pid)
                 return
 
             # 저장된 HWND 우선 사용

@@ -20,10 +20,12 @@ Files written:
       ``rolloutMtime`` track the source file so we can evict when the
       rollout goes stale or is deleted.
 
-Promotion: when a real hook fires for a session we're already mirroring,
-its sessionId shows up in ``known_session_ids`` and we delete our virtual
-files so the row "promotes" to the hook-managed PID-having form on the
-next tick.
+Ownership: when a real hook fires for a session, write-state.py records a
+``~/.claude/monitor/codex-hooked/<sessionId>.json`` marker. The poller then
+treats that rollout as hook-owned forever and will not recreate it as a
+PID-less fallback row after the real Codex process exits. Subagent rollouts
+are also classified as ignored. In both cases the source rollout JSONL is
+left untouched; only monitor-generated virtual files are cleaned up.
 """
 
 import glob
@@ -53,10 +55,22 @@ _FAIL_TYPES = {"error", "task_failed", "turn_failed"}
 # Filename prefix for our PID-less virtual rows. Kept ASCII + dashes so
 # every filesystem (and our int-PID parsers) handle it cleanly.
 VIRTUAL_PREFIX = "codex-"
+IGNORE_NESTED = "nested"
+IGNORE_HOOK_OWNED = "hook_owned"
 
 
 def _codex_sessions_root():
     return os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+
+
+def _codex_hooked_dir(state_dir):
+    return os.path.join(os.path.dirname(state_dir), "codex-hooked")
+
+
+def _is_hook_owned_session(state_dir, session_id):
+    if not session_id:
+        return False
+    return os.path.exists(os.path.join(_codex_hooked_dir(state_dir), f"{session_id}.json"))
 
 
 def virtual_id_for(session_id: str) -> str:
@@ -78,6 +92,56 @@ def _read_first_json_line(path):
         return json.loads(line)
     except (OSError, ValueError):
         return None
+
+
+def _is_nested_rollout_payload(payload):
+    """True for Codex subagent/nested exec rollouts, not user-facing sessions."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("thread_source") == "subagent":
+        return True
+    source = payload.get("source")
+    return isinstance(source, dict) and "subagent" in source
+
+
+def _ignore_reason(state_dir, session_id, payload):
+    """Return why this rollout should not create a monitor row, or None."""
+    if _is_nested_rollout_payload(payload):
+        return IGNORE_NESTED
+    if _is_hook_owned_session(state_dir, session_id):
+        return IGNORE_HOOK_OWNED
+    return None
+
+
+def _cache_ignored(prev_cache, path, mtime, session_id, reason):
+    prev_cache[path] = {
+        "mtime": mtime,
+        "session_id": session_id,
+        "ignored": True,
+        "ignore_reason": reason,
+    }
+
+
+def _drop_virtual_monitor_row(sessions_dir, state_dir, session_id):
+    """Remove only monitor-generated virtual files for an ignored rollout.
+
+    The source rollout JSONL under ~/.codex/sessions is never touched.
+    """
+    vid = virtual_id_for(session_id)
+    for p in (
+        os.path.join(sessions_dir, f"{vid}.json"),
+        os.path.join(state_dir, f"{vid}.json"),
+    ):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _ignore_rollout(prev_cache, path, mtime, session_id, reason, sessions_dir, state_dir):
+    """Mark a rollout ignored and remove only monitor-generated virtual row files."""
+    _cache_ignored(prev_cache, path, mtime, session_id, reason)
+    _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
 
 
 def _scan_turn_markers(path):
@@ -252,6 +316,26 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         # in the multi-megabyte range and re-parsing them every 500ms
         # turned the poller into the dominant cost on the hot path.
         cache_hit = cached is not None and cached.get("mtime") == mtime
+        if cache_hit and cached.get("ignored"):
+            session_id = cached.get("session_id")
+            if session_id:
+                # Hook ownership may be learned after a rollout was first
+                # cached for another ignore reason. Keep the current row hidden
+                # and refresh the reason for diagnostics.
+                if _is_hook_owned_session(state_dir, session_id):
+                    cached["ignore_reason"] = IGNORE_HOOK_OWNED
+                _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
+            seen_rollout_paths.add(path)
+            continue
+        if cache_hit and _is_hook_owned_session(state_dir, cached.get("session_id")):
+            session_id = cached.get("session_id")
+            if session_id:
+                _ignore_rollout(
+                    prev_cache, path, mtime, session_id, IGNORE_HOOK_OWNED,
+                    sessions_dir, state_dir,
+                )
+            seen_rollout_paths.add(path)
+            continue
         if cache_hit:
             session_id = cached["session_id"]
             cwd = cached["cwd"]
@@ -266,6 +350,14 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             session_id = payload.get("id")
             cwd = payload.get("cwd")
             if not session_id or not cwd:
+                continue
+            reason = _ignore_reason(state_dir, session_id, payload)
+            if reason:
+                seen_rollout_paths.add(path)
+                _ignore_rollout(
+                    prev_cache, path, mtime, session_id, reason,
+                    sessions_dir, state_dir,
+                )
                 continue
             started, completed, failed = _scan_turn_markers(path)
             prev_cache[path] = {

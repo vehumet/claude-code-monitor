@@ -116,6 +116,7 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(real_state["summary"], "old topic")
             self.assertFalse((sessions_dir / f"{vid}.json").exists())
             self.assertFalse((state_dir / f"{vid}.json").exists())
+            self.assertTrue((home / ".claude" / "monitor" / "codex-hooked" / f"{sid}.json").exists())
 
     def test_rollout_cache_hit_repairs_missing_files(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -160,6 +161,85 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertTrue((state_dir / f"{vid}.json").exists())
             state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["state"], "working")
+
+    def test_subagent_rollout_is_ignored_and_virtual_row_cleanup_only(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "monitor" / "state"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "subagent1-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                json.dumps({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": sid,
+                        "cwd": cwd,
+                        "thread_source": "subagent",
+                        "source": {"subagent": {"agent_role": "researcher"}},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_ignore")
+            vid = mod.virtual_id_for(sid)
+            (sessions_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+            (state_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+            cache = {}
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue(rollout.exists())
+            self.assertFalse((sessions_dir / f"{vid}.json").exists())
+            self.assertFalse((state_dir / f"{vid}.json").exists())
+            self.assertTrue(cache[str(rollout)]["ignored"])
+            self.assertEqual(cache[str(rollout)]["ignore_reason"], "nested")
+
+    def test_hook_owned_rollout_is_not_reimported_after_pid_exit(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "monitor" / "state"
+            hooked_dir = home / ".claude" / "monitor" / "codex-hooked"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            hooked_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "hooked11-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "thread_source": "user"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            (hooked_dir / f"{sid}.json").write_text("{}", encoding="utf-8")
+            mod = load_module(POLLER, "codex_rollout_poller_hooked")
+            vid = mod.virtual_id_for(sid)
+            (sessions_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+            (state_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+
+            cache = {}
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue(rollout.exists())
+            self.assertFalse((sessions_dir / f"{vid}.json").exists())
+            self.assertFalse((state_dir / f"{vid}.json").exists())
+            self.assertTrue(cache[str(rollout)]["ignored"])
+            self.assertEqual(cache[str(rollout)]["ignore_reason"], "hook_owned")
 
 
 if __name__ == "__main__":

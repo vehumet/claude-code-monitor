@@ -218,6 +218,28 @@ def get_state_dir():
     )
 
 
+def _monitor_root():
+    return os.path.dirname(get_state_dir())
+
+
+def _mark_codex_hooked_session(session_id):
+    """Persist that Codex hooks own this sessionId.
+
+    The rollout poller uses this marker to avoid resurrecting the same rollout
+    as a PID-less fallback row after the real Codex process exits.
+    """
+    if not session_id:
+        return
+    try:
+        d = os.path.join(_monitor_root(), "codex-hooked")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{session_id}.json")
+        data = {"sessionId": session_id, "updatedAt": int(time.time())}
+        _atomic_write_json(path, data, "codex-hooked")
+    except Exception:
+        _log.debug("failed to mark hooked codex session", exc_info=True)
+
+
 # Carry-over fields preserved across writes (slot is stable for session lifetime;
 # summary is updated by Stop hook / UserPromptSubmit fallback). `provider` is
 # decided once on the first write and frozen so a later hook firing in an
@@ -1167,6 +1189,9 @@ def main():
             p = entry[0]
     if not provider:
         provider = "claude"
+
+    if provider == "codex" and session_id:
+        _mark_codex_hooked_session(session_id)
 
     llm_pid = _find_ancestor_llm_pid(my_pid, tree)
     promoted_virtual_id = None
