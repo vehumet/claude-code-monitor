@@ -2,13 +2,13 @@
 
 Always-on-top overlay widget that shows the live status of every Claude Code **and Codex CLI** session running on your machine.
 
-Built with Claude Code, for personal use. Tested on Windows; other platforms work in part but aren't a focus.
+Built with Claude Code and Codex CLI, for personal use. Tested on Windows; other platforms work in part but aren't a focus.
 
 ![demo](docs/cm_demo.webp)
 
 ## What it shows
 
-Each row is one Claude Code or Codex session: a provider glyph (`△` Claude, `◆` Codex), a colour dot for state, the project folder + slot number, a short topic summary, and the state label.
+Each row is one Claude Code or Codex session: a provider marker (`●` Claude, `◆` Codex), state colour, the project folder + slot number, a short topic summary, and the state label.
 
 | State | Meaning |
 |---|---|
@@ -53,7 +53,7 @@ Requires Python 3.10+ with tkinter (bundled with the standard installer) and the
 
 When `~/.codex/` is present, the installer appends a marker-fenced block to `~/.codex/config.toml` that enables `[features] hooks = true` and registers `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PermissionRequest` / `Stop` hooks calling `write-state.py --provider codex <state>`. The block is idempotent on rerun and `~/.codex/config.toml` is backed up to `config.toml.bak.<unix_ts>` before any change. `python uninstall.py` removes the block cleanly.
 
-If you'd rather wire the hooks yourself or run Codex with hooks disabled, the overlay still picks up Codex sessions through the rollout JSONL fallback poller — sessions are scanned from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and shown as PID-less rows (clicks won't focus the terminal, but state and folder are visible). Pass `--skip-codex-hooks` to opt out of the auto-injection.
+If you'd rather wire the hooks yourself or run Codex with hooks disabled, the overlay still picks up user-facing Codex sessions through the rollout JSONL fallback poller — sessions are scanned from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and shown as PID-less rows (clicks won't focus the terminal, but state and folder are visible). Subagent/nested rollouts are ignored, and any session that has ever been seen by a real hook is treated as hook-owned so it won't be resurrected later as a fallback row. Pass `--skip-codex-hooks` to opt out of the auto-injection.
 
 If you move the monitor's install location after the fact, run `python uninstall.py` then `python install.py` again so the absolute paths in `config.toml` are regenerated.
 
