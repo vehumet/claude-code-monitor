@@ -131,6 +131,7 @@ THEME = {
 }
 
 DONE_BLINK_SECONDS = 5  # "done" blinks for this long, then stays solid
+STARTUP_QUIET_SECONDS = 3  # suppress stale catch-up events after opening
 
 
 # ── Config ────────────────────────────────────────────────────────
@@ -928,9 +929,10 @@ class MonitorOverlay:
         self.blink_ms = CONFIG.get("blink_interval_ms", 600)
         self.summary_max_chars = max(4, int(CONFIG.get("summary_max_chars", 12)))
         self.sound_enabled = CONFIG.get("sound_enabled", True)
-        # Suppress sound + blink for whatever state already exists when the
-        # widget first opens — those events happened before we were watching.
+        # Suppress sound + blink for whatever state already exists, including
+        # delayed catch-up writes that land just after the widget opens.
         self._first_poll = True
+        self._quiet_until = time.monotonic() + STARTUP_QUIET_SECONDS
         self.row_height = 22
         self.header_height = 22
         self.padding = 4
@@ -1079,9 +1081,8 @@ class MonitorOverlay:
     def _poll_loop(self):
         try:
             changed, events = self.tracker.poll()
-            if self._first_poll:
-                # Quench any state we inherited at startup so it doesn't blink
-                # or chime on the user.
+            if self._first_poll or time.monotonic() < self._quiet_until:
+                # Quench inherited/catch-up state so it doesn't blink or chime.
                 for inst in self.tracker.instances.values():
                     inst.done_since = 0.0
                     inst.blink_on = False

@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import glob
+import io
 import ctypes
 import ctypes.wintypes as wintypes
 
@@ -740,6 +741,8 @@ def _scan_codex_rollout(rollout_path):
 # Codex rollout event type markers — mirrors codex_rollout_poller.py's sets.
 _ROLLOUT_START_TYPES = {"task_started"}
 _ROLLOUT_COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
+_CODEX_DONE_RECHECK_ENV = "CLAUDE_MONITOR_CODEX_DONE_RECHECK"
+_CODEX_DONE_RECHECK_DELAY_S = 1.0
 
 
 def _codex_task_complete(session_id):
@@ -759,6 +762,7 @@ def _codex_task_complete(session_id):
         return True
     started = 0
     completed = 0
+    latest_marker = None
     try:
         with open(rollout, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -774,13 +778,56 @@ def _codex_task_complete(session_id):
                 pt = payload.get("type") if isinstance(payload, dict) else None
                 if pt in _ROLLOUT_START_TYPES:
                     started += 1
+                    latest_marker = "started"
                 elif pt in _ROLLOUT_COMPLETE_TYPES:
                     completed += 1
+                    latest_marker = "completed"
     except OSError:
         return True
     if started == 0 and completed == 0:
         return True  # no markers yet — conservative
+    if latest_marker == "completed":
+        return True
     return completed >= started
+
+
+def _spawn_codex_done_recheck(hook_data):
+    """Retry Codex Stop once after rollout JSONL has had time to flush.
+
+    Codex can fire the Stop hook before the trailing task_complete marker is
+    visible on disk. A detached one-shot retry prevents rows from sticking in
+    working when the immediate Stop was merely early.
+    """
+    if os.environ.get(_CODEX_DONE_RECHECK_ENV) == "1":
+        return
+    payload = json.dumps({
+        "argv": ["--provider", "codex", "done"],
+        "hook_data": hook_data,
+    }).encode("utf-8")
+    cmd = [sys.executable, os.path.abspath(__file__), "__codex_done_recheck__"]
+    env = os.environ.copy()
+    env[_CODEX_DONE_RECHECK_ENV] = "1"
+    kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "env": env,
+    }
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except Exception:
+            pass
+        _log.debug("spawned codex done recheck")
+    except Exception:
+        _log.error("failed to spawn codex done recheck", exc_info=True)
 
 
 # Default summarisation model for Codex sessions. `gpt-5.4-mini` is the
@@ -1097,6 +1144,19 @@ def main():
     args = sys.argv[1:]
     if not args:
         sys.exit(0)
+
+    if args[0] == "__codex_done_recheck__":
+        try:
+            raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+            data = json.loads(raw) if raw.strip() else {}
+            time.sleep(_CODEX_DONE_RECHECK_DELAY_S)
+            sys.argv = [sys.argv[0]] + data.get("argv", [])
+            hook_payload = json.dumps(data.get("hook_data", {})).encode("utf-8")
+            sys.stdin = io.TextIOWrapper(io.BytesIO(hook_payload), encoding="utf-8")
+            main()
+        except Exception:
+            _log.error("codex done recheck failed", exc_info=True)
+        return
 
     # Background summarizer mode (re-entry) — runs from a child env with the
     # NESTED marker set; treat as the trusted summarizer path, not a hook.
@@ -1437,6 +1497,7 @@ def main():
     if state == "done" and provider == "codex" and session_id:
         if not _codex_task_complete(session_id):
             _log.debug("=> Codex Stop: agentic turn boundary, not final done — suppressing")
+            _spawn_codex_done_recheck(hook_data)
             return
 
     # Skip write if state unchanged AND wezterm info unchanged

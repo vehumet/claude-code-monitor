@@ -118,6 +118,38 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue((home / ".claude" / "monitor" / "codex-hooked" / f"{sid}.json").exists())
 
+    def test_codex_task_complete_prefers_latest_marker(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_latest_complete")
+            mod._find_codex_rollout = lambda _sid: str(rollout)
+
+            self.assertTrue(mod._codex_task_complete("sid"))
+
+    def test_codex_task_complete_false_when_latest_marker_started(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_latest_started")
+            mod._find_codex_rollout = lambda _sid: str(rollout)
+
+            self.assertFalse(mod._codex_task_complete("sid"))
+
     def test_rollout_cache_hit_repairs_missing_files(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
