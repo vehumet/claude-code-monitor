@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Claude Code Monitor Overlay — always-on-top widget showing all Claude Code instances.
+"""Session Monitor overlay — always-on-top widget showing Claude Code and Codex sessions.
 
 Usage:
-    python  claude-code-monitor.py      # with console
-    pythonw claude-code-monitor.py      # no console window (Windows)
+    python  session-monitor.py      # with console
+    pythonw session-monitor.py      # no console window (Windows)
 
 No external dependencies — stdlib + tkinter + ctypes only.
 """
@@ -76,9 +76,9 @@ if IS_WINDOWS:
 # ── Diagnostic logger ─────────────────────────────────────────────
 
 def _setup_logger():
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "monitor")
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor")
     os.makedirs(log_dir, exist_ok=True)
-    logger = logging.getLogger("claude_monitor")
+    logger = logging.getLogger("session_monitor")
     logger.setLevel(logging.DEBUG)
     if not logger.handlers:
         handler = logging.handlers.RotatingFileHandler(
@@ -183,10 +183,10 @@ def _default_config():
 
 
 def load_config():
-    """Load config from ~/.claude/monitor/config.json, falling back to defaults."""
+    """Load config from ~/.claude/session-monitor/config.json, falling back to defaults."""
     config = _default_config()
     config_path = os.path.join(
-        os.path.expanduser("~"), ".claude", "monitor", "config.json"
+        os.path.expanduser("~"), ".claude", "session-monitor", "config.json"
     )
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -204,9 +204,9 @@ CONFIG = load_config()
 
 def get_state_dir():
     """Return state directory path (env var > default)."""
-    return os.environ.get(
-        "CLAUDE_MONITOR_STATE_DIR",
-        os.path.join(os.path.expanduser("~"), ".claude", "monitor", "state"),
+    return (
+        os.environ.get("SESSION_MONITOR_STATE_DIR")
+        or os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "state")
     )
 
 
@@ -449,7 +449,7 @@ def _spawn_codex_summary(virtual_id: str):
         return
     cmd = [sys.executable, write_state, "__summarize__", str(virtual_id)]
     env = os.environ.copy()
-    env["CLAUDE_MONITOR_NESTED"] = "1"
+    env["SESSION_MONITOR_NESTED"] = "1"
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -680,7 +680,7 @@ _FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
 # Provider glyphs shown in the left marker column so users can tell Claude vs
 # Codex rows at a glance. Filled shapes survive small UI sizes better than
 # hollow outlines.
-# CLAUDE_MONITOR_ASCII_GLYPH=1 swaps in ASCII fallbacks for terminals/fonts
+# SESSION_MONITOR_ASCII_GLYPH=1 swaps in ASCII fallbacks for terminals/fonts
 # that can't render the geometric shapes cleanly.
 _GLYPH_UNICODE = {"claude": "●", "codex": "◆"}
 _GLYPH_ASCII = {"claude": "[C]", "codex": "[X]"}
@@ -696,7 +696,8 @@ def provider_marker(provider) -> str:
     """Single-character row marker identifying which LLM CLI owns the row."""
     if not provider:
         return ""
-    table = _GLYPH_ASCII if os.environ.get("CLAUDE_MONITOR_ASCII_GLYPH") == "1" else _GLYPH_UNICODE
+    ascii_glyph = os.environ.get("SESSION_MONITOR_ASCII_GLYPH")
+    table = _GLYPH_ASCII if ascii_glyph == "1" else _GLYPH_UNICODE
     return table.get(provider, "")
 
 
@@ -1024,7 +1025,7 @@ class InstanceTracker:
 
 class MonitorOverlay:
     POSITION_FILE = os.path.join(
-        os.path.expanduser("~"), ".claude", "monitor", "position.json"
+        os.path.expanduser("~"), ".claude", "session-monitor", "position.json"
     )
 
     def __init__(self):
@@ -1043,7 +1044,7 @@ class MonitorOverlay:
 
         self.tracker = InstanceTracker()
         self.root = tk.Tk()
-        self.root.title("Claude Monitor")
+        self.root.title("Session Monitor")
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
         self.root.wm_attributes("-alpha", CONFIG.get("opacity", 0.65))
@@ -1085,7 +1086,7 @@ class MonitorOverlay:
         # Persist max-chars so write-state.py reads the same source-of-truth.
         try:
             cfg_path = os.path.join(
-                os.path.expanduser("~"), ".claude", "monitor", "config.json"
+        os.path.expanduser("~"), ".claude", "session-monitor", "config.json"
             )
             os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
             try:
@@ -1545,7 +1546,7 @@ class MonitorOverlay:
 
 def main():
     if "--version" in sys.argv or "-v" in sys.argv:
-        print(f"claude-code-monitor {__version__}")
+        print(f"session-monitor {__version__}")
         sys.exit(0)
 
     app = MonitorOverlay()

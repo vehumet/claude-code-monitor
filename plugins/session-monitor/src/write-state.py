@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code hook: write instance state for the monitor overlay.
+"""Hook entrypoint: write Claude Code/Codex session state for Session Monitor.
 
 Usage (from hook script):
     echo "$INPUT" | python write-state.py <state>
@@ -49,7 +49,7 @@ class PROCESSENTRY32(ctypes.Structure):
 # ── Logger ───────────────────────────────────────────────────────
 
 def _setup_logger():
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "monitor")
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor")
     os.makedirs(log_dir, exist_ok=True)
     logger = logging.getLogger("write_state")
     logger.setLevel(logging.DEBUG)
@@ -214,9 +214,9 @@ def _resolve_wezterm_info(existing):
 
 def get_state_dir():
     """Return state directory path (env var > default)."""
-    return os.environ.get(
-        "CLAUDE_MONITOR_STATE_DIR",
-        os.path.join(os.path.expanduser("~"), ".claude", "monitor", "state"),
+    return (
+        os.environ.get("SESSION_MONITOR_STATE_DIR")
+        or os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "state")
     )
 
 
@@ -612,7 +612,7 @@ def _iter_user_messages(jsonl_fp):
 
 
 def _nested_pids_dir():
-    return os.path.join(os.path.expanduser("~"), ".claude", "monitor", "nested-pids")
+    return os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "nested-pids")
 
 
 def _mark_nested_pid(pid):
@@ -631,7 +631,7 @@ def _spawn_summarizer(target_pid):
     cmd = [sys.executable, os.path.abspath(__file__),
            "__summarize__", str(target_pid)]
     env = os.environ.copy()
-    env["CLAUDE_MONITOR_NESTED"] = "1"
+    env["SESSION_MONITOR_NESTED"] = "1"
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -654,7 +654,7 @@ def _spawn_summarizer(target_pid):
 
 def _load_monitor_config():
     """Read the widget's config (summary_max_chars + language)."""
-    cfg = os.path.join(os.path.expanduser("~"), ".claude", "monitor", "config.json")
+    cfg = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "config.json")
     try:
         with open(cfg, "r", encoding="utf-8") as f:
             d = json.load(f)
@@ -967,7 +967,7 @@ def _build_codex_digest(scan):
 # Codex rollout event type markers — mirrors codex_rollout_poller.py's sets.
 _ROLLOUT_START_TYPES = {"task_started"}
 _ROLLOUT_COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
-_CODEX_DONE_RECHECK_ENV = "CLAUDE_MONITOR_CODEX_DONE_RECHECK"
+_CODEX_DONE_RECHECK_ENV = "SESSION_MONITOR_CODEX_DONE_RECHECK"
 _CODEX_DONE_RECHECK_DELAY_S = 1.0
 
 
@@ -1105,7 +1105,7 @@ def _call_codex_summary(transcript):
         )
 
     model = (
-        os.environ.get("CLAUDE_MONITOR_CODEX_SUMMARY_MODEL")
+        os.environ.get("SESSION_MONITOR_CODEX_SUMMARY_MODEL")
         or cfg.get("codex_summary_model")
         or _CODEX_DEFAULT_SUMMARY_MODEL
     )
@@ -1124,7 +1124,7 @@ def _call_codex_summary(transcript):
         "-",
     ]
     env = os.environ.copy()
-    env["CLAUDE_MONITOR_NESTED"] = "1"  # belt-and-braces if hooks fire anyway
+    env["SESSION_MONITOR_NESTED"] = "1"  # belt-and-braces if hooks fire anyway
     kwargs = {
         "stdin": subprocess.PIPE,
         "stdout": subprocess.DEVNULL,
@@ -1207,7 +1207,7 @@ def _call_haiku(transcript):
         "--output-format", "text",
     ]
     env = os.environ.copy()
-    env["CLAUDE_MONITOR_NESTED"] = "1"
+    env["SESSION_MONITOR_NESTED"] = "1"
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -1429,7 +1429,7 @@ def main():
     # Skip hook firings inside any nested `claude` invocation we spawned for
     # summarization, otherwise that child's hooks would create a transient
     # session entry that the overlay flickers in and out of view.
-    if os.environ.get("CLAUDE_MONITOR_NESTED") == "1":
+    if os.environ.get("SESSION_MONITOR_NESTED") == "1":
         sys.exit(0)
 
     # Optional `--provider claude|codex` prefix injected by Codex hook commands.
@@ -1479,7 +1479,11 @@ def main():
     # Provider precedence: --provider arg > env var > ancestor process tree >
     # 'claude' default (back-compat). Do not infer from hook_event_name:
     # Claude and Codex payloads both expose that key in recent CLIs.
-    provider = forced_provider or os.environ.get("CLAUDE_MONITOR_PROVIDER") or None
+    provider = (
+        forced_provider
+        or os.environ.get("SESSION_MONITOR_PROVIDER")
+        or None
+    )
     if not provider:
         p = my_pid
         _visited = set()

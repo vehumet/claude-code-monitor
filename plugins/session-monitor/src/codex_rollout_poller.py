@@ -14,14 +14,14 @@ Files written:
       Minimal session record (sessionId, cwd, virtualId, provider).
       ``_do_summarize`` reads ``sessionId`` from here to find the rollout.
 
-  ``~/.claude/monitor/state/codex-<sid8>.json``
+  ``~/.claude/session-monitor/state/codex-<sid8>.json``
       State record (state, cwd, updatedAt, provider, summary fields…).
       The overlay renders this directly. ``rolloutPath`` and
       ``rolloutMtime`` track the source file so we can evict when the
       rollout goes stale or is deleted.
 
 Ownership: when a real hook fires for a session, write-state.py records a
-``~/.claude/monitor/codex-hooked/<sessionId>.json`` marker. The poller then
+``~/.claude/session-monitor/codex-hooked/<sessionId>.json`` marker. The poller then
 treats that rollout as hook-owned forever and will not recreate it as a
 PID-less fallback row after the real Codex process exits. Subagent rollouts
 are also classified as ignored. In both cases the source rollout JSONL is

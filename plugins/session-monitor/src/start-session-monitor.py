@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detached launcher for Claude Code Monitor."""
+"""Detached launcher for Session Monitor."""
 
 import os
 import shutil
@@ -20,7 +20,7 @@ def _script_dir():
 
 
 def _default_monitor_path():
-    return os.path.join(_script_dir(), "claude-code-monitor.py")
+    return os.path.join(_script_dir(), "session-monitor.py")
 
 
 def _resolve_pythonw():
@@ -41,9 +41,9 @@ def _resolve_pythonw():
 def _monitor_running():
     if IS_WINDOWS:
         cmd = (
-            "$needle = 'claude-code-monitor' + '.py'; "
+            "$needle = '[\\\\/]session-monitor\\.py(\"|\\s|$)'; "
             "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match $needle } | "
+            "Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^pythonw?\\.exe$' -and $_.CommandLine -match $needle } | "
             "Select-Object -First 1 -ExpandProperty ProcessId"
         )
         kwargs = {
@@ -67,7 +67,7 @@ def _monitor_running():
         return False
     try:
         proc = subprocess.run(
-            [pgrep, "-f", "[c]laude-code-monitor.py"],
+            [pgrep, "-f", r"[/\\][s]ession-monitor.py([[:space:]]|$)"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -8,13 +8,13 @@ description: Launch or reopen the session monitor overlay from Codex. Use when t
 Run exactly one shell command:
 
 ```bash
-python ~/.claude/monitor/start-monitor.py
+python ~/.claude/session-monitor/start-session-monitor.py
 ```
 
 If `python` is unavailable on Windows, retry once with:
 
 ```powershell
-py ~/.claude/monitor/start-monitor.py
+py ~/.claude/session-monitor/start-session-monitor.py
 ```
 
 Do not inspect the repository, modify files, install packages, or explain setup unless the command fails. Report the result in one short sentence.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Uninstaller for Claude Code Monitor.
+"""Uninstaller for Session Monitor.
 
 Removes installed files and cleans up hooks from settings.json.
 No external dependencies — stdlib only.
@@ -18,25 +18,27 @@ import time
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
-MONITOR_DIR = os.path.join(CLAUDE_DIR, "monitor")
+MONITOR_DIR = os.path.join(CLAUDE_DIR, "session-monitor")
 HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
 COMMANDS_DIR = os.path.join(CLAUDE_DIR, "commands")
 SETTINGS_FILE = os.path.join(CLAUDE_DIR, "settings.json")
 CODEX_CONFIG = os.path.join(HOME, ".codex", "config.toml")
 CODEX_SKILL_DIRS = [
     os.path.join(HOME, ".codex", "skills", "session-monitor"),
-    os.path.join(HOME, ".codex", "skills", "claude-monitor"),
 ]
-CODEX_HOOK_MARKER_OPEN = "# >>> claude-code-monitor codex hooks (managed) >>>"
-CODEX_HOOK_MARKER_CLOSE = "# <<< claude-code-monitor codex hooks (managed) <<<"
-CODEX_FEATURE_FLAG_TAG = "added by claude-code-monitor"
+CODEX_HOOK_MARKER_OPEN = "# >>> session-monitor codex hooks (managed) >>>"
+CODEX_HOOK_MARKER_CLOSE = "# <<< session-monitor codex hooks (managed) <<<"
+CODEX_FEATURE_FLAG_TAG = "added by session-monitor"
 
 # Files that may be preserved
-CONFIG_FILES = {"config.json", "position.json"}
+CONFIG_FILES = {"config.json", "position.json", "pins.json"}
 
 # Files to remove
 HOOK_FILES = [os.path.join(HOOKS_DIR, "write-state.py")]
-COMMAND_FILES = [os.path.join(COMMANDS_DIR, "monitor.md")]
+COMMAND_FILES = [
+    os.path.join(COMMANDS_DIR, "session-monitor.md"),
+]
+MANAGED_COMMAND_MARKER = "<!-- session-monitor:managed-command -->"
 
 
 def _has_write_state_hook(hook_entry: dict) -> bool:
@@ -46,6 +48,24 @@ def _has_write_state_hook(hook_entry: dict) -> bool:
         if "write-state.py" in cmd:
             return True
     return False
+
+
+def _is_managed_command_file(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    if MANAGED_COMMAND_MARKER in text:
+        return True
+    return (
+        "start-session-monitor.py" in text
+        and "Run this single command immediately" in text
+        and "Do NOT check if it's running beforehand" in text
+        and "Session monitor launched." in text
+    )
 
 
 def remove_codex_hooks(dry_run=False) -> bool:
@@ -140,7 +160,7 @@ def remove_hooks(settings: dict) -> bool:
 
 
 def uninstall(dry_run=False, keep_config=False):
-    print("Claude Code Monitor - Uninstaller")
+    print("Session Monitor - Uninstaller")
     print("=" * 35)
     print()
 
@@ -159,15 +179,18 @@ def uninstall(dry_run=False, keep_config=False):
     print("Removing command files...")
     for fpath in COMMAND_FILES:
         if os.path.exists(fpath):
-            print(f"  rm {fpath}")
-            if not dry_run:
-                os.remove(fpath)
+            if _is_managed_command_file(fpath):
+                print(f"  rm {fpath}")
+                if not dry_run:
+                    os.remove(fpath)
+            else:
+                print(f"  (keeping unmanaged) {fpath}")
         else:
             print(f"  (not found) {fpath}")
 
     # 3. Remove monitor directory
     print()
-    print("Removing monitor directory...")
+    print("Removing session monitor directory...")
     if os.path.isdir(MONITOR_DIR):
         if keep_config:
             # Remove everything except config files

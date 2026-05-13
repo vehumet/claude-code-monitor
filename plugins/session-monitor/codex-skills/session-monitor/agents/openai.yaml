@@ -1,4 +1,4 @@
 interface:
   display_name: "Session Monitor"
-  short_description: "Launch the Claude/Codex session monitor overlay"
+  short_description: "Launch the session monitor overlay"
   default_prompt: "Launch the session monitor overlay"

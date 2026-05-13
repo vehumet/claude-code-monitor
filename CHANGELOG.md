@@ -7,10 +7,11 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Drop the private Claude plugin marketplace installation path. The Python installer is now the only supported install method, with root-level `install.py` and `uninstall.py` entry points.
-- Replace the Windows VBS monitor launcher with a Python detached launcher (`start-monitor.py`), used by both `/monitor` and manual launch instructions.
-- Install a Codex `$session-monitor` skill as the Codex-side equivalent of Claude Code's `/monitor` command, and make the launcher no-op when the overlay is already running.
+- Replace the Windows VBS monitor launcher with a Python detached launcher (`start-session-monitor.py`), used by both `/session-monitor` and manual launch instructions.
+- Rename the Claude Code slash command to `/session-monitor` and install a matching Codex `$session-monitor` skill.
 - Update README install/update/uninstall instructions so an LLM can install from the GitHub URL with `git clone` followed by `python install.py`.
-- Clarify that Claude Code and Codex CLI sessions should be restarted after install/update before using `/monitor` or `$session-monitor`.
+- Clarify that Claude Code and Codex CLI sessions should be restarted after install/update before using `/session-monitor` or `$session-monitor`.
+- Rename user-facing branding, install path, source paths, and environment variables to Session Monitor names.
 - Claude hooks now pass `--provider claude` explicitly, and reinstalling updates older managed hook commands in place.
 
 ### Fixed
@@ -27,7 +28,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Codex CLI session support. The overlay now monitors Codex (`codex.exe`) sessions alongside Claude Code, with provider markers in the left status column (`●` for Claude, `◆` for Codex; ASCII `[C]`/`[X]` fallback via `CLAUDE_MONITOR_ASCII_GLYPH=1`). Same colour palette, same state vocabulary, same sounds.
+- Codex CLI session support. The overlay now monitors Codex (`codex.exe`) sessions alongside Claude Code, with provider markers in the left status column (`●` for Claude, `◆` for Codex; ASCII `[C]`/`[X]` fallback via `SESSION_MONITOR_ASCII_GLYPH=1`). Same colour palette, same state vocabulary, same sounds.
 - Codex hook auto-installation via `install.py`: when `~/.codex/` is present, the installer appends a marker-fenced block to `~/.codex/config.toml` that enables `[features] hooks = true` and registers `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PermissionRequest` / `Stop` hooks calling `write-state.py --provider codex <state>`. Idempotent on rerun, backed up to `config.toml.bak.<ts>`. `--skip-codex-hooks` opts out for users who'd rather wire it themselves.
 - Rollout JSONL fallback poller (`codex_rollout_poller.py`): when hooks are disabled or hook injection failed, the overlay still discovers user-facing Codex sessions by scanning `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Rollout-discovered sessions appear as PID-less virtual rows (`codex-<sid8>`) with state inferred from in-band `event_msg` markers.
 
@@ -37,14 +38,14 @@ All notable changes to this project will be documented in this file.
 - PID-validation helpers (`_pid_is_claude`, `_is_claude_basename`, `is_claude_pid_alive`) generalised to recognise both `claude.exe` (incl. the `claude.exe.old.*` self-update rename) and `codex.exe`. Existing call sites unchanged through thin compatibility wrappers.
 - `write-state.py` accepts an optional `--provider claude|codex` CLI prefix (Codex hooks pass `--provider codex` because Codex's runtime doesn't expand `${CLAUDE_PLUGIN_ROOT}`). Provider is otherwise auto-detected from stdin payload (`hook_event_name` only appears in Codex hook payloads) or the ancestor process tree.
 - `uninstall.py` now also strips the marker-fenced Codex block and the inserted `hooks = true` (or legacy `codex_hooks = true`) flag from `~/.codex/config.toml`.
-- Pinned rows now persist across monitor restarts for live sessions via `~/.claude/monitor/pins.json`.
+- Pinned rows now persist across monitor restarts for live sessions via `~/.claude/session-monitor/pins.json`.
 - Provider identity moved out of the folder label and into the left status marker column, so folder names stay aligned.
 - Rollout poller infers state from in-band `task_started` / `task_complete` event counts instead of mtime freshness, so a Codex turn that goes silent during reasoning no longer flips the row between Working and Done. mtime is now only the fallback for the brief window before the first turn marker appears (raised from 5s to 30s).
 - PID-less Codex rows no longer attempt terminal focus, because rollout files do not carry process/window ownership and WindowsTerminal fallback can focus unrelated terminals. Hook-registered rows continue to use real PIDs / recorded `hwnd`.
 - `install.py` writes the new `[features].hooks = true` flag instead of the deprecated `codex_hooks` (Codex 0.128+ warns on the old name) and migrates existing installations in place — the flag line is rewritten, marker block stays put, and `~/.codex/config.toml` is backed up to `config.toml.bak.<unix_ts>`.
-- Codex Stop hook now spawns the same background summarizer Claude does, but shells out to `codex exec --ephemeral --ignore-user-config --color never -m <model> -o <file>` and walks the rollout JSONL for the richest available signal. Single-pass scan picks one of, in priority order: most-recent `agent_message` with `phase: final_answer` (Codex's analogue of Claude's away_summary — usually the turn-completion message) → first `agent_message` with `phase: commentary` (the assistant's plan/intro for the current turn) → first 5 `user_message` events. Default model `gpt-5.4-mini`; override with `CLAUDE_MONITOR_CODEX_SUMMARY_MODEL` env var or `codex_summary_model` in `~/.claude/monitor/config.json`. `--ephemeral` keeps the call from creating its own rollout file, `--ignore-user-config` keeps it from re-firing our hooks, and the captured summary is written to state JSON with `summarySource: "codex_mini"` (refresh policy reuses the 5-minute Haiku cooldown).
-- Rollout poller now persists virtual rows to disk (`~/.claude/sessions/codex-<sid8>.json` + `~/.claude/monitor/state/codex-<sid8>.json`) instead of merging in-memory, so PID-less Codex sessions (those running with `[features] hooks` off, or started before the hook block was installed) flow through the standard sessions/state pipeline, get slot numbers, and auto-summary when the overlay sees the row transition to `done`. The summarizer is spawned by the overlay (not a hook) since these sessions have no hook to fire; the same `_should_summarize` cooldown applies.
-- Codex rollout ownership is now explicit: hook-seen sessionIds are marked under `~/.claude/monitor/codex-hooked/`, subagent/nested rollouts are ignored, and ignored rollouts only remove monitor-generated virtual row files. Source rollout JSONL files are never deleted.
+- Codex Stop hook now spawns the same background summarizer Claude does, but shells out to `codex exec --ephemeral --ignore-user-config --color never -m <model> -o <file>` and walks the rollout JSONL for the richest available signal. Single-pass scan picks one of, in priority order: most-recent `agent_message` with `phase: final_answer` (Codex's analogue of Claude's away_summary — usually the turn-completion message) → first `agent_message` with `phase: commentary` (the assistant's plan/intro for the current turn) → first 5 `user_message` events. Default model `gpt-5.4-mini`; override with `SESSION_MONITOR_CODEX_SUMMARY_MODEL` env var or `codex_summary_model` in `~/.claude/session-monitor/config.json`. `--ephemeral` keeps the call from creating its own rollout file, `--ignore-user-config` keeps it from re-firing our hooks, and the captured summary is written to state JSON with `summarySource: "codex_mini"` (refresh policy reuses the 5-minute Haiku cooldown).
+- Rollout poller now persists virtual rows to disk (`~/.claude/sessions/codex-<sid8>.json` + `~/.claude/session-monitor/state/codex-<sid8>.json`) instead of merging in-memory, so PID-less Codex sessions (those running with `[features] hooks` off, or started before the hook block was installed) flow through the standard sessions/state pipeline, get slot numbers, and auto-summary when the overlay sees the row transition to `done`. The summarizer is spawned by the overlay (not a hook) since these sessions have no hook to fire; the same `_should_summarize` cooldown applies.
+- Codex rollout ownership is now explicit: hook-seen sessionIds are marked under `~/.claude/session-monitor/codex-hooked/`, subagent/nested rollouts are ignored, and ignored rollouts only remove monitor-generated virtual row files. Source rollout JSONL files are never deleted.
 - Hot-path optimisations after a `simplify`-pass review: poller caches `task_started` / `task_complete` counts in `prev_cache` and skips the per-tick rollout re-scan when mtime is unchanged (large rollouts can be multi-MB and were re-parsed every 500ms); poller skips the state JSON write entirely on cache-hit so the overlay isn't re-reading state every tick for unchanged sessions; `InstanceTracker.poll` reads each `sessions/*.json` once per tick instead of twice (was doing `known_session_ids` collection + main loop separately); `prev_cache` now evicts entries past `_SCAN_MAX_AGE_S` so an always-on monitor doesn't accumulate forever.
 
 ## [0.0.19] - 2026-05-05
@@ -180,8 +181,8 @@ All notable changes to this project will be documented in this file.
 - `write-state.py`: process tree now stores exe name (`pid -> (parent_pid, exe)`)
 - `write-state.py`: accept terminal host HWND on UserPromptSubmit hook
 - `write-state.py`: add Phase 3.5 ancestor PID matching before Phase 4 fallback
-- `claude-code-monitor.py`: add Phase 1c global WindowsTerminal scan in `find_window_for_pid()`
-- `claude-code-monitor.py`: filter out "Program Manager" from window candidates
+- `session-monitor.py`: add Phase 1c global WindowsTerminal scan in `find_window_for_pid()`
+- `session-monitor.py`: filter out "Program Manager" from window candidates
 
 ## [0.0.4] - 2026-03-17
 
@@ -231,8 +232,8 @@ All notable changes to this project will be documented in this file.
 - Click-to-focus: click an instance to bring its terminal to the foreground
 - Draggable overlay with position persistence
 - i18n support (English, Korean)
-- Configurable via `~/.claude/monitor/config.json`
-- `CLAUDE_MONITOR_STATE_DIR` environment variable for custom state directory
+- Configurable via `~/.claude/session-monitor/config.json`
+- `SESSION_MONITOR_STATE_DIR` environment variable for custom state directory
 - Claude Code Plugin support (hooks.json + slash command)
 - Standalone install/uninstall scripts with settings.json merge
 - `--version` flag

@@ -10,10 +10,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRITE_STATE = ROOT / "plugins" / "claude-code-monitor" / "src" / "write-state.py"
-POLLER = ROOT / "plugins" / "claude-code-monitor" / "src" / "codex_rollout_poller.py"
-MONITOR = ROOT / "plugins" / "claude-code-monitor" / "src" / "claude-code-monitor.py"
-START_MONITOR = ROOT / "plugins" / "claude-code-monitor" / "src" / "start-monitor.py"
+WRITE_STATE = ROOT / "plugins" / "session-monitor" / "src" / "write-state.py"
+POLLER = ROOT / "plugins" / "session-monitor" / "src" / "codex_rollout_poller.py"
+MONITOR = ROOT / "plugins" / "session-monitor" / "src" / "session-monitor.py"
+START_MONITOR = ROOT / "plugins" / "session-monitor" / "src" / "start-session-monitor.py"
+INSTALLER = ROOT / "plugins" / "session-monitor" / "install.py"
 
 
 def load_module(path, name):
@@ -31,7 +32,7 @@ class _FakeStdin:
 
 class MonitorCoreTests(unittest.TestCase):
     def tearDown(self):
-        for name in ("write_state", "claude_monitor"):
+        for name in ("write_state", "session_monitor"):
             logger = logging.getLogger(name)
             for handler in list(logger.handlers):
                 logger.removeHandler(handler)
@@ -52,7 +53,7 @@ class MonitorCoreTests(unittest.TestCase):
             home = Path(td)
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             sessions_dir = home / ".claude" / "sessions"
             state_dir.mkdir(parents=True)
             sessions_dir.mkdir(parents=True)
@@ -118,7 +119,7 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(real_state["summary"], "old topic")
             self.assertFalse((sessions_dir / f"{vid}.json").exists())
             self.assertFalse((state_dir / f"{vid}.json").exists())
-            self.assertTrue((home / ".claude" / "monitor" / "codex-hooked" / f"{sid}.json").exists())
+            self.assertTrue((home / ".claude" / "session-monitor" / "codex-hooked" / f"{sid}.json").exists())
 
     def test_codex_task_complete_prefers_latest_marker(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -267,7 +268,7 @@ class MonitorCoreTests(unittest.TestCase):
 
         self.assertEqual(
             Path(mod._default_monitor_path()),
-            START_MONITOR.with_name("claude-code-monitor.py"),
+            START_MONITOR.with_name("session-monitor.py"),
         )
 
     def test_start_monitor_resolves_sibling_pythonw_on_windows(self):
@@ -291,7 +292,7 @@ class MonitorCoreTests(unittest.TestCase):
 
     def test_start_monitor_does_not_spawn_duplicate_monitor(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            monitor = Path(td) / "claude-code-monitor.py"
+            monitor = Path(td) / "session-monitor.py"
             monitor.write_text("", encoding="utf-8")
 
             mod = load_module(START_MONITOR, "start_monitor_no_duplicate")
@@ -300,12 +301,46 @@ class MonitorCoreTests(unittest.TestCase):
 
             self.assertIsNone(mod.launch(str(monitor)))
 
+    def test_state_dir_uses_session_monitor_env_name(self):
+        mod = load_module(MONITOR, "session_monitor_state_dir_env")
+        old_new = os.environ.get("SESSION_MONITOR_STATE_DIR")
+        try:
+            os.environ["SESSION_MONITOR_STATE_DIR"] = "new-state"
+
+            self.assertEqual(mod.get_state_dir(), "new-state")
+        finally:
+            if old_new is None:
+                os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+            else:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = old_new
+
+    def test_command_file_ownership_detection_is_narrow(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            user_command = Path(td) / "session-monitor.md"
+            user_command.write_text(
+                "# Session Monitor\n\nMy own command.\n",
+                encoding="utf-8",
+            )
+            managed_command = Path(td) / "managed.md"
+            managed_command.write_text(
+                "start-session-monitor.py\n"
+                "Run this single command immediately\n"
+                "Do NOT check if it's running beforehand\n"
+                "Session monitor launched.\n",
+                encoding="utf-8",
+            )
+
+            mod = load_module(INSTALLER, "installer_command_ownership")
+
+            self.assertFalse(mod._is_managed_command_file(str(user_command)))
+            self.assertTrue(mod._is_managed_command_file(str(managed_command)))
+
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             sessions_dir = home / ".claude" / "sessions"
             state_dir.mkdir(parents=True)
             sessions_dir.mkdir(parents=True)
@@ -360,7 +395,7 @@ class MonitorCoreTests(unittest.TestCase):
             home = Path(td)
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             sessions_dir = home / ".claude" / "sessions"
             state_dir.mkdir(parents=True)
             sessions_dir.mkdir(parents=True)
@@ -414,7 +449,7 @@ class MonitorCoreTests(unittest.TestCase):
             session.write_text(json.dumps({"status": "busy"}), encoding="utf-8")
             transcript.write_text("{}\n", encoding="utf-8")
 
-            mod = load_module(MONITOR, "claude_monitor_question_resolve")
+            mod = load_module(MONITOR, "session_monitor_question_resolve")
             question_at = 100.0
             state = {
                 "state": "question",
@@ -448,7 +483,7 @@ class MonitorCoreTests(unittest.TestCase):
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
             sessions_dir = home / ".claude" / "sessions"
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
             sessions_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
@@ -492,7 +527,7 @@ class MonitorCoreTests(unittest.TestCase):
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
             sessions_dir = home / ".claude" / "sessions"
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
             sessions_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
@@ -532,7 +567,7 @@ class MonitorCoreTests(unittest.TestCase):
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
             sessions_dir = home / ".claude" / "sessions"
-            state_dir = home / ".claude" / "monitor" / "state"
+            state_dir = home / ".claude" / "session-monitor" / "state"
             rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
             sessions_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
@@ -573,8 +608,8 @@ class MonitorCoreTests(unittest.TestCase):
             os.environ["HOME"] = td
             os.environ["USERPROFILE"] = td
             sessions_dir = home / ".claude" / "sessions"
-            state_dir = home / ".claude" / "monitor" / "state"
-            hooked_dir = home / ".claude" / "monitor" / "codex-hooked"
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            hooked_dir = home / ".claude" / "session-monitor" / "codex-hooked"
             rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
             sessions_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)

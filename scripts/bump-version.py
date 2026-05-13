@@ -16,7 +16,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MONITOR_PY = os.path.join(ROOT, "plugins", "claude-code-monitor", "src", "claude-code-monitor.py")
+MONITOR_PY = os.path.join(ROOT, "plugins", "session-monitor", "src", "session-monitor.py")
 
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 PY_VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Install Claude Code Monitor from the repository root."""
+"""Install Session Monitor from the repository root."""
 
 import os
 import runpy
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-INSTALLER = os.path.join(ROOT, "plugins", "claude-code-monitor", "install.py")
+INSTALLER = os.path.join(ROOT, "plugins", "session-monitor", "install.py")
 
 
 if __name__ == "__main__":
