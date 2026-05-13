@@ -85,28 +85,6 @@ HOOKS_CONFIG = {
             ],
         },
     ],
-    "PostToolUse": [
-        {
-            "matcher": "AskUserQuestion",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
-                    "timeout": 5,
-                }
-            ],
-        },
-        {
-            "matcher": "ExitPlanMode",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
-                    "timeout": 5,
-                }
-            ],
-        },
-    ],
     "Stop": [
         {
             "matcher": "",
@@ -352,16 +330,23 @@ def merge_hooks(settings: dict) -> bool:
         settings["hooks"] = {}
 
     modified = False
-    # Older installs may have catch-all tool hooks that spawn Python for every
-    # tool call. Question clearing now happens in the overlay via file-change
-    # polling, so remove only our managed catch-all entries.
+    # Older installs may have PostToolUse hooks that clear question state by
+    # writing "working". Question clearing now happens in the overlay via
+    # file-change polling; PostToolUse can be too early for ExitPlanMode
+    # approval prompts, so remove only our managed entries.
     for event_name in ("PreToolUse", "PostToolUse"):
         existing = settings["hooks"].get(event_name)
         if not isinstance(existing, list):
             continue
+        deprecated_matchers = {""}
+        if event_name == "PostToolUse":
+            deprecated_matchers.update({"AskUserQuestion", "ExitPlanMode"})
         pruned = [
             entry for entry in existing
-            if not (entry.get("matcher", "") == "" and _has_write_state_hook(entry))
+            if not (
+                entry.get("matcher", "") in deprecated_matchers
+                and _has_write_state_hook(entry)
+            )
         ]
         if len(pruned) != len(existing):
             settings["hooks"][event_name] = pruned

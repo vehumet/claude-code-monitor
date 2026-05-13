@@ -335,6 +335,44 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse(mod._is_managed_command_file(str(user_command)))
             self.assertTrue(mod._is_managed_command_file(str(managed_command)))
 
+    def test_installer_removes_deprecated_question_post_tool_hooks(self):
+        mod = load_module(INSTALLER, "installer_deprecated_question_hooks")
+        settings = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": "ExitPlanMode",
+                        "hooks": [{
+                            "type": "command",
+                            "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
+                            "timeout": 5,
+                        }],
+                    },
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": [{
+                            "type": "command",
+                            "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
+                            "timeout": 5,
+                        }],
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "python user-script.py",
+                            "timeout": 5,
+                        }],
+                    },
+                ]
+            }
+        }
+
+        self.assertTrue(mod.merge_hooks(settings))
+        post_hooks = settings["hooks"]["PostToolUse"]
+        self.assertEqual(len(post_hooks), 1)
+        self.assertEqual(post_hooks[0]["matcher"], "Bash")
+
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -390,6 +428,58 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(state["questionTranscriptSize"], transcript.stat().st_size)
             self.assertEqual(state["questionSessionPath"], str(sessions_dir / f"{real_pid}.json"))
 
+    def test_waiting_session_forces_question_on_stale_working_hook(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            sid = "exitplan-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            real_pid = 4242
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "status": "waiting",
+                    "waitingFor": "approve ExitPlanMode",
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_waiting_session")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (real_pid, "python.exe"),
+                real_pid: (1, "claude.exe"),
+                1: (0, "cmd.exe"),
+            }
+
+            payload = json.dumps({
+                "session_id": sid,
+                "cwd": cwd,
+                "tool_name": "ExitPlanMode",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "claude", "working"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+
+            state = json.loads((state_dir / f"{real_pid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["state"], "question")
+            self.assertEqual(state["questionSessionPath"], str(sessions_dir / f"{real_pid}.json"))
+
     def test_claude_hook_event_name_does_not_force_codex_provider(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -438,6 +528,59 @@ class MonitorCoreTests(unittest.TestCase):
 
             state = json.loads((state_dir / f"{real_pid}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["provider"], "claude")
+
+    def test_monitor_overlays_waiting_session_as_question(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "exitplan-session",
+                    "cwd": cwd,
+                    "status": "waiting",
+                    "waitingFor": "approve ExitPlanMode",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "working",
+                    "cwd": cwd,
+                    "provider": "claude",
+                    "updatedAt": 123,
+                    "slot": 4,
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_waiting_session")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                changed, events = tracker.poll()
+
+                self.assertTrue(changed)
+                self.assertEqual(events, ["question"])
+                self.assertEqual(tracker.instances[real_pid].state, "question")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
 
     def test_question_file_change_resolves_to_working_or_done(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

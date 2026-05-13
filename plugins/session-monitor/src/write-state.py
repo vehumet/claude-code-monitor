@@ -448,6 +448,14 @@ def _session_pid(sess, basename):
         return basename
 
 
+def _session_waits_for_user(sess):
+    if not isinstance(sess, dict):
+        return False
+    status = str(sess.get("status") or "").lower()
+    waiting_for = str(sess.get("waitingFor") or "").strip()
+    return status == "waiting" or bool(waiting_for)
+
+
 def _is_virtual_id(pid):
     return isinstance(pid, str) and pid.startswith("codex-")
 
@@ -1474,6 +1482,7 @@ def main():
 
     pid = None
     matched_cwd = cwd
+    matched_session = None
     tree = _build_process_tree()
 
     # Provider precedence: --provider arg > env var > ancestor process tree >
@@ -1523,6 +1532,7 @@ def main():
                                candidate_pid, llm_pid)
                 else:
                     pid = candidate_pid
+                    matched_session = sess
                     _log.debug("Phase 2: session_id match -> pid=%s file=%s", pid, basename)
                 break
         if pid is None and not session_matched:
@@ -1541,6 +1551,7 @@ def main():
                     _atomic_write_json(sess_file, sess, "session-register")
                     _log.debug("Phase 2.5: updated sessionId in %s.json", real_pid)
                 pid = real_pid
+                matched_session = sess
                 matched_cwd = sess.get("cwd", cwd)
             else:
                 # Prefer the cwd already recorded in our state file (the
@@ -1566,6 +1577,7 @@ def main():
                 }
                 _atomic_write_json(sess_file, sess, "session-register")
                 pid = real_pid
+                matched_session = sess
                 matched_cwd = home_cwd
                 _log.debug("Phase 2.5: created session file %s.json", real_pid)
         except Exception:
@@ -1582,6 +1594,7 @@ def main():
         if len(cwd_matches) == 1:
             sf, basename, sess = cwd_matches[0]
             pid = _session_pid(sess, basename)
+            matched_session = sess
             matched_cwd = sess.get("cwd", cwd)
             _log.debug("Phase 3: unique cwd match -> pid=%s", pid)
 
@@ -1603,6 +1616,7 @@ def main():
             if ancestor_match:
                 sf, basename, sess, sess_pid = ancestor_match
                 pid = sess_pid
+                matched_session = sess
                 matched_cwd = sess.get("cwd", cwd)
             else:
                 _log.debug("Phase 3: no ancestor match among %d cwd matches, skipping",
@@ -1616,6 +1630,7 @@ def main():
             sess_pid = _session_pid(sess, basename)
             if sess_pid in ancestors:
                 pid = sess_pid
+                matched_session = sess
                 matched_cwd = sess.get("cwd", cwd)
                 _log.debug("Phase 3.5: ancestor match -> pid=%s file=%s", pid, basename)
                 break
@@ -1679,6 +1694,14 @@ def main():
         else:
             _log.debug("=> tool_failure skipped (is_interrupt not set)")
             return
+
+    # ExitPlanMode can fire PostToolUse while Claude is still waiting for plan
+    # approval. Treat that stale "working" write as question state when the
+    # session metadata already exposes the waiting flag.
+    if state == "working" and provider == "claude" and _session_waits_for_user(matched_session):
+        state = "question"
+        _log.debug("=> working resolved to 'question' (session waitingFor=%r)",
+                   matched_session.get("waitingFor") if matched_session else None)
 
     # Guard: catch-all "working"이 동시 실행된 "question"을 덮어쓰는 것을 방지
     # PreToolUse에서 catch-all("working")과 specific("question") 훅이 동시에 실행됨

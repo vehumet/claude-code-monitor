@@ -287,6 +287,8 @@ def resolve_question_state_from_files(state_data, sessions_data=None, now=None):
     if session_data is None and session_path:
         session_data = _read_json_file(session_path)
     session_status = (session_data or {}).get("status")
+    if str(session_status or "").lower() == "waiting" or (session_data or {}).get("waitingFor"):
+        return None
     if session_status == "idle":
         return "done"
 
@@ -303,6 +305,15 @@ def resolve_question_state_from_files(state_data, sessions_data=None, now=None):
     if transcript_changed or session_changed:
         return "working"
     return None
+
+
+def session_waits_for_user(session_data) -> bool:
+    """Return True when Claude's session metadata says it is awaiting input."""
+    if not isinstance(session_data, dict):
+        return False
+    status = str(session_data.get("status") or "").lower()
+    waiting_for = str(session_data.get("waitingFor") or "").strip()
+    return status == "waiting" or bool(waiting_for)
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -822,6 +833,7 @@ class InstanceTracker:
         # up (the file load is cached in `sessions_data` so the same path
         # isn't decoded twice).
         sessions_data = {}
+        session_by_pid = {}
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
             try:
                 with open(sf, "r", encoding="utf-8") as f:
@@ -860,6 +872,7 @@ class InstanceTracker:
                 session_id = sess.get("sessionId", "") or ""
                 if pid is None:
                     continue
+                session_by_pid[pid] = sess
             except Exception:
                 continue
 
@@ -920,6 +933,10 @@ class InstanceTracker:
                 saved_provider = st.get("provider", "claude")
             except Exception:
                 continue
+
+            session_data = session_by_pid.get(pid)
+            if saved_provider == "claude" and session_waits_for_user(session_data):
+                state = "question"
 
             replacement_state = resolve_question_state_from_files(st, sessions_data)
             if replacement_state:
