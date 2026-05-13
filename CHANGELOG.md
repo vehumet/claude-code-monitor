@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Drop the private Claude plugin marketplace installation path. The Python installer is now the only supported install method, with root-level `install.py` and `uninstall.py` entry points.
+- Update README install/update/uninstall instructions so an LLM can install from the GitHub URL with `git clone` followed by `python install.py`.
+- Claude hooks now pass `--provider claude` explicitly, and reinstalling updates older managed hook commands in place.
+
+### Fixed
+
+- Do not classify Claude hook payloads as Codex just because they contain `hook_event_name`.
+- Ignore non-interactive `codex exec` rollouts in the fallback poller so summary/background exec sessions do not appear as PID-less monitor rows.
+
+### Removed
+
+- Remove marketplace/plugin metadata, marketplace hook definitions, and the marketplace-specific `/update-monitor` command.
+
 ## [0.0.20] - 2026-05-08
 
 ### Added

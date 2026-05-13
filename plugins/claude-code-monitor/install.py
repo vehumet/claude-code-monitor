@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone installer for Claude Code Monitor.
+"""Python installer for Claude Code Monitor.
 
 Copies files to ~/.claude/monitor/ and merges hooks into settings.json.
 No external dependencies — stdlib only.
@@ -63,7 +63,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "question"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
                     "timeout": 5,
                 }
             ],
@@ -73,7 +73,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "question"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
                     "timeout": 5,
                 }
             ],
@@ -85,7 +85,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "working"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
                     "timeout": 5,
                 }
             ],
@@ -95,7 +95,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "working"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
                     "timeout": 5,
                 }
             ],
@@ -107,7 +107,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "done"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "done"',
                     "timeout": 10,
                 }
             ],
@@ -119,7 +119,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" "working"',
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
                     "timeout": 5,
                 }
             ],
@@ -300,6 +300,23 @@ def _has_write_state_hook(hook_entry: dict) -> bool:
     return False
 
 
+def _sync_write_state_hook(existing_entry: dict, desired_entry: dict) -> bool:
+    """Update our managed hook command in place when installer defaults change."""
+    modified = False
+    desired_hooks = desired_entry.get("hooks", [])
+    if len(desired_hooks) != 1:
+        return False
+    desired_hook = desired_hooks[0]
+    for hook in existing_entry.get("hooks", []):
+        if "write-state.py" not in hook.get("command", ""):
+            continue
+        if hook != desired_hook:
+            hook.clear()
+            hook.update(desired_hook)
+            modified = True
+    return modified
+
+
 def merge_hooks(settings: dict) -> bool:
     """Merge monitor hooks into settings, skipping duplicates. Returns True if modified."""
     if "hooks" not in settings:
@@ -333,6 +350,8 @@ def merge_hooks(settings: dict) -> bool:
             for ex_entry in existing:
                 if ex_entry.get("matcher") == new_entry.get("matcher") and _has_write_state_hook(ex_entry):
                     duplicate = True
+                    if _sync_write_state_hook(ex_entry, new_entry):
+                        modified = True
                     break
             if not duplicate:
                 existing.append(new_entry)
@@ -342,7 +361,7 @@ def merge_hooks(settings: dict) -> bool:
 
 
 def install(dry_run=False, skip_codex_hooks=False):
-    print("Claude Code Monitor - Standalone Installer")
+    print("Claude Code Monitor - Python Installer")
     print("=" * 45)
     print()
 

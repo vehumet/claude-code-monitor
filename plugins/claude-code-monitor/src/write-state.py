@@ -241,14 +241,13 @@ def _mark_codex_hooked_session(session_id):
         _log.debug("failed to mark hooked codex session", exc_info=True)
 
 
-# Carry-over fields preserved across writes (slot is stable for session lifetime;
-# summary is updated by Stop hook / UserPromptSubmit fallback). `provider` is
-# decided once on the first write and frozen so a later hook firing in an
-# unusual environment can't flip a row's identity.
+# Carry-over fields preserved across writes. Slot is stable for session lifetime;
+# summary is updated by Stop hook / UserPromptSubmit fallback. Provider is
+# recomputed from explicit hook commands or the live process tree so older
+# misclassified state files can self-correct.
 _PRESERVED_FIELDS = (
     "slot", "summary", "summarySource",
     "summaryAt", "summaryMsgCount", "summarySessionId",
-    "provider",
 )
 
 def _file_snapshot(path):
@@ -1217,10 +1216,10 @@ def main():
     if os.environ.get("CLAUDE_MONITOR_NESTED") == "1":
         sys.exit(0)
 
-    # Optional `--provider claude|codex` prefix injected by Codex hook commands
-    # (Codex's `~/.codex/config.toml` doesn't carry the same env conventions
-    # Claude's plugin runtime does, so we make provider explicit). Falls
-    # through to auto-detection below when omitted.
+    # Optional `--provider claude|codex` prefix injected by Codex hook commands.
+    # Codex hook payloads and environment conventions differ from Claude's, so
+    # the installer makes the provider explicit. Falls through to auto-detection
+    # below when omitted.
     forced_provider = None
     if args and args[0] == "--provider" and len(args) >= 2:
         forced_provider = args[1]
@@ -1261,13 +1260,10 @@ def main():
     matched_cwd = cwd
     tree = _build_process_tree()
 
-    # Provider precedence: --provider arg > env var > stdin hook_event_name >
-    # ancestor process tree > 'claude' default (back-compat). Frozen on first
-    # write via _PRESERVED_FIELDS so a stray fallback can't reclassify a row.
+    # Provider precedence: --provider arg > env var > ancestor process tree >
+    # 'claude' default (back-compat). Do not infer from hook_event_name:
+    # Claude and Codex payloads both expose that key in recent CLIs.
     provider = forced_provider or os.environ.get("CLAUDE_MONITOR_PROVIDER") or None
-    if not provider and "hook_event_name" in hook_data:
-        # Codex hook payloads always include this key; Claude's never do.
-        provider = "codex"
     if not provider:
         p = my_pid
         _visited = set()
@@ -1541,8 +1537,15 @@ def main():
     if existing and existing.get("state") == state:
         existing_wt = existing.get("wezterm") if isinstance(existing.get("wezterm"), dict) else None
         has_slot = isinstance(existing.get("slot"), int)
+        same_provider = existing.get("provider") == provider
         needs_question_snapshot = state == "question" and not existing.get("questionAt")
-        if wezterm_info == existing_wt and has_slot and not is_user_prompt and not needs_question_snapshot:
+        if (
+            wezterm_info == existing_wt
+            and has_slot
+            and same_provider
+            and not is_user_prompt
+            and not needs_question_snapshot
+        ):
             _log.debug("=> State unchanged (%s), skipping write", state)
             return
 

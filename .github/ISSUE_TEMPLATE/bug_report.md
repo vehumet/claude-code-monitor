@@ -21,7 +21,7 @@ What you expected to happen.
 - OS: [e.g. Windows 11, macOS 14]
 - Python version: [e.g. 3.12.0]
 - Claude Code version: [e.g. 1.0.0]
-- Installation method: [Plugin / Standalone]
+- Install command: [e.g. python install.py]
 
 **Logs / Screenshots**
 If applicable, add screenshots or console output.

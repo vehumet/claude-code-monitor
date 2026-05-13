@@ -57,6 +57,7 @@ _FAIL_TYPES = {"error", "task_failed", "turn_failed"}
 VIRTUAL_PREFIX = "codex-"
 IGNORE_NESTED = "nested"
 IGNORE_HOOK_OWNED = "hook_owned"
+IGNORE_EXEC = "exec"
 
 
 def _codex_sessions_root():
@@ -104,10 +105,19 @@ def _is_nested_rollout_payload(payload):
     return isinstance(source, dict) and "subagent" in source
 
 
+def _is_exec_rollout_payload(payload):
+    """True for non-interactive `codex exec` rollouts."""
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("originator") == "codex_exec" or payload.get("source") == "exec"
+
+
 def _ignore_reason(state_dir, session_id, payload):
     """Return why this rollout should not create a monitor row, or None."""
     if _is_nested_rollout_payload(payload):
         return IGNORE_NESTED
+    if _is_exec_rollout_payload(payload):
+        return IGNORE_EXEC
     if _is_hook_owned_session(state_dir, session_id):
         return IGNORE_HOOK_OWNED
     return None

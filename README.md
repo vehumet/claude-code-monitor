@@ -31,23 +31,24 @@ Output language follows the OS locale (Korean → Korean, otherwise English). Ca
 
 ## Install
 
-Plugin install (recommended):
+Python installer is the only supported install path. Give an LLM or coding agent this repository URL and ask it to run these commands:
 
-```bash
-claude plugin marketplace add vehumet/claude-code-monitor
-claude plugin install claude-code-monitor
-```
-
-Standalone install:
-
-```bash
+```powershell
 git clone https://github.com/vehumet/claude-code-monitor.git
 cd claude-code-monitor
-python plugins/claude-code-monitor/install.py
-# add --skip-codex-hooks if you don't want ~/.codex/config.toml touched
+python install.py
 ```
 
-Requires Python 3.10+ with tkinter (bundled with the standard installer) and the Claude Code CLI.
+The installer is idempotent. It copies the monitor into `~/.claude/monitor/`, installs the `/monitor` slash command into `~/.claude/commands/`, and merges the required hooks into `~/.claude/settings.json`. When `~/.codex/` exists, it also installs Codex CLI hooks into `~/.codex/config.toml`.
+
+Useful options:
+
+```powershell
+python install.py --dry-run
+python install.py --skip-codex-hooks
+```
+
+Requires Git, Python 3.10+ with tkinter (bundled with the standard Python installer), and the Claude Code CLI.
 
 ### Codex CLI support
 
@@ -57,12 +58,20 @@ If you'd rather wire the hooks yourself or run Codex with hooks disabled, the ov
 
 If you move the monitor's install location after the fact, run `python uninstall.py` then `python install.py` again so the absolute paths in `config.toml` are regenerated.
 
+### Update
+
+```powershell
+cd claude-code-monitor
+git pull
+python install.py
+```
+
 ## Run
 
 In a Claude Code session:
 
 ```
-/claude-code-monitor:monitor
+/monitor
 ```
 
 Or directly:
@@ -92,10 +101,8 @@ Language is auto-detected from the OS locale (`ko` on Korean systems, `en` other
 
 ## Uninstall
 
-```bash
-claude plugin uninstall claude-code-monitor
-# or, for standalone:
-python plugins/claude-code-monitor/uninstall.py
+```powershell
+python uninstall.py
 ```
 
 ## License
