@@ -176,6 +176,7 @@ def _default_config():
         "summary_max_chars": 12,
         "poll_interval_ms": 500,
         "blink_interval_ms": 600,
+        "question_clear_grace_ms": 1000,
         "sound_enabled": True,
     }
 
@@ -212,6 +213,95 @@ def get_label(key):
     """Return localized label."""
     lang = CONFIG.get("language", "en")
     return LABELS.get(lang, LABELS["en"]).get(key, key)
+
+
+QUESTION_CLEAR_GRACE_S = max(
+    0.0, float(CONFIG.get("question_clear_grace_ms", 1000)) / 1000.0
+)
+_QUESTION_FIELDS = (
+    "questionAt",
+    "questionTranscriptPath", "questionTranscriptMtimeNs", "questionTranscriptSize",
+    "questionSessionPath", "questionSessionMtimeNs", "questionSessionSize",
+)
+
+
+def _atomic_write_json(path, data):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _path_changed_since(path, old_mtime_ns, old_size):
+    if not path:
+        return False
+    try:
+        st = os.stat(os.path.expanduser(path))
+    except OSError:
+        return False
+    try:
+        return int(st.st_mtime_ns) != int(old_mtime_ns) or int(st.st_size) != int(old_size)
+    except (TypeError, ValueError):
+        return False
+
+
+def _strip_question_fields(data):
+    out = dict(data)
+    for key in _QUESTION_FIELDS:
+        out.pop(key, None)
+    return out
+
+
+def resolve_question_state_from_files(state_data, sessions_data=None, now=None):
+    """Return a replacement state for stale `question`, or None to keep it.
+
+    The expensive signal (hooking every PostToolUse) is replaced with cheap
+    file metadata checks captured when `question` was written.
+    """
+    if state_data.get("state") != "question":
+        return None
+    question_at = state_data.get("questionAt")
+    if not question_at:
+        return None
+    now = time.time() if now is None else now
+    try:
+        age = now - float(question_at)
+    except (TypeError, ValueError):
+        return None
+    if age < QUESTION_CLEAR_GRACE_S:
+        return None
+
+    session_path = state_data.get("questionSessionPath")
+    session_data = None
+    if session_path and isinstance(sessions_data, dict):
+        session_data = sessions_data.get(session_path)
+    if session_data is None and session_path:
+        session_data = _read_json_file(session_path)
+    session_status = (session_data or {}).get("status")
+    if session_status == "idle":
+        return "done"
+
+    transcript_changed = _path_changed_since(
+        state_data.get("questionTranscriptPath"),
+        state_data.get("questionTranscriptMtimeNs"),
+        state_data.get("questionTranscriptSize"),
+    )
+    session_changed = _path_changed_since(
+        session_path,
+        state_data.get("questionSessionMtimeNs"),
+        state_data.get("questionSessionSize"),
+    )
+    if transcript_changed or session_changed:
+        return "working"
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -828,6 +918,18 @@ class InstanceTracker:
                 saved_provider = st.get("provider", "claude")
             except Exception:
                 continue
+
+            replacement_state = resolve_question_state_from_files(st, sessions_data)
+            if replacement_state:
+                st = _strip_question_fields(st)
+                st["state"] = replacement_state
+                st["updatedAt"] = int(time.time())
+                try:
+                    _atomic_write_json(sf, st)
+                except Exception:
+                    _log.debug("failed to clear question state", exc_info=True)
+                state = replacement_state
+                updated_at = st["updatedAt"]
 
             # Cleanup orphan state files for dead PIDs (sessions/*.json may have
             # been removed earlier without removing the matching state JSON).

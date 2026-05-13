@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WRITE_STATE = ROOT / "plugins" / "claude-code-monitor" / "src" / "write-state.py"
 POLLER = ROOT / "plugins" / "claude-code-monitor" / "src" / "codex_rollout_poller.py"
+MONITOR = ROOT / "plugins" / "claude-code-monitor" / "src" / "claude-code-monitor.py"
 
 
 def load_module(path, name):
@@ -149,6 +150,99 @@ class MonitorCoreTests(unittest.TestCase):
             mod._find_codex_rollout = lambda _sid: str(rollout)
 
             self.assertFalse(mod._codex_task_complete("sid"))
+
+    def test_question_state_records_file_snapshots(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            sid = "question-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            real_pid = 4242
+            transcript = home / "transcript.jsonl"
+            transcript.write_text("{}\n", encoding="utf-8")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "status": "busy",
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_question_snapshot")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (real_pid, "python.exe"),
+                real_pid: (1, "claude.exe"),
+                1: (0, "cmd.exe"),
+            }
+
+            payload = json.dumps({
+                "session_id": sid,
+                "cwd": cwd,
+                "transcript_path": str(transcript),
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "question"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+
+            state = json.loads((state_dir / f"{real_pid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["state"], "question")
+            self.assertEqual(state["questionTranscriptPath"], str(transcript))
+            self.assertEqual(state["questionTranscriptSize"], transcript.stat().st_size)
+            self.assertEqual(state["questionSessionPath"], str(sessions_dir / f"{real_pid}.json"))
+
+    def test_question_file_change_resolves_to_working_or_done(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            session = home / "session.json"
+            transcript = home / "transcript.jsonl"
+            session.write_text(json.dumps({"status": "busy"}), encoding="utf-8")
+            transcript.write_text("{}\n", encoding="utf-8")
+
+            mod = load_module(MONITOR, "claude_monitor_question_resolve")
+            question_at = 100.0
+            state = {
+                "state": "question",
+                "questionAt": question_at,
+                "questionSessionPath": str(session),
+                "questionSessionMtimeNs": session.stat().st_mtime_ns,
+                "questionSessionSize": session.stat().st_size,
+                "questionTranscriptPath": str(transcript),
+                "questionTranscriptMtimeNs": transcript.stat().st_mtime_ns,
+                "questionTranscriptSize": transcript.stat().st_size,
+            }
+
+            self.assertIsNone(
+                mod.resolve_question_state_from_files(state, now=question_at + 0.1)
+            )
+            transcript.write_text("{}\n{}\n", encoding="utf-8")
+            self.assertEqual(
+                mod.resolve_question_state_from_files(state, now=question_at + 2.0),
+                "working",
+            )
+
+            session.write_text(json.dumps({"status": "idle"}), encoding="utf-8")
+            self.assertEqual(
+                mod.resolve_question_state_from_files(state, now=question_at + 2.0),
+                "done",
+            )
 
     def test_rollout_cache_hit_repairs_missing_files(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

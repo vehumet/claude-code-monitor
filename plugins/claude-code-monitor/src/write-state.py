@@ -251,6 +251,40 @@ _PRESERVED_FIELDS = (
     "provider",
 )
 
+def _file_snapshot(path):
+    if not path:
+        return None
+    try:
+        st = os.stat(os.path.expanduser(path))
+        return {
+            "path": path,
+            "mtime_ns": int(st.st_mtime_ns),
+            "size": int(st.st_size),
+        }
+    except OSError:
+        return None
+
+
+def _attach_question_snapshot(state_data, hook_data, session_file, now):
+    """Record cheap file markers so the overlay can clear question without
+    a PostToolUse catch-all hook."""
+    state_data["questionAt"] = now
+    transcript_path = (
+        hook_data.get("transcript_path")
+        or hook_data.get("transcriptPath")
+        or hook_data.get("transcript")
+    )
+    transcript = _file_snapshot(transcript_path)
+    if transcript:
+        state_data["questionTranscriptPath"] = transcript["path"]
+        state_data["questionTranscriptMtimeNs"] = transcript["mtime_ns"]
+        state_data["questionTranscriptSize"] = transcript["size"]
+    session = _file_snapshot(session_file)
+    if session:
+        state_data["questionSessionPath"] = session["path"]
+        state_data["questionSessionMtimeNs"] = session["mtime_ns"]
+        state_data["questionSessionSize"] = session["size"]
+
 
 def _basename_provider(name):
     """Map a process basename to a known-LLM provider id, or None.
@@ -1501,13 +1535,14 @@ def main():
             return
 
     # Skip write if state unchanged AND wezterm info unchanged
-    # (catch-all이 매 도구마다 호출되므로 필수 최적화)
+    # (legacy catch-all hooks may still be installed, so keep the optimization)
     # Exceptions: missing slot needs allocation; UserPromptSubmit may need to stamp
     # a trim summary even when state stays "working" (e.g. consecutive prompts).
     if existing and existing.get("state") == state:
         existing_wt = existing.get("wezterm") if isinstance(existing.get("wezterm"), dict) else None
         has_slot = isinstance(existing.get("slot"), int)
-        if wezterm_info == existing_wt and has_slot and not is_user_prompt:
+        needs_question_snapshot = state == "question" and not existing.get("questionAt")
+        if wezterm_info == existing_wt and has_slot and not is_user_prompt and not needs_question_snapshot:
             _log.debug("=> State unchanged (%s), skipping write", state)
             return
 
@@ -1541,6 +1576,10 @@ def main():
         state_data["slot"] = _allocate_slot(state_dir, pid, matched_cwd)
         _log.debug("=> Allocated slot=%d for pid=%s cwd=%s",
                    state_data["slot"], pid, matched_cwd)
+
+    if state == "question":
+        session_file = os.path.join(sessions_dir, f"{pid}.json")
+        _attach_question_snapshot(state_data, hook_data, session_file, now)
 
     # UserPromptSubmit fallback: stamp a trimmed first-line summary ONLY when
     # the row currently has no summary at all. Subsequent prompts must not

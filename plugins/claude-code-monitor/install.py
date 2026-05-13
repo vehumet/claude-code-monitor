@@ -51,8 +51,6 @@ CODEX_FEATURE_FLAG_TAG = "added by claude-code-monitor"
 CODEX_HOOK_EVENTS = [
     ("SessionStart", "session_start"),
     ("UserPromptSubmit", "working"),
-    ("PreToolUse", "working"),
-    ("PostToolUse", "working"),
     ("PermissionRequest", "question"),
     ("Stop", "done"),
 ]
@@ -154,6 +152,18 @@ def _render_codex_hook_block() -> str:
     return "\n".join(lines)
 
 
+def _replace_codex_hook_block(text: str, block: str):
+    start = text.find(CODEX_HOOK_MARKER_OPEN)
+    end = text.find(CODEX_HOOK_MARKER_CLOSE)
+    if start < 0 or end < start:
+        return text, False
+    end += len(CODEX_HOOK_MARKER_CLOSE)
+    old = text[start:end]
+    if old == block:
+        return text, False
+    return text[:start] + block + text[end:], True
+
+
 def _ensure_codex_hooks_flag(text: str):
     """Ensure `hooks = true` is set inside the `[features]` section, and
     drop the deprecated `codex_hooks = true` line if present (Codex 0.128+
@@ -225,12 +235,21 @@ def merge_codex_hooks(dry_run=False) -> bool:
             return False
     if CODEX_HOOK_MARKER_OPEN in text:
         # Hook block already injected. Still migrate the feature-flag line if
-        # it's on the deprecated `codex_hooks` name (Codex 0.128+ warns).
+        # it's on the deprecated `codex_hooks` name (Codex 0.128+ warns),
+        # and refresh the managed block when our default hook set changes.
         migrated, modified, _ = _ensure_codex_hooks_flag(text)
-        if not modified:
+        updated, block_modified = _replace_codex_hook_block(
+            migrated, _render_codex_hook_block()
+        )
+        if not modified and not block_modified:
             print("  Codex hooks marker already present - skipping (idempotent).")
             return False
-        print(f"  Migrating deprecated codex_hooks flag -> hooks in {CODEX_CONFIG}")
+        if modified and block_modified:
+            print(f"  Updating Codex hooks and feature flag in {CODEX_CONFIG}")
+        elif modified:
+            print(f"  Migrating deprecated codex_hooks flag -> hooks in {CODEX_CONFIG}")
+        else:
+            print(f"  Updating Codex hooks in {CODEX_CONFIG}")
         if dry_run:
             return True
         ts = int(time.time())
@@ -238,8 +257,8 @@ def merge_codex_hooks(dry_run=False) -> bool:
         shutil.copy2(CODEX_CONFIG, backup)
         print(f"  Backup: {backup}")
         with open(CODEX_CONFIG, "w", encoding="utf-8") as f:
-            f.write(migrated)
-        print("  Codex hooks flag migrated.")
+            f.write(updated)
+        print("  Codex hooks updated.")
         return True
 
     text2, in_place_modified, has_features = _ensure_codex_hooks_flag(text)
@@ -287,6 +306,21 @@ def merge_hooks(settings: dict) -> bool:
         settings["hooks"] = {}
 
     modified = False
+    # Older installs may have catch-all tool hooks that spawn Python for every
+    # tool call. Question clearing now happens in the overlay via file-change
+    # polling, so remove only our managed catch-all entries.
+    for event_name in ("PreToolUse", "PostToolUse"):
+        existing = settings["hooks"].get(event_name)
+        if not isinstance(existing, list):
+            continue
+        pruned = [
+            entry for entry in existing
+            if not (entry.get("matcher", "") == "" and _has_write_state_hook(entry))
+        ]
+        if len(pruned) != len(existing):
+            settings["hooks"][event_name] = pruned
+            modified = True
+
     for event_name, hook_entries in HOOKS_CONFIG.items():
         if event_name not in settings["hooks"]:
             settings["hooks"][event_name] = []
