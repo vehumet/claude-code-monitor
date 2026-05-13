@@ -151,6 +151,116 @@ class MonitorCoreTests(unittest.TestCase):
 
             self.assertFalse(mod._codex_task_complete("sid"))
 
+    def test_codex_rollout_digest_collects_recent_work_signals(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "old request"},
+                    }),
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "localization phase 3 review"},
+                    }),
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "phase": "commentary",
+                            "message": "checking localization files and CI guards",
+                        },
+                    }),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "shell_command",
+                            "arguments": {"command": "rg Loc Assets/_Project/Scripts"},
+                        },
+                    }),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Assets/_Project/Scripts/Localization/Loc.cs:12",
+                        },
+                    }),
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "phase": "final_answer",
+                            "message": "found missing localization guard coverage",
+                        },
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_digest")
+
+            scan = mod._scan_codex_rollout(str(rollout))
+
+            self.assertIn("localization phase 3 review", scan["digest"])
+            self.assertIn("checking localization files", scan["digest"])
+            self.assertIn("shell_command", scan["digest"])
+            self.assertIn("Assets/_Project/Scripts/Localization/Loc.cs", scan["digest"])
+            self.assertIn("missing localization guard", scan["digest"])
+
+    def test_codex_rollout_digest_is_bounded(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            long_text = "x" * 2000
+            rollout.write_text(
+                "\n".join(
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": f"request {i} {long_text}"},
+                    })
+                    for i in range(20)
+                ),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_digest_bound")
+
+            scan = mod._scan_codex_rollout(str(rollout))
+
+            self.assertLessEqual(len(scan["digest"]), mod._CODEX_DIGEST_MAX_CHARS)
+            self.assertLessEqual(
+                len(scan["user_messages"]),
+                mod._CODEX_DIGEST_SECTION_LIMITS["user_messages"],
+            )
+
+    def test_resolve_codex_command_falls_back_to_npm_shim_on_windows(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            appdata = Path(td) / "AppData" / "Roaming"
+            npm = appdata / "npm"
+            npm.mkdir(parents=True)
+            shim = npm / "codex.cmd"
+            shim.write_text("@echo off\n", encoding="utf-8")
+
+            mod = load_module(WRITE_STATE, "write_state_codex_command")
+            mod.IS_WINDOWS = True
+            mod.shutil.which = lambda _name: None
+            old_appdata = os.environ.get("APPDATA")
+            os.environ["APPDATA"] = str(appdata)
+            try:
+                self.assertEqual(mod._resolve_codex_command(), str(shim))
+            finally:
+                if old_appdata is None:
+                    os.environ.pop("APPDATA", None)
+                else:
+                    os.environ["APPDATA"] = old_appdata
+
+    def test_codex_summary_prompt_non_korean_preserves_user_language_instruction(self):
+        mod = load_module(WRITE_STATE, "write_state_codex_prompt_language")
+
+        self.assertIn("dominant user request", mod._CODEX_SUMMARY_PROMPT_EN)
+        self.assertIn("same language", mod._CODEX_SUMMARY_PROMPT_EN)
+        self.assertIn("natural spacing", mod._CODEX_SUMMARY_PROMPT_EN)
+        self.assertIn("띄어쓰기", mod._CODEX_SUMMARY_PROMPT_KO)
+
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)

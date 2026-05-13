@@ -15,6 +15,7 @@ import logging.handlers
 import os
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -684,6 +685,31 @@ _HAIKU_PROMPT_EN = (
     "\n\n{transcript}"
 )
 
+_CODEX_SUMMARY_PROMPT_KO = (
+    "아래는 Codex 세션의 압축 digest야. "
+    "사용자가 지금 실제로 맡긴 작업을 한국어 명사구 {n}자 이내로 요약해. "
+    "띄어쓰기를 생략하지 말고 자연스러운 한국어 띄어쓰기를 유지해. "
+    "도구명이나 '세션', '요약', '작업' 같은 일반어만 쓰지 말고, "
+    "사용자 요청·수정 파일·도구 호출을 근거로 구체적인 주제를 골라. "
+    "예: '코덱스 요약 개선', '로컬라이제이션 검토', '훅 설치 정리'. "
+    "따옴표·접두사·마크다운 없이 한 줄만 출력."
+    "\n\nDigest:\n{transcript}"
+)
+
+_CODEX_SUMMARY_PROMPT_EN = (
+    "Below is a compact digest from a Codex session. "
+    "Summarize the concrete task the user is working on in the same language "
+    "as the dominant user request when practical, as a short noun phrase, "
+    "max {words} words and under {n} characters. "
+    "Keep natural spacing between words; do not remove spaces to satisfy "
+    "the character limit. "
+    "Do not answer with generic labels such as 'session summary', 'task summary', "
+    "or tool names alone. Use the user request, edited files, and tool calls "
+    "to name the actual work. "
+    "Output plain text only: no quotes, prefixes, punctuation, or markdown."
+    "\n\nDigest:\n{transcript}"
+)
+
 
 _MARKDOWN_MARKERS_RE = re.compile(r"(\*+|_+|`+|~+|^#+\s*)")
 
@@ -722,24 +748,135 @@ def _find_codex_rollout(session_id):
     return None
 
 
+_CODEX_DIGEST_MAX_CHARS = 6000
+_CODEX_DIGEST_SECTION_LIMITS = {
+    "user_messages": 3,
+    "commentary": 6,
+    "final_answers": 3,
+    "tool_calls": 12,
+    "file_hints": 16,
+    "plan_updates": 4,
+}
+
+
+def _clip_text(text, max_chars):
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _append_limited(items, value, limit):
+    value = (value or "").strip()
+    if not value:
+        return
+    if len(items) >= limit:
+        del items[0]
+    items.append(value)
+
+
+def _extract_codex_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                txt = item.get("text") or item.get("content") or item.get("message")
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        txt = value.get("text") or value.get("content") or value.get("message")
+        if isinstance(txt, str):
+            return txt
+    return ""
+
+
+def _extract_codex_command(payload, item):
+    name = (
+        item.get("name")
+        or item.get("call_id")
+        or item.get("tool_name")
+        or payload.get("name")
+        or payload.get("tool_name")
+        or payload.get("call_id")
+    )
+    args = (
+        item.get("arguments")
+        or item.get("input")
+        or item.get("params")
+        or payload.get("arguments")
+        or payload.get("input")
+        or payload.get("params")
+    )
+    if isinstance(args, str):
+        arg_text = args
+    elif args:
+        try:
+            arg_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            arg_text = str(args)
+    else:
+        arg_text = ""
+    if name and arg_text:
+        return f"{name}: {_clip_text(arg_text, 240)}"
+    if name:
+        return str(name)
+    if arg_text:
+        return _clip_text(arg_text, 240)
+    return ""
+
+
+def _extract_codex_file_hints(payload, item):
+    hints = []
+    for source in (payload, item):
+        if not isinstance(source, dict):
+            continue
+        for key in ("path", "file", "filename", "uri"):
+            val = source.get(key)
+            if isinstance(val, str) and val:
+                hints.append(val)
+        for key in ("files", "paths"):
+            vals = source.get(key)
+            if isinstance(vals, list):
+                hints.extend(v for v in vals if isinstance(v, str) and v)
+    text = _extract_codex_text(item.get("output") or item.get("content") or payload.get("output"))
+    if text:
+        for m in re.finditer(r"(?:(?:[A-Za-z]:)?[\\/])?[\w.\-]+(?:[\\/][\w.\-]+)+", text):
+            hints.append(m.group(0))
+    return hints
+
+
+def _codex_item(payload):
+    item = payload.get("item")
+    return item if isinstance(item, dict) else payload
+
+
 def _scan_codex_rollout(rollout_path):
     """Single-pass scan of a Codex rollout JSONL pulling out the signals
     the summarizer cares about.
 
     Returns a dict with:
-      - ``user_messages``: list[str] — every ``event_msg/user_message`` text.
-      - ``first_commentary``: str | None — the assistant's first
-        ``event_msg/agent_message`` with ``phase=commentary``. This is
-        usually the model's intro/plan for the turn, similar in spirit to
-        an ai-title.
-      - ``last_final_answer``: str | None — the most recent
-        ``event_msg/agent_message`` with ``phase=final_answer``. This is
-        Codex's analogue of Claude's away_summary and is the highest-quality
-        single-string label we can pull from a session.
+      - recent user/commentary/final-answer messages
+      - recent tool calls and file hints
+      - a compact digest for the LLM summarizer
 
     Verified against Codex CLI 0.128.0 rollouts.
     """
-    out = {"user_messages": [], "first_commentary": None, "last_final_answer": None}
+    limits = _CODEX_DIGEST_SECTION_LIMITS
+    out = {
+        "user_messages": [],
+        "commentary": [],
+        "final_answers": [],
+        "tool_calls": [],
+        "file_hints": [],
+        "plan_updates": [],
+        "digest": "",
+    }
+    seen_files = set()
     if not rollout_path or not os.path.exists(rollout_path):
         return out
     try:
@@ -749,26 +886,82 @@ def _scan_codex_rollout(rollout_path):
                     d = json.loads(line)
                 except ValueError:
                     continue
-                if d.get("type") != "event_msg":
+                line_type = d.get("type")
+                if line_type not in ("event_msg", "response_item", "compacted"):
                     continue
                 payload = d.get("payload") or {}
                 if not isinstance(payload, dict):
                     continue
-                pt = payload.get("type")
-                msg = payload.get("message")
-                if not isinstance(msg, str) or not msg.strip():
-                    continue
+                item = _codex_item(payload)
+                pt = payload.get("type") or item.get("type")
+                phase = payload.get("phase") or item.get("phase")
+                msg = payload.get("message") or _extract_codex_text(
+                    item.get("content") or item.get("text") or item.get("message")
+                )
+
                 if pt == "user_message":
-                    out["user_messages"].append(msg)
+                    _append_limited(
+                        out["user_messages"], _clip_text(msg, 700), limits["user_messages"]
+                    )
                 elif pt == "agent_message":
-                    phase = payload.get("phase")
                     if phase == "final_answer":
-                        out["last_final_answer"] = msg
-                    elif phase == "commentary" and out["first_commentary"] is None:
-                        out["first_commentary"] = msg
+                        _append_limited(
+                            out["final_answers"], _clip_text(msg, 900), limits["final_answers"]
+                        )
+                    elif phase == "commentary":
+                        _append_limited(
+                            out["commentary"], _clip_text(msg, 500), limits["commentary"]
+                        )
+                elif pt in ("function_call", "custom_tool_call", "web_search_call", "mcp_tool_call"):
+                    _append_limited(
+                        out["tool_calls"],
+                        _extract_codex_command(payload, item),
+                        limits["tool_calls"],
+                    )
+                elif pt in (
+                    "function_call_output",
+                    "custom_tool_call_output",
+                    "mcp_tool_call_end",
+                    "patch_apply_end",
+                ):
+                    for hint in _extract_codex_file_hints(payload, item):
+                        norm = hint.replace("\\", "/")
+                        if norm in seen_files:
+                            continue
+                        seen_files.add(norm)
+                        _append_limited(
+                            out["file_hints"], _clip_text(norm, 180), limits["file_hints"]
+                        )
+                elif pt in ("plan_update", "update_plan"):
+                    plan_text = _extract_codex_text(
+                        item.get("text") or item.get("content") or payload.get("plan")
+                    )
+                    _append_limited(
+                        out["plan_updates"], _clip_text(plan_text, 600), limits["plan_updates"]
+                    )
     except OSError:
         pass
+    out["digest"] = _build_codex_digest(out)
     return out
+
+
+def _build_codex_digest(scan):
+    sections = []
+
+    def add_section(title, values):
+        values = [v.strip() for v in values if isinstance(v, str) and v.strip()]
+        if not values:
+            return
+        lines = [f"{idx}. {v}" for idx, v in enumerate(values, 1)]
+        sections.append(f"{title}:\n" + "\n".join(lines))
+
+    add_section("Recent user requests", scan.get("user_messages", []))
+    add_section("Recent assistant progress/comments", scan.get("commentary", []))
+    add_section("Recent final answers", scan.get("final_answers", []))
+    add_section("Recent tool calls", scan.get("tool_calls", []))
+    add_section("Touched/mentioned files", scan.get("file_hints", []))
+    add_section("Plan updates", scan.get("plan_updates", []))
+    return _clip_text("\n\n".join(sections), _CODEX_DIGEST_MAX_CHARS)
 
 
 # Codex rollout event type markers — mirrors codex_rollout_poller.py's sets.
@@ -869,6 +1062,31 @@ def _spawn_codex_done_recheck(hook_data):
 _CODEX_DEFAULT_SUMMARY_MODEL = "gpt-5.4-mini"
 
 
+def _resolve_codex_command():
+    """Find Codex even when pythonw starts with a GUI-shortened PATH."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    candidates = []
+    if IS_WINDOWS:
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.extend([
+                os.path.join(appdata, "npm", "codex.cmd"),
+                os.path.join(appdata, "npm", "codex"),
+            ])
+    else:
+        home = os.path.expanduser("~")
+        candidates.extend([
+            os.path.join(home, ".local", "bin", "codex"),
+            os.path.join(home, ".npm-global", "bin", "codex"),
+        ])
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return "codex"
+
+
 def _call_codex_summary(transcript):
     """Run `codex exec` with --ephemeral + --ignore-user-config to get a
     one-line summary without spawning a new persisted Codex session and
@@ -876,11 +1094,15 @@ def _call_codex_summary(transcript):
     cfg = _load_monitor_config()
     base_n = cfg["summary_max_chars"]
     if cfg["language"] == "ko":
-        prompt = _HAIKU_PROMPT_KO.format(n=base_n, transcript=transcript[:4000])
+        prompt = _CODEX_SUMMARY_PROMPT_KO.format(
+            n=base_n, transcript=transcript[:_CODEX_DIGEST_MAX_CHARS]
+        )
     else:
         en_n = base_n * 2
         words = max(2, en_n // 6)
-        prompt = _HAIKU_PROMPT_EN.format(n=en_n, words=words, transcript=transcript[:4000])
+        prompt = _CODEX_SUMMARY_PROMPT_EN.format(
+            n=en_n, words=words, transcript=transcript[:_CODEX_DIGEST_MAX_CHARS]
+        )
 
     model = (
         os.environ.get("CLAUDE_MONITOR_CODEX_SUMMARY_MODEL")
@@ -892,19 +1114,19 @@ def _call_codex_summary(transcript):
     os.close(fd)
 
     cmd = [
-        "codex", "exec",
+        _resolve_codex_command(), "exec",
         "--ephemeral",             # don't write a rollout JSONL
         "--ignore-user-config",    # don't load our own hooks → no recursion
         "--skip-git-repo-check",
         "--color", "never",
         "-m", model,
         "-o", output_path,
-        prompt,
+        "-",
     ]
     env = os.environ.copy()
     env["CLAUDE_MONITOR_NESTED"] = "1"  # belt-and-braces if hooks fire anyway
     kwargs = {
-        "stdin": subprocess.DEVNULL,
+        "stdin": subprocess.PIPE,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "env": env,
@@ -930,7 +1152,7 @@ def _call_codex_summary(transcript):
         return None
     _mark_nested_pid(proc.pid)
     try:
-        proc.communicate(timeout=120)
+        proc.communicate(prompt.encode("utf-8"), timeout=120)
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
@@ -1080,18 +1302,12 @@ def _do_summarize(target_pid):
         msgs = scan["user_messages"]
         full_count = len(msgs)
 
-        # Signal priority — pick the one the model can summarize best.
-        # Mirrors Claude's chain (ai_title → away_summary → user msgs):
-        # 1) most recent final_answer — Codex's "turn done" message;
-        # 2) first commentary — assistant's plan/intro for the current turn;
-        # 3) first few user messages (last-resort fallback when neither
-        #    agent_message has been emitted yet).
-        if scan["last_final_answer"]:
-            transcript = scan["last_final_answer"][:1500]
-            signal_kind = "codex_final_answer"
-        elif scan["first_commentary"]:
-            transcript = scan["first_commentary"][:1500]
-            signal_kind = "codex_commentary"
+        # Codex has no stable Claude-style away_summary. Keep cost bounded by
+        # reducing the rollout locally into a small structured digest, then ask
+        # the mini model to normalize that into the row label.
+        if scan["digest"]:
+            transcript = scan["digest"]
+            signal_kind = "codex_digest"
         elif msgs:
             sample = msgs[:5] if full_count >= 5 else msgs
             transcript = "\n\n---\n\n".join(m[:400] for m in sample)

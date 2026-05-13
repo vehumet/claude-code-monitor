@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 
 - Do not classify Claude hook payloads as Codex just because they contain `hook_event_name`.
 - Ignore non-interactive `codex exec` rollouts in the fallback poller so summary/background exec sessions do not appear as PID-less monitor rows.
+- Improve Codex session summaries by reducing rollouts into a bounded structured digest of recent prompts, progress messages, final answers, tool calls, and file hints before calling the mini summarizer.
 
 ### Removed
 
