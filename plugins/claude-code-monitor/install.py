@@ -25,6 +25,7 @@ COMMANDS_DIR = os.path.join(CLAUDE_DIR, "commands")
 SETTINGS_FILE = os.path.join(CLAUDE_DIR, "settings.json")
 CODEX_DIR = os.path.join(HOME, ".codex")
 CODEX_CONFIG = os.path.join(CODEX_DIR, "config.toml")
+CODEX_SKILLS_DIR = os.path.join(CODEX_DIR, "skills")
 
 # Files to copy
 SRC_DIR = os.path.join(SCRIPT_DIR, "src")
@@ -42,6 +43,13 @@ HOOK_FILES = [
 ]
 COMMAND_FILES = [
     ("commands", "monitor.md"),
+]
+CODEX_SKILLS_SRC = os.path.join(SCRIPT_DIR, "codex-skills")
+CODEX_SKILLS = [
+    "session-monitor",
+]
+STALE_CODEX_SKILLS = [
+    "claude-monitor",
 ]
 
 # Codex hooks ─ injected into ~/.codex/config.toml inside marker fences so we
@@ -417,7 +425,37 @@ def install(dry_run=False, skip_codex_hooks=False):
         else:
             print(f"  WARNING: {src} not found, skipping")
 
-    # 5. Merge hooks into settings.json
+    # 5. Copy Codex skill, when Codex is present
+    print()
+    print("Codex CLI skill...")
+    if not os.path.isdir(CODEX_DIR):
+        print("  ~/.codex not found - skipping Codex skill.")
+    else:
+        for skill_name in CODEX_SKILLS:
+            src_root = os.path.join(CODEX_SKILLS_SRC, skill_name)
+            dst_root = os.path.join(CODEX_SKILLS_DIR, skill_name)
+            if not os.path.isdir(src_root):
+                print(f"  WARNING: {src_root} not found, skipping")
+                continue
+            for root, _dirs, files in os.walk(src_root):
+                rel_dir = os.path.relpath(root, src_root)
+                dst_dir = dst_root if rel_dir == "." else os.path.join(dst_root, rel_dir)
+                if not dry_run:
+                    os.makedirs(dst_dir, exist_ok=True)
+                for fname in files:
+                    src = os.path.join(root, fname)
+                    dst = os.path.join(dst_dir, fname)
+                    print(f"  {src} -> {dst}")
+                    if not dry_run:
+                        shutil.copy2(src, dst)
+        for skill_name in STALE_CODEX_SKILLS:
+            path = os.path.join(CODEX_SKILLS_DIR, skill_name)
+            if os.path.isdir(path):
+                print(f"  rmdir stale {path}")
+                if not dry_run:
+                    shutil.rmtree(path)
+
+    # 6. Merge hooks into settings.json
     print()
     print("Merging hooks into settings.json...")
     settings = {}
@@ -446,7 +484,7 @@ def install(dry_run=False, skip_codex_hooks=False):
     else:
         print("  Hooks already present, no changes needed.")
 
-    # 6. Codex CLI hooks (optional)
+    # 7. Codex CLI hooks (optional)
     print()
     print("Codex CLI hooks...")
     if skip_codex_hooks:
@@ -462,6 +500,7 @@ def install(dry_run=False, skip_codex_hooks=False):
         print()
         print("Usage:")
         print("  Launch monitor:  /monitor  (in Claude Code)")
+        print("  Launch in Codex: $session-monitor  (after restarting Codex)")
         print("  Or manually:     python ~/.claude/monitor/start-monitor.py")
         print()
         print("Configuration (optional):")

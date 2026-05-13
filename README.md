@@ -74,6 +74,12 @@ In a Claude Code session:
 /monitor
 ```
 
+In Codex CLI, custom slash commands are not currently supported. The installer adds a small Codex skill instead; restart Codex after installing or updating, then type:
+
+```
+$session-monitor
+```
+
 Or directly:
 
 ```powershell

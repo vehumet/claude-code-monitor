@@ -23,6 +23,10 @@ HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
 COMMANDS_DIR = os.path.join(CLAUDE_DIR, "commands")
 SETTINGS_FILE = os.path.join(CLAUDE_DIR, "settings.json")
 CODEX_CONFIG = os.path.join(HOME, ".codex", "config.toml")
+CODEX_SKILL_DIRS = [
+    os.path.join(HOME, ".codex", "skills", "session-monitor"),
+    os.path.join(HOME, ".codex", "skills", "claude-monitor"),
+]
 CODEX_HOOK_MARKER_OPEN = "# >>> claude-code-monitor codex hooks (managed) >>>"
 CODEX_HOOK_MARKER_CLOSE = "# <<< claude-code-monitor codex hooks (managed) <<<"
 CODEX_FEATURE_FLAG_TAG = "added by claude-code-monitor"
@@ -216,6 +220,17 @@ def uninstall(dry_run=False, keep_config=False):
         print("  (not found) settings.json")
 
     # 5. Codex hooks (best-effort)
+    print()
+    print("Removing Codex skill...")
+    for skill_dir in CODEX_SKILL_DIRS:
+        if os.path.isdir(skill_dir):
+            print(f"  rmdir {skill_dir}")
+            if not dry_run:
+                shutil.rmtree(skill_dir)
+        else:
+            print(f"  (not found) {skill_dir}")
+
+    # 6. Codex hooks (best-effort)
     print()
     print("Cleaning Codex hooks from ~/.codex/config.toml...")
     remove_codex_hooks(dry_run=dry_run)

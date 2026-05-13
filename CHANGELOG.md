@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - Drop the private Claude plugin marketplace installation path. The Python installer is now the only supported install method, with root-level `install.py` and `uninstall.py` entry points.
 - Replace the Windows VBS monitor launcher with a Python detached launcher (`start-monitor.py`), used by both `/monitor` and manual launch instructions.
+- Install a Codex `$session-monitor` skill as the Codex-side equivalent of Claude Code's `/monitor` command, and make the launcher no-op when the overlay is already running.
 - Update README install/update/uninstall instructions so an LLM can install from the GitHub URL with `git clone` followed by `python install.py`.
 - Claude hooks now pass `--provider claude` explicitly, and reinstalling updates older managed hook commands in place.
 

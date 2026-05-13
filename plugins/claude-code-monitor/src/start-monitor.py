@@ -38,10 +38,52 @@ def _resolve_pythonw():
     return shutil.which("pythonw") or exe or "python"
 
 
+def _monitor_running():
+    if IS_WINDOWS:
+        cmd = (
+            "$needle = 'claude-code-monitor' + '.py'; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match $needle } | "
+            "Select-Object -First 1 -ExpandProperty ProcessId"
+        )
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "stdin": subprocess.DEVNULL,
+            "creationflags": CREATE_NO_WINDOW,
+        }
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", cmd],
+                timeout=5,
+                **kwargs,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return any(ch.isdigit() for ch in proc.stdout)
+
+    pgrep = shutil.which("pgrep")
+    if not pgrep:
+        return False
+    try:
+        proc = subprocess.run(
+            [pgrep, "-f", "[c]laude-code-monitor.py"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def launch(monitor_path=None):
     monitor_path = os.path.abspath(monitor_path or _default_monitor_path())
     if not os.path.exists(monitor_path):
         raise FileNotFoundError(monitor_path)
+    if _monitor_running():
+        return None
 
     kwargs = {
         "stdin": subprocess.DEVNULL,

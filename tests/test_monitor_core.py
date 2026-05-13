@@ -289,6 +289,17 @@ class MonitorCoreTests(unittest.TestCase):
             finally:
                 mod.sys.executable = old_executable
 
+    def test_start_monitor_does_not_spawn_duplicate_monitor(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            monitor = Path(td) / "claude-code-monitor.py"
+            monitor.write_text("", encoding="utf-8")
+
+            mod = load_module(START_MONITOR, "start_monitor_no_duplicate")
+            mod._monitor_running = lambda: True
+            mod.subprocess.Popen = lambda *_args, **_kwargs: self.fail("Popen called")
+
+            self.assertIsNone(mod.launch(str(monitor)))
+
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)

@@ -27,6 +27,7 @@ plugins/claude-code-monitor/
 │   ├── start-monitor.py                 # Python detached 런처
 │   └── start.sh                         # Unix 런처
 ├── commands/                            # /monitor 슬래시 커맨드
+├── codex-skills/                        # Codex CLI용 $session-monitor skill
 ├── install.py                           # 실제 설치 스크립트 + Codex config.toml 자동 주입
 └── uninstall.py                         # 실제 제거 스크립트
 scripts/bump-version.py                  # claude-code-monitor.py 버전 갱신 도구
