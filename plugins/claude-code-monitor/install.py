@@ -499,7 +499,7 @@ def install(dry_run=False, skip_codex_hooks=False):
         print("Installation complete!")
         print()
         print("Usage:")
-        print("  Launch monitor:  /monitor  (in Claude Code)")
+        print("  Launch in Claude Code: /monitor  (after restarting Claude Code)")
         print("  Launch in Codex: $session-monitor  (after restarting Codex)")
         print("  Or manually:     python ~/.claude/monitor/start-monitor.py")
         print()

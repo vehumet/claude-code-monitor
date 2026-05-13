@@ -39,7 +39,7 @@ cd claude-code-monitor
 python install.py
 ```
 
-The installer is idempotent. It copies the monitor into `~/.claude/monitor/`, installs the `/monitor` slash command into `~/.claude/commands/`, and merges the required hooks into `~/.claude/settings.json`. When `~/.codex/` exists, it also installs Codex CLI hooks into `~/.codex/config.toml`.
+The installer is idempotent. It copies the monitor into `~/.claude/monitor/`, installs the `/monitor` slash command into `~/.claude/commands/`, and merges the required hooks into `~/.claude/settings.json`. When `~/.codex/` exists, it also installs Codex CLI hooks into `~/.codex/config.toml` and the `$session-monitor` skill into `~/.codex/skills/`.
 
 Useful options:
 
@@ -68,13 +68,15 @@ python install.py
 
 ## Run
 
-In a Claude Code session:
+After installing or updating, restart the CLI session so it reloads newly installed commands/skills.
+
+In Claude Code:
 
 ```
 /monitor
 ```
 
-In Codex CLI, custom slash commands are not currently supported. The installer adds a small Codex skill instead; restart Codex after installing or updating, then type:
+In Codex CLI, custom slash commands are not currently supported. Use the installed skill:
 
 ```
 $session-monitor
