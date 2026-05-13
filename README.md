@@ -93,6 +93,7 @@ Optional `~/.claude/monitor/config.json`:
   "language": "ko",
   "opacity": 0.65,
   "summary_max_chars": 12,
+  "blink_seconds": 10,
   "sound_enabled": true
 }
 ```

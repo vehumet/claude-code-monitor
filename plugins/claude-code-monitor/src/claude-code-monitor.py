@@ -130,7 +130,7 @@ THEME = {
     "close_hover": "#f38ba8",   # red
 }
 
-DONE_BLINK_SECONDS = 5  # "done" blinks for this long, then stays solid
+DONE_BLINK_SECONDS = 10  # "done"/"interrupted" blink this long, then stay solid
 STARTUP_QUIET_SECONDS = 3  # suppress stale catch-up events after opening
 
 
@@ -176,6 +176,7 @@ def _default_config():
         "summary_max_chars": 12,
         "poll_interval_ms": 500,
         "blink_interval_ms": 600,
+        "blink_seconds": DONE_BLINK_SECONDS,
         "question_clear_grace_ms": 1000,
         "sound_enabled": True,
     }
@@ -1029,6 +1030,7 @@ class MonitorOverlay:
     def __init__(self):
         self.poll_ms = CONFIG.get("poll_interval_ms", 500)
         self.blink_ms = CONFIG.get("blink_interval_ms", 600)
+        self.blink_seconds = max(0.0, float(CONFIG.get("blink_seconds", DONE_BLINK_SECONDS)))
         self.summary_max_chars = max(4, int(CONFIG.get("summary_max_chars", 12)))
         self.sound_enabled = CONFIG.get("sound_enabled", True)
         # Suppress sound + blink for whatever state already exists, including
@@ -1227,14 +1229,14 @@ class MonitorOverlay:
                 if not inst:
                     continue
                 if inst.state == "done":
-                    if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
+                    if inst.done_since > 0 and now - inst.done_since < self.blink_seconds:
                         color = THEME["done"] if self._blink_phase else THEME["bg"]
                     else:
                         color = THEME["done"]
                     row["dot"].config(fg=color)
                     row["state"].config(fg=color)
                 elif inst.state == "interrupted":
-                    if inst.done_since > 0 and now - inst.done_since < DONE_BLINK_SECONDS:
+                    if inst.done_since > 0 and now - inst.done_since < self.blink_seconds:
                         color = THEME["interrupted"] if self._blink_phase else THEME["bg"]
                     else:
                         color = THEME["interrupted"]
