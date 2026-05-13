@@ -31,8 +31,11 @@ SRC_DIR = os.path.join(SCRIPT_DIR, "src")
 MONITOR_FILES = [
     "claude-code-monitor.py",
     "codex_rollout_poller.py",
-    "start-monitor.vbs",
+    "start-monitor.py",
     "start.sh",
+]
+STALE_MONITOR_FILES = [
+    "start-monitor.vbs",
 ]
 HOOK_FILES = [
     "write-state.py",
@@ -385,6 +388,13 @@ def install(dry_run=False, skip_codex_hooks=False):
         else:
             print(f"  WARNING: {src} not found, skipping")
 
+    for fname in STALE_MONITOR_FILES:
+        path = os.path.join(MONITOR_DIR, fname)
+        if os.path.exists(path):
+            print(f"  rm stale {path}")
+            if not dry_run:
+                os.remove(path)
+
     # 3. Copy hook files
     for fname in HOOK_FILES:
         src = os.path.join(SRC_DIR, fname)
@@ -452,7 +462,7 @@ def install(dry_run=False, skip_codex_hooks=False):
         print()
         print("Usage:")
         print("  Launch monitor:  /monitor  (in Claude Code)")
-        print("  Or manually:     pythonw ~/.claude/monitor/claude-code-monitor.py")
+        print("  Or manually:     python ~/.claude/monitor/start-monitor.py")
         print()
         print("Configuration (optional):")
         print("  Create ~/.claude/monitor/config.json to customize:")

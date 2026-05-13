@@ -5,9 +5,9 @@ Run this single command immediately without any pre-checks or status messages:
 ```
 MR="$(python -c "import os; print(os.path.join(os.path.expanduser('~'), '.claude', 'monitor').replace(chr(92), '/'))" 2>/dev/null)"
 if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "cygwin"* ]]; then
-  tasklist 2>/dev/null | grep -qi pythonw && echo "Monitor already running." || { cscript //nologo "$(cygpath -w "$MR/start-monitor.vbs")" && echo "Monitor launched."; }
+  powershell.exe -NoProfile -Command "\$needle = 'claude-code-monitor' + '\.py'; Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and \$_.CommandLine -match \$needle } | Select-Object -First 1 -ExpandProperty ProcessId" 2>/dev/null | grep -q '[0-9]' && echo "Monitor already running." || { python "$MR/start-monitor.py" && echo "Monitor launched."; }
 else
-  pgrep -f claude-code-monitor.py > /dev/null && echo "Monitor already running." || { pythonw "$MR/claude-code-monitor.py" 2>/dev/null & echo "Monitor launched."; }
+  pgrep -f '[c]laude-code-monitor.py' > /dev/null && echo "Monitor already running." || { python "$MR/start-monitor.py" && echo "Monitor launched."; }
 fi
 ```
 

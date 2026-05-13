@@ -23,6 +23,7 @@ jobs:
           python -m py_compile plugins/claude-code-monitor/src/claude-code-monitor.py
           python -m py_compile plugins/claude-code-monitor/src/write-state.py
           python -m py_compile plugins/claude-code-monitor/src/codex_rollout_poller.py
+          python -m py_compile plugins/claude-code-monitor/src/start-monitor.py
           python -m py_compile install.py
           python -m py_compile uninstall.py
           python -m py_compile plugins/claude-code-monitor/install.py

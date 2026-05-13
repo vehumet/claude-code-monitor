@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WRITE_STATE = ROOT / "plugins" / "claude-code-monitor" / "src" / "write-state.py"
 POLLER = ROOT / "plugins" / "claude-code-monitor" / "src" / "codex_rollout_poller.py"
 MONITOR = ROOT / "plugins" / "claude-code-monitor" / "src" / "claude-code-monitor.py"
+START_MONITOR = ROOT / "plugins" / "claude-code-monitor" / "src" / "start-monitor.py"
 
 
 def load_module(path, name):
@@ -260,6 +261,33 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertIn("same language", mod._CODEX_SUMMARY_PROMPT_EN)
         self.assertIn("natural spacing", mod._CODEX_SUMMARY_PROMPT_EN)
         self.assertIn("띄어쓰기", mod._CODEX_SUMMARY_PROMPT_KO)
+
+    def test_start_monitor_default_path_is_next_to_launcher(self):
+        mod = load_module(START_MONITOR, "start_monitor_default_path")
+
+        self.assertEqual(
+            Path(mod._default_monitor_path()),
+            START_MONITOR.with_name("claude-code-monitor.py"),
+        )
+
+    def test_start_monitor_resolves_sibling_pythonw_on_windows(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            bin_dir = Path(td)
+            python = bin_dir / "python.exe"
+            pythonw = bin_dir / "pythonw.exe"
+            python.write_text("", encoding="utf-8")
+            pythonw.write_text("", encoding="utf-8")
+
+            mod = load_module(START_MONITOR, "start_monitor_pythonw")
+            old_executable = mod.sys.executable
+            try:
+                mod.IS_WINDOWS = True
+                mod.sys.executable = str(python)
+                mod.shutil.which = lambda _name: None
+
+                self.assertEqual(mod._resolve_pythonw(), str(pythonw))
+            finally:
+                mod.sys.executable = old_executable
 
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

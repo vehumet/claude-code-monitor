@@ -24,7 +24,7 @@ plugins/claude-code-monitor/
 │   ├── claude-code-monitor.py           # 메인 오버레이 위젯
 │   ├── write-state.py                   # 훅에서 호출하는 상태 기록 스크립트 (Claude/Codex 공용)
 │   ├── codex_rollout_poller.py          # Codex hooks 미설정 시 ~/.codex/sessions/ 폴백 폴러
-│   ├── start-monitor.vbs                # Windows 런처
+│   ├── start-monitor.py                 # Python detached 런처
 │   └── start.sh                         # Unix 런처
 ├── commands/                            # /monitor 슬래시 커맨드
 ├── install.py                           # 실제 설치 스크립트 + Codex config.toml 자동 주입
@@ -52,7 +52,7 @@ GitHub Actions (`validate.yml`): Python 문법 검사 (3.10~3.13), 유닛 테스
 ## Gotchas
 
 - 사운드/창 포커스 기능은 Windows 전용 (ctypes Win32 API 사용)
-- `start-monitor.vbs`는 셸 종료 후에도 모니터 프로세스가 살아남도록 하는 용도
+- `start-monitor.py`는 셸 종료 후에도 모니터 프로세스가 살아남도록 `pythonw`/detached process로 실행하는 용도
 - 상태 파일은 PID 기반이므로 같은 cwd를 공유하는 여러 터미널이 있으면 충돌 가능 (v0.0.2에서 수정됨)
 - Codex 폴러가 만드는 PID-less 행은 클릭해도 터미널 창이 안 떠짐 (PID를 모름). hook이 잡은 Codex 행은 정상 동작.
 - monitor 디렉터리 이동 시 `~/.codex/config.toml`의 hook command가 절대경로라 깨진다. `uninstall.py` → 디렉터리 이동 → `install.py` 순서로 재설치할 것.

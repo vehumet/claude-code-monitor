@@ -76,12 +76,14 @@ In a Claude Code session:
 
 Or directly:
 
-```bash
-# Windows — survives shell exit
-cscript //nologo "%USERPROFILE%\.claude\monitor\start-monitor.vbs"
+```powershell
+# Windows
+python "$env:USERPROFILE\.claude\monitor\start-monitor.py"
+```
 
-# Any platform
-pythonw ~/.claude/monitor/claude-code-monitor.py
+```bash
+# macOS/Linux
+python ~/.claude/monitor/start-monitor.py
 ```
 
 ## Config
