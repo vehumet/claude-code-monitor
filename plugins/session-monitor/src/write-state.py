@@ -975,6 +975,7 @@ def _build_codex_digest(scan):
 # Codex rollout event type markers — mirrors codex_rollout_poller.py's sets.
 _ROLLOUT_START_TYPES = {"task_started"}
 _ROLLOUT_COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
+_ROLLOUT_FAIL_TYPES = {"error", "task_failed", "turn_failed", "turn_aborted"}
 _CODEX_DONE_RECHECK_ENV = "SESSION_MONITOR_CODEX_DONE_RECHECK"
 _CODEX_DONE_RECHECK_DELAY_S = 1.0
 
@@ -983,13 +984,13 @@ def _codex_task_complete(session_id):
     """True when the rollout JSONL confirms the Codex task is finished.
 
     Codex fires Stop after each model turn in agentic mode, not only at
-    actual task completion.  Checking task_started vs task_complete counts
+    actual task completion.  Checking task_started vs terminal turn markers
     (same logic as codex_rollout_poller._infer_state) lets us tell apart
     intermediate per-turn stops from the final one.
 
     Fails safe — returns True (allow done) when rollout is unavailable or
     has no markers yet.  Returns False (suppress done) only when
-    task_started > task_complete (task is clearly still in progress).
+    the latest marker is task_started (task is clearly still in progress).
     """
     rollout = _find_codex_rollout(session_id)
     if not rollout:
@@ -1014,6 +1015,9 @@ def _codex_task_complete(session_id):
                     started += 1
                     latest_marker = "started"
                 elif pt in _ROLLOUT_COMPLETE_TYPES:
+                    completed += 1
+                    latest_marker = "completed"
+                elif pt in _ROLLOUT_FAIL_TYPES:
                     completed += 1
                     latest_marker = "completed"
     except OSError:

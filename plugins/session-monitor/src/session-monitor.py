@@ -21,6 +21,7 @@ import glob
 import time
 import threading
 import tkinter as tk
+import urllib.parse
 from tkinter import font as tkfont
 
 # codex_rollout_poller lives next to this file; src/ isn't always on
@@ -563,6 +564,7 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
                [(p, tree.get(p, (None, "?"))[1]) for p in chain])
 
     pid_set = set(chain)
+    direct_pid_set = set(pid_set)
 
     # Phase 1b: Add terminal host processes that are descendants of our chain.
     # Windows 11 terminal delegation: conhost.exe (child of shell) launches
@@ -577,15 +579,13 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
         if parent in extra and exe in TERMINAL_HOSTS:
             extra.add(p)
     pid_set |= extra
+    direct_pid_set |= extra
 
-    # Phase 1c: Windows 11 delegation model fallback
-    # WindowsTerminal.exe is NOT a descendant of the shell process.
-    # Add all WT PIDs so their windows become candidates.
-    wt_pids = {p for p, (parent, exe) in tree.items()
-                if exe == "windowsterminal.exe"}
-    if wt_pids:
-        _log.debug("  Phase 1c: adding %d WindowsTerminal PIDs as candidates", len(wt_pids))
-        pid_set |= wt_pids
+    # Do not add every WindowsTerminal.exe as a broad fallback. It can raise
+    # unrelated terminals whose titles happen to contain a shared path segment
+    # (for example the username or another project under the same workspace).
+    # If the terminal host is not in the process chain or a direct descendant,
+    # we prefer doing nothing over focusing the wrong window.
 
     candidates = []  # list of (chain_index, owning_pid, hwnd, title)
 
@@ -621,6 +621,16 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
         _log.debug("  => no candidates found")
         return None
 
+    direct_candidates = [c for c in candidates if c[1] in direct_pid_set]
+    require_cwd_match = not direct_candidates
+    if direct_candidates:
+        if len(direct_candidates) != len(candidates):
+            _log.debug("  direct-candidate filter: %d -> %d candidates",
+                       len(candidates), len(direct_candidates))
+        candidates = direct_candidates
+    else:
+        _log.debug("  only broad terminal candidates; requiring unique cwd title match")
+
     # Filter: prefer windows whose title ends with " - Cursor"
     cursor_candidates = [c for c in candidates if c[3].endswith(" - Cursor")]
     if cursor_candidates:
@@ -634,7 +644,7 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
     best_idx = candidates[0][0]
     tied = [c for c in candidates if c[0] == best_idx]
 
-    if len(tied) > 1 and cwd:
+    if (len(tied) > 1 or require_cwd_match) and cwd:
         _log.debug("  %d tied candidates at chain_idx=%d, trying path component matching",
                    len(tied), best_idx)
         # Try each path component from innermost to outermost
@@ -648,6 +658,12 @@ def find_window_for_pid(target_pid: int, tree: dict, cwd: str = "") -> int | Non
             if len(matches) == 1:
                 _log.debug("  => unique match hwnd=%d title=%r", matches[0][2], matches[0][3])
                 return matches[0][2]  # hwnd
+        if require_cwd_match:
+            _log.debug("  => no unique cwd match; refusing broad terminal fallback")
+            return None
+    elif require_cwd_match:
+        _log.debug("  => no cwd available; refusing broad terminal fallback")
+        return None
 
     # Stable fallback: sort by hwnd to avoid Z-order dependency
     tied.sort(key=lambda c: c[2])
@@ -1435,12 +1451,14 @@ class MonitorOverlay:
                 return
 
             # Virtual codex rows from the rollout poller don't carry a real
-            # PID. Do not try to focus them; process/window ownership is
-            # ambiguous and WindowsTerminal fallback can raise an unrelated
-            # terminal. Hook-registered Codex rows have real PIDs and focus
-            # through the normal path below.
+            # PID. Fall back to matching live codex.exe processes by cwd; this
+            # is not as precise as hook-captured wezterm pane IDs, but it makes
+            # PID-less rows clickable when hooks are unavailable.
             if not isinstance(claude_pid, int):
-                _log.debug("_activate_terminal: pid-less row has no focus target pid=%s", claude_pid)
+                if inst and inst.provider == "codex":
+                    self._activate_codex_pidless(inst.cwd, inst.session_id)
+                else:
+                    _log.debug("_activate_terminal: pid-less row has no focus target pid=%s", claude_pid)
                 return
 
             # 저장된 HWND 우선 사용
@@ -1463,11 +1481,14 @@ class MonitorOverlay:
         except Exception:
             _log.error("_activate_terminal failed for pid=%d", claude_pid, exc_info=True)
 
-    def _activate_codex_pidless(self, cwd: str):
+    def _activate_codex_pidless(self, cwd: str, session_id: str = ""):
         """Best-effort window activation for a Codex row the rollout poller
-        registered without a PID. Tries every live codex.exe and lets
-        find_window_for_pid match by cwd path components."""
+        registered without a PID. Prefer a wezterm pane session-id match, then
+        a unique cwd match, then live codex.exe process/window ownership."""
         try:
+            if self._activate_wezterm_pane_for_codex_row(cwd, session_id):
+                return
+
             tree = build_process_tree()
             codex_pids = [p for p, (_, exe) in tree.items() if exe == "codex.exe"]
             for cpid in codex_pids:
@@ -1479,6 +1500,159 @@ class MonitorOverlay:
                        cwd, len(codex_pids))
         except Exception:
             _log.error("_activate_codex_pidless failed", exc_info=True)
+
+    @staticmethod
+    def _normalize_wezterm_cwd(cwd: str) -> str:
+        if not cwd:
+            return ""
+        value = cwd
+        if value.startswith("file://"):
+            parsed = urllib.parse.urlparse(value)
+            value = urllib.parse.unquote(parsed.path or "")
+            if IS_WINDOWS and re.match(r"^/[A-Za-z]:/", value):
+                value = value[1:]
+            value = value.replace("/", os.sep)
+        return os.path.normcase(os.path.normpath(value))
+
+    def _activate_wezterm_pane_for_codex_row(self, cwd: str, session_id: str = "") -> bool:
+        """Activate the wezterm pane for a PID-less Codex row.
+
+        Prefer session-id text inside panes with the same cwd. If no session id
+        is available, cwd is usable only when it identifies one pane exactly.
+        """
+        target = self._normalize_wezterm_cwd(cwd)
+        if not target:
+            return False
+
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 2,
+            }
+            if IS_WINDOWS:
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            result = subprocess.run(["wezterm", "cli", "list", "--format", "json"], **kwargs)
+            if result.returncode != 0:
+                _log.debug("wezterm list rc=%s stderr=%s",
+                           result.returncode, (result.stderr or "")[:200])
+                return False
+            panes = json.loads(result.stdout or "[]")
+        except FileNotFoundError:
+            _log.debug("wezterm.exe not on PATH")
+            return False
+        except Exception:
+            _log.debug("wezterm list failed", exc_info=True)
+            return False
+
+        matches = [
+            p for p in panes
+            if self._normalize_wezterm_cwd(str(p.get("cwd") or "")) == target
+        ]
+        sid = (session_id or "").strip()
+        if sid and len(matches) > 1:
+            sid_matches = []
+            for pane in matches:
+                pane_id = pane.get("pane_id")
+                if pane_id is None:
+                    continue
+                try:
+                    kwargs = {
+                        "capture_output": True,
+                        "text": True,
+                        "encoding": "utf-8",
+                        "errors": "replace",
+                        "timeout": 2,
+                    }
+                    if IS_WINDOWS:
+                        kwargs["creationflags"] = 0x08000000
+                    result = subprocess.run(
+                        ["wezterm", "cli", "get-text", "--pane-id", str(pane_id)], **kwargs
+                    )
+                except Exception:
+                    _log.debug("wezterm get-text failed for pane_id=%s", pane_id, exc_info=True)
+                    continue
+                if result.returncode == 0 and sid in (result.stdout or ""):
+                    sid_matches.append(pane)
+            if len(sid_matches) == 1:
+                matches = sid_matches
+            else:
+                _log.debug("wezterm session match for %s cwd=%s -> %d panes; refusing",
+                           sid, cwd, len(sid_matches))
+                return False
+
+        if len(matches) != 1:
+            _log.debug("wezterm cwd match for %s -> %d panes; refusing", cwd, len(matches))
+            return False
+
+        pane = matches[0]
+        pane_id = pane.get("pane_id")
+        if pane_id is None:
+            return False
+
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 2,
+            }
+            if IS_WINDOWS:
+                kwargs["creationflags"] = 0x08000000
+            result = subprocess.run(
+                ["wezterm", "cli", "activate-pane", "--pane-id", str(pane_id)], **kwargs
+            )
+            if result.returncode != 0:
+                _log.debug("wezterm activate-pane rc=%s stderr=%s",
+                           result.returncode, (result.stderr or "")[:200])
+                return False
+        except Exception:
+            _log.debug("wezterm activate-pane failed", exc_info=True)
+            return False
+
+        self._raise_wezterm_client_for_pane(pane_id)
+        _log.debug("activated wezterm pane_id=%s for cwd=%s", pane_id, cwd)
+        return True
+
+    def _raise_wezterm_client_for_pane(self, pane_id):
+        if not IS_WINDOWS:
+            return
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 2,
+                "creationflags": 0x08000000,
+            }
+            result = subprocess.run(["wezterm", "cli", "list-clients", "--format", "json"], **kwargs)
+            if result.returncode != 0:
+                return
+            clients = json.loads(result.stdout or "[]")
+        except Exception:
+            _log.debug("wezterm list-clients failed", exc_info=True)
+            return
+
+        selected = None
+        for c in clients:
+            if c.get("focused_pane_id") == pane_id:
+                selected = c
+                break
+        if selected is None and len(clients) == 1:
+            selected = clients[0]
+        if not selected:
+            return
+        try:
+            gui_pid = int(selected.get("pid"))
+        except (TypeError, ValueError):
+            return
+        hwnd = self._find_wezterm_hwnd(gui_pid)
+        if hwnd:
+            activate_window(hwnd)
 
     def _activate_wezterm_pane(self, wezterm_info: dict) -> bool:
         """Activate wezterm tab via cli + raise GUI window. Returns True if tab activated."""

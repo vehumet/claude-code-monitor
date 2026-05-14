@@ -46,11 +46,11 @@ _STALE_EVICTION_S = 30 * 60
 _WORKING_FRESHNESS_S = 30
 
 # Known event_msg payload.type markers, verified against Codex CLI 0.128.0.
-# Comparing task_started vs task_complete counts is the most reliable
+# Comparing task_started vs terminal turn markers is the most reliable
 # in-band state signal — mtime is the fallback before the first marker.
 _START_TYPES = {"task_started"}
 _COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
-_FAIL_TYPES = {"error", "task_failed", "turn_failed"}
+_FAIL_TYPES = {"error", "task_failed", "turn_failed", "turn_aborted"}
 
 # Filename prefix for our PID-less virtual rows. Kept ASCII + dashes so
 # every filesystem (and our int-PID parsers) handle it cleanly.
@@ -155,11 +155,15 @@ def _ignore_rollout(prev_cache, path, mtime, session_id, reason, sessions_dir, s
 
 
 def _scan_turn_markers(path):
-    """Single-pass walk of the rollout — count task_started / task_complete
-    / failure markers. Returns ``(started, completed, failed)``."""
+    """Single-pass walk of rollout turn markers.
+
+    Returns ``(started, terminal, latest_failed)``. Older Codex rollouts can
+    contain interrupted turns followed by later successful turns, so a failure
+    marker is only an interrupted monitor state when it is the latest marker.
+    """
     started = 0
-    completed = 0
-    failed = False
+    terminal = 0
+    latest_marker = None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -177,13 +181,16 @@ def _scan_turn_markers(path):
                     continue
                 if pt in _START_TYPES:
                     started += 1
+                    latest_marker = "started"
                 elif pt in _COMPLETE_TYPES:
-                    completed += 1
+                    terminal += 1
+                    latest_marker = "completed"
                 elif pt in _FAIL_TYPES:
-                    failed = True
+                    terminal += 1
+                    latest_marker = "failed"
     except OSError:
         return 0, 0, False
-    return started, completed, failed
+    return started, terminal, latest_marker == "failed"
 
 
 def _infer_state(mtime, started, completed, failed):

@@ -153,6 +153,21 @@ class MonitorCoreTests(unittest.TestCase):
 
             self.assertFalse(mod._codex_task_complete("sid"))
 
+    def test_codex_task_complete_treats_turn_aborted_as_terminal(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_aborted_terminal")
+            mod._find_codex_rollout = lambda _sid: str(rollout)
+
+            self.assertTrue(mod._codex_task_complete("sid"))
+
     def test_codex_rollout_digest_collects_recent_work_signals(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             rollout = Path(td) / "rollout.jsonl"
@@ -663,6 +678,208 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertTrue((state_dir / f"{vid}.json").exists())
             state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["state"], "working")
+
+    def test_rollout_interrupted_turns_do_not_leave_later_done_session_working(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_aborted_then_done")
+
+            started, terminal, failed = mod._scan_turn_markers(str(rollout))
+
+            self.assertEqual(started, 2)
+            self.assertEqual(terminal, 2)
+            self.assertFalse(failed)
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed),
+                "done",
+            )
+
+    def test_rollout_latest_turn_aborted_is_interrupted(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_latest_aborted")
+
+            started, terminal, failed = mod._scan_turn_markers(str(rollout))
+
+            self.assertEqual(started, 1)
+            self.assertEqual(terminal, 1)
+            self.assertTrue(failed)
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed),
+                "interrupted",
+            )
+
+    def test_pidless_codex_row_uses_cwd_focus_fallback(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_focus")
+        called = []
+
+        class Dummy:
+            def __init__(self):
+                self.tracker = type("Tracker", (), {
+                    "instances": {
+                        "codex-abc": type("Inst", (), {
+                            "provider": "codex",
+                            "cwd": "C:\\project",
+                            "session_id": "",
+                            "wezterm": None,
+                        })()
+                    }
+                })()
+
+            def _activate_codex_pidless(self, cwd, session_id=""):
+                called.append((cwd, session_id))
+
+        mod.MonitorOverlay._activate_terminal(Dummy(), "codex-abc")
+
+        self.assertEqual(called, [("C:\\project", "")])
+
+    def test_pidless_codex_focus_does_nothing_without_window_match(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_no_match")
+        mod.MonitorOverlay._activate_wezterm_pane_for_codex_row = lambda _self, _cwd, _sid="": False
+        mod.build_process_tree = lambda: {
+            100: (1, "codex.exe"),
+        }
+        mod.find_window_for_pid = lambda _pid, _tree, _cwd: None
+        mod.activate_window = lambda _hwnd: self.fail("activate_window called")
+
+        class Dummy:
+            pass
+
+        mod.MonitorOverlay._activate_codex_pidless(Dummy(), "C:\\project")
+
+    def test_pidless_codex_focus_uses_unique_wezterm_cwd(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_wezterm")
+        calls = []
+
+        class Result:
+            def __init__(self, stdout):
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["wezterm", "cli", "list"]:
+                return Result(json.dumps([
+                    {
+                        "pane_id": 15,
+                        "cwd": "file:///C:/Users/vehum/cluade_workspace/claude-code-monitor/",
+                    }
+                ]))
+            if cmd[:3] == ["wezterm", "cli", "activate-pane"]:
+                return Result("")
+            self.fail(f"unexpected command: {cmd}")
+
+        raised = []
+        old_run = mod.subprocess.run
+        try:
+            mod.subprocess.run = fake_run
+
+            class Dummy:
+                _normalize_wezterm_cwd = staticmethod(mod.MonitorOverlay._normalize_wezterm_cwd)
+
+                def _raise_wezterm_client_for_pane(self, pane_id):
+                    raised.append(pane_id)
+
+            self.assertTrue(mod.MonitorOverlay._activate_wezterm_pane_for_codex_row(
+                Dummy(),
+                "C:\\Users\\vehum\\cluade_workspace\\claude-code-monitor",
+            ))
+        finally:
+            mod.subprocess.run = old_run
+
+        self.assertIn(["wezterm", "cli", "activate-pane", "--pane-id", "15"], calls)
+        self.assertEqual(raised, [15])
+
+    def test_pidless_codex_focus_uses_session_id_when_cwd_is_duplicated(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_wezterm_session")
+        calls = []
+
+        class Result:
+            def __init__(self, stdout):
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["wezterm", "cli", "list"]:
+                return Result(json.dumps([
+                    {"pane_id": 1, "cwd": "file:///C:/project/"},
+                    {"pane_id": 2, "cwd": "file:///C:/project/"},
+                ]))
+            if cmd[:3] == ["wezterm", "cli", "get-text"]:
+                pane_id = cmd[-1]
+                return Result("session 019e-target" if pane_id == "2" else "other session")
+            if cmd[:3] == ["wezterm", "cli", "activate-pane"]:
+                return Result("")
+            self.fail(f"unexpected command: {cmd}")
+
+        raised = []
+        old_run = mod.subprocess.run
+        try:
+            mod.subprocess.run = fake_run
+
+            class Dummy:
+                _normalize_wezterm_cwd = staticmethod(mod.MonitorOverlay._normalize_wezterm_cwd)
+
+                def _raise_wezterm_client_for_pane(self, pane_id):
+                    raised.append(pane_id)
+
+            self.assertTrue(mod.MonitorOverlay._activate_wezterm_pane_for_codex_row(
+                Dummy(),
+                "C:\\project",
+                "019e-target",
+            ))
+        finally:
+            mod.subprocess.run = old_run
+
+        self.assertIn(["wezterm", "cli", "activate-pane", "--pane-id", "2"], calls)
+        self.assertEqual(raised, [2])
+
+    def test_pidless_codex_focus_rejects_duplicate_wezterm_cwd(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_wezterm_duplicate")
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps([
+                {"pane_id": 1, "cwd": "file:///C:/project/"},
+                {"pane_id": 2, "cwd": "file:///C:/project/"},
+            ])
+
+        old_run = mod.subprocess.run
+        try:
+            mod.subprocess.run = lambda *_args, **_kwargs: Result()
+
+            class Dummy:
+                _normalize_wezterm_cwd = staticmethod(mod.MonitorOverlay._normalize_wezterm_cwd)
+
+                def _raise_wezterm_client_for_pane(self, _pane_id):
+                    self.fail("_raise_wezterm_client_for_pane called")
+
+            self.assertFalse(mod.MonitorOverlay._activate_wezterm_pane_for_codex_row(
+                Dummy(),
+                "C:\\project",
+            ))
+        finally:
+            mod.subprocess.run = old_run
 
     def test_subagent_rollout_is_ignored_and_virtual_row_cleanup_only(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
