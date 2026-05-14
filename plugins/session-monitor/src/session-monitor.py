@@ -128,6 +128,7 @@ THEME = {
     "interrupted": "#fab387",   # peach/orange
     "idle":        "#585b70",   # grey
     "hover":       "#313244",
+    "recent_bg":   "#25283a",
     "close_hover": "#f38ba8",   # red
 }
 
@@ -759,7 +760,8 @@ def build_display_name(cwd, slot, summary, provider="claude"):
 class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
-                 "slot", "summary", "pinned_at", "provider", "session_id")
+                 "slot", "summary", "pinned_at", "provider", "session_id",
+                 "state_changed_at")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude", session_id=""):
         self.pid = pid
@@ -767,6 +769,7 @@ class Instance:
         self.session_id = session_id or ""
         self.state = state
         self.updated_at = updated_at
+        self.state_changed_at = updated_at or 0
         self.slot = 0
         self.summary = ""
         self.provider = provider
@@ -1003,6 +1006,8 @@ class InstanceTracker:
                     old_state = inst.state
                     inst.state = state
                     inst.updated_at = updated_at
+                    if old_state != state:
+                        inst.state_changed_at = updated_at or int(time.time())
                     if state == "done" and old_state != "done":
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
@@ -1264,14 +1269,14 @@ class MonitorOverlay:
                     continue
                 if inst.state == "done":
                     if inst.done_since > 0 and now - inst.done_since < self.blink_seconds:
-                        color = THEME["done"] if self._blink_phase else THEME["bg"]
+                        color = THEME["done"] if self._blink_phase else row.get("base_bg", THEME["bg"])
                     else:
                         color = THEME["done"]
                     row["dot"].config(fg=color)
                     row["state"].config(fg=color)
                 elif inst.state == "interrupted":
                     if inst.done_since > 0 and now - inst.done_since < self.blink_seconds:
-                        color = THEME["interrupted"] if self._blink_phase else THEME["bg"]
+                        color = THEME["interrupted"] if self._blink_phase else row.get("base_bg", THEME["bg"])
                     else:
                         color = THEME["interrupted"]
                     row["dot"].config(fg=color)
@@ -1298,6 +1303,7 @@ class MonitorOverlay:
                 str(i.pid),
             ),
         )
+        recent_key = self._recent_state_change_key(instances)
 
         if not instances:
             frame = tk.Frame(self.content, bg=THEME["bg"])
@@ -1310,7 +1316,7 @@ class MonitorOverlay:
             self.row_widgets.append({"frame": frame, "instance": None, "dot": lbl})
         else:
             for inst in instances:
-                self._add_row(inst)
+                self._add_row(inst, is_recent=self.tracker.pin_key(inst) == recent_key)
 
         row_count = max(len(instances), 1)
         height = self.header_height + row_count * self.row_height + self.padding
@@ -1329,11 +1335,20 @@ class MonitorOverlay:
             text = text[:-1]
         return text.rstrip() + "\u2026"
 
-    def _add_row(self, inst: Instance):
+    def _recent_state_change_key(self, instances):
+        candidates = [i for i in instances if i.state_changed_at]
+        if not candidates:
+            return None
+        inst = max(candidates, key=lambda i: (i.state_changed_at, str(i.pid)))
+        return self.tracker.pin_key(inst)
+
+    def _add_row(self, inst: Instance, is_recent=False):
         state_color = THEME.get(inst.state, THEME["idle"])
         state_text = get_label(inst.state)
+        base_bg = THEME["recent_bg"] if is_recent else THEME["bg"]
 
-        frame = tk.Frame(self.content, bg=THEME["bg"], cursor="hand2")
+        frame = tk.Frame(self.content, bg=base_bg, cursor="hand2")
+        frame._session_monitor_base_bg = base_bg
         frame.pack(fill=tk.X, pady=0)
 
         # Grid columns: dot | folder(N) | summary | state
@@ -1346,7 +1361,7 @@ class MonitorOverlay:
 
         dot_glyph = provider_marker(inst.provider) or "\u25cf"
         dot_box = tk.Frame(
-            frame, bg=THEME["bg"],
+            frame, bg=base_bg,
             width=self.col_dot_w, height=cell_h,
         )
         dot_box.grid(row=0, column=0, sticky="w", padx=(4, 0))
@@ -1355,7 +1370,7 @@ class MonitorOverlay:
         marker_fg = state_color if inst.pinned_at is None else THEME["fg"]
         dot = tk.Label(
             dot_box, text=dot_glyph, font=self.font_row,
-            bg=THEME["bg"], fg=marker_fg, cursor="hand2",
+            bg=base_bg, fg=marker_fg, cursor="hand2",
         )
         dot.pack(fill=tk.BOTH, expand=True)
 
@@ -1366,7 +1381,7 @@ class MonitorOverlay:
         dot.bind("<Button-1>", on_dot_click)
 
         folder_box = tk.Frame(
-            frame, bg=THEME["bg"],
+            frame, bg=base_bg,
             width=self.col_folder_w, height=cell_h,
         )
         folder_box.grid(row=0, column=1, sticky="w")
@@ -1374,12 +1389,12 @@ class MonitorOverlay:
         folder_box.pack_propagate(False)
         folder_lbl = tk.Label(
             folder_box, text=build_folder_head(inst.cwd, inst.slot, inst.provider),
-            font=self.font_row, bg=THEME["bg"], fg=THEME["fg"], anchor="w",
+            font=self.font_row, bg=base_bg, fg=THEME["fg"], anchor="w",
         )
         folder_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         summary_box = tk.Frame(
-            frame, bg=THEME["bg"],
+            frame, bg=base_bg,
             width=self.col_summary_w, height=cell_h,
         )
         summary_box.grid(row=0, column=2, sticky="w")
@@ -1387,13 +1402,13 @@ class MonitorOverlay:
         summary_box.pack_propagate(False)
         summary_lbl = tk.Label(
             summary_box, text=build_summary_text(inst.summary),
-            font=self.font_row, bg=THEME["bg"], fg=THEME["dim"], anchor="w",
+            font=self.font_row, bg=base_bg, fg=THEME["dim"], anchor="w",
         )
         summary_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         state_lbl = tk.Label(
             frame, text=state_text, font=self.font_state,
-            bg=THEME["bg"], fg=state_color, anchor="e",
+            bg=base_bg, fg=state_color, anchor="e",
         )
         state_lbl.grid(row=0, column=3, sticky="e", padx=(0, 6))
 
@@ -1416,7 +1431,7 @@ class MonitorOverlay:
 
         self.row_widgets.append({
             "frame": frame, "dot": dot, "name": name_lbl,
-            "state": state_lbl, "instance": inst,
+            "state": state_lbl, "instance": inst, "base_bg": base_bg,
         })
 
     def _toggle_pin(self, pid):
@@ -1429,7 +1444,7 @@ class MonitorOverlay:
         self._rebuild_rows()
 
     def _row_hover(self, frame, entering):
-        bg = THEME["hover"] if entering else THEME["bg"]
+        bg = THEME["hover"] if entering else getattr(frame, "_session_monitor_base_bg", THEME["bg"])
         frame.config(bg=bg)
         # Recolor every descendant — grid cells include nested boxes
         # (folder_box → folder_lbl, summary_box → summary_lbl).

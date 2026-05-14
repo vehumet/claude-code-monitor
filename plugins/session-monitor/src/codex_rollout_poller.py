@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
-"""Disk sync for Codex CLI sessions that aren't reaching us via hooks.
+"""Disk sync for Codex CLI rollout rows that are not owned by hooks.
 
 Codex writes a rollout JSONL for every session under
 ``~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<sid>.jsonl`` regardless of hook
-configuration. We mirror those — for sessions not already registered by a
-real Codex hook — into the standard monitor stores under PID-less virtual
-IDs so the rest of the pipeline (slot allocation, summarisation,
-overlay rendering) treats them like first-class rows.
+configuration. Hook-less top-level rollouts are mirrored into PID-less rows so
+completed sessions remain visible and clickable even when hooks did not bind
+them to a real process.
 
 Files written:
-
-  ``~/.claude/sessions/codex-<sid8>.json``
-      Minimal session record (sessionId, cwd, virtualId, provider).
-      ``_do_summarize`` reads ``sessionId`` from here to find the rollout.
-
-  ``~/.claude/session-monitor/state/codex-<sid8>.json``
-      State record (state, cwd, updatedAt, provider, summary fields…).
-      The overlay renders this directly. ``rolloutPath`` and
-      ``rolloutMtime`` track the source file so we can evict when the
-      rollout goes stale or is deleted.
 
 Ownership: when a real hook fires for a session, write-state.py records a
 ``~/.claude/session-monitor/codex-hooked/<sessionId>.json`` marker. The poller then
 treats that rollout as hook-owned forever and will not recreate it as a
-PID-less fallback row after the real Codex process exits. Subagent rollouts
-are also classified as ignored. In both cases the source rollout JSONL is
-left untouched; only monitor-generated virtual files are cleaned up.
+PID-less fallback row after the real Codex process exits. Subagent and exec
+rollouts are also classified as ignored. In all cases the source rollout JSONL
+is left untouched; only monitor-generated virtual files are cleaned up.
 """
 
 import glob
@@ -76,6 +65,11 @@ def _is_hook_owned_session(state_dir, session_id):
 
 def virtual_id_for(session_id: str) -> str:
     """Stable virtual ID derived from the Codex session UUID."""
+    return f"{VIRTUAL_PREFIX}{session_id}"
+
+
+def _legacy_virtual_id_for(session_id: str) -> str:
+    """Old virtual ID format kept only to remove pre-migration files."""
     return f"{VIRTUAL_PREFIX}{session_id[:8]}"
 
 
@@ -137,15 +131,15 @@ def _drop_virtual_monitor_row(sessions_dir, state_dir, session_id):
 
     The source rollout JSONL under ~/.codex/sessions is never touched.
     """
-    vid = virtual_id_for(session_id)
-    for p in (
-        os.path.join(sessions_dir, f"{vid}.json"),
-        os.path.join(state_dir, f"{vid}.json"),
-    ):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    for vid in {virtual_id_for(session_id), _legacy_virtual_id_for(session_id)}:
+        for p in (
+            os.path.join(sessions_dir, f"{vid}.json"),
+            os.path.join(state_dir, f"{vid}.json"),
+        ):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def _ignore_rollout(prev_cache, path, mtime, session_id, reason, sessions_dir, state_dir):
@@ -388,8 +382,18 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
 
         seen_rollout_paths.add(path)
         vid = virtual_id_for(session_id)
+        legacy_vid = _legacy_virtual_id_for(session_id)
         sess_path = os.path.join(sessions_dir, f"{vid}.json")
         state_path = os.path.join(state_dir, f"{vid}.json")
+        if legacy_vid != vid:
+            for p in (
+                os.path.join(sessions_dir, f"{legacy_vid}.json"),
+                os.path.join(state_dir, f"{legacy_vid}.json"),
+            ):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
         if session_id in known_session_ids:
             # A hook already owns this session. Drop any virtual files we

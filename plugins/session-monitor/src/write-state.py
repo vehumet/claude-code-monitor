@@ -756,6 +756,40 @@ def _find_codex_rollout(session_id):
     return None
 
 
+def _codex_rollout_payload(session_id):
+    """Return the session_meta payload for a Codex rollout, if available."""
+    rollout = _find_codex_rollout(session_id)
+    if not rollout:
+        return None
+    try:
+        with open(rollout, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                if d.get("type") != "session_meta":
+                    return None
+                payload = d.get("payload") or {}
+                return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _is_nested_codex_payload(payload):
+    """True for subagent rollouts that must not update the parent row."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("thread_source") == "subagent":
+        return True
+    source = payload.get("source")
+    return isinstance(source, dict) and "subagent" in source
+
+
+def _codex_session_is_nested(session_id):
+    return _is_nested_codex_payload(_codex_rollout_payload(session_id))
+
+
 _CODEX_DIGEST_MAX_CHARS = 6000
 _CODEX_DIGEST_SECTION_LIMITS = {
     "user_messages": 3,
@@ -1513,6 +1547,10 @@ def main():
     if not provider:
         provider = "claude"
 
+    if provider == "codex" and session_id and _codex_session_is_nested(session_id):
+        _log.debug("=> Codex subagent hook ignored: session_id=%s", session_id)
+        return
+
     if provider == "codex" and session_id:
         _mark_codex_hooked_session(session_id)
 
@@ -1550,7 +1588,14 @@ def main():
             if os.path.exists(sess_file):
                 with open(sess_file, "r", encoding="utf-8") as f:
                     sess = json.load(f)
-                if sess.get("sessionId") != session_id:
+                existing_sid = sess.get("sessionId")
+                if provider == "codex" and existing_sid and existing_sid != session_id:
+                    _log.debug(
+                        "Phase 2.5: refusing to overwrite codex sessionId in %s.json old=%s new=%s",
+                        real_pid, existing_sid, session_id,
+                    )
+                    return
+                if existing_sid != session_id:
                     sess["sessionId"] = session_id
                     _atomic_write_json(sess_file, sess, "session-register")
                     _log.debug("Phase 2.5: updated sessionId in %s.json", real_pid)

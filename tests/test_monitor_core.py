@@ -121,6 +121,150 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue((home / ".claude" / "session-monitor" / "codex-hooked" / f"{sid}.json").exists())
 
+    def test_codex_subagent_hook_does_not_update_parent_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "15"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            parent_sid = "parent11-1111-2222-3333-abcdefghijkl"
+            sub_sid = "subagt11-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            parent_pid = 4242
+            (sessions_dir / f"{parent_pid}.json").write_text(
+                json.dumps({
+                    "pid": parent_pid,
+                    "sessionId": parent_sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{parent_pid}.json").write_text(
+                json.dumps({
+                    "pid": parent_pid,
+                    "state": "working",
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (rollout_dir / f"rollout-2026-05-15T00-00-00-{sub_sid}.jsonl").write_text(
+                json.dumps({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": sub_sid,
+                        "cwd": cwd,
+                        "thread_source": "subagent",
+                        "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent_sid}}},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_subagent_hook_ignored")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (parent_pid, "python.exe"),
+                parent_pid: (1, "codex.exe"),
+                1: (0, "cmd.exe"),
+            }
+
+            payload = json.dumps({
+                "session_id": sub_sid,
+                "sessionId": sub_sid,
+                "cwd": cwd,
+                "hook_event_name": "user_prompt_submit",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "codex", "done"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+
+            parent_session = json.loads((sessions_dir / f"{parent_pid}.json").read_text(encoding="utf-8"))
+            parent_state = json.loads((state_dir / f"{parent_pid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(parent_session["sessionId"], parent_sid)
+            self.assertEqual(parent_state["state"], "working")
+            self.assertFalse(
+                (home / ".claude" / "session-monitor" / "codex-hooked" / f"{sub_sid}.json").exists()
+            )
+
+    def test_codex_existing_pid_session_id_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            parent_sid = "parent11-1111-2222-3333-abcdefghijkl"
+            spawned_sid = "spawned1-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            parent_pid = 4242
+            (sessions_dir / f"{parent_pid}.json").write_text(
+                json.dumps({
+                    "pid": parent_pid,
+                    "sessionId": parent_sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{parent_pid}.json").write_text(
+                json.dumps({
+                    "pid": parent_pid,
+                    "state": "working",
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_codex_no_overwrite")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (parent_pid, "python.exe"),
+                parent_pid: (1, "codex.exe"),
+                1: (0, "cmd.exe"),
+            }
+            mod._codex_session_is_nested = lambda _sid: False
+
+            payload = json.dumps({
+                "session_id": spawned_sid,
+                "sessionId": spawned_sid,
+                "cwd": cwd,
+                "hook_event_name": "session_start",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "codex", "session_start"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+
+            parent_session = json.loads((sessions_dir / f"{parent_pid}.json").read_text(encoding="utf-8"))
+            parent_state = json.loads((state_dir / f"{parent_pid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(parent_session["sessionId"], parent_sid)
+            self.assertEqual(parent_state["state"], "working")
+
     def test_codex_task_complete_prefers_latest_marker(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             rollout = Path(td) / "rollout.jsonl"
@@ -635,7 +779,27 @@ class MonitorCoreTests(unittest.TestCase):
                 "done",
             )
 
-    def test_rollout_cache_hit_repairs_missing_files(self):
+    def test_recent_state_change_key_uses_state_change_time(self):
+        mod = load_module(MONITOR, "session_monitor_recent_state_change")
+        older = mod.Instance(1, "C:\\a", updated_at=100, session_id="older")
+        newer = mod.Instance(2, "C:\\b", updated_at=200, session_id="newer")
+        older.state_changed_at = 300
+        newer.state_changed_at = 200
+
+        class Tracker:
+            @staticmethod
+            def pin_key(inst):
+                return inst.session_id or str(inst.pid)
+
+        class Overlay:
+            tracker = Tracker()
+
+        self.assertEqual(
+            mod.MonitorOverlay._recent_state_change_key(Overlay(), [older, newer]),
+            "older",
+        )
+
+    def test_rollout_cache_hit_repairs_working_pidless_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
             os.environ["HOME"] = td
@@ -671,13 +835,60 @@ class MonitorCoreTests(unittest.TestCase):
                 }
             }
 
+            vid = mod.virtual_id_for(sid)
+            (sessions_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+            (state_dir / f"{vid}.json").write_text("{}", encoding="utf-8")
+
             mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
 
-            vid = "codex-abcdefgh"
             self.assertTrue((sessions_dir / f"{vid}.json").exists())
             self.assertTrue((state_dir / f"{vid}.json").exists())
             state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["state"], "working")
+
+    def test_rollout_virtual_ids_do_not_collide_on_timestamp_prefix(self):
+        mod = load_module(POLLER, "codex_rollout_poller_full_virtual_id")
+        a = "019e27ec-b184-7192-b398-ef2d33000d02"
+        b = "019e27ec-c001-7192-b398-ef2d33000d02"
+
+        self.assertNotEqual(mod.virtual_id_for(a), mod.virtual_id_for(b))
+        self.assertEqual(mod.virtual_id_for(a), f"codex-{a}")
+
+    def test_rollout_full_virtual_id_removes_legacy_prefix_file(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "019e27ec-b184-7192-b398-ef2d33000d02"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": "cli"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            legacy_vid = "codex-019e27ec"
+            (sessions_dir / f"{legacy_vid}.json").write_text("{}", encoding="utf-8")
+            (state_dir / f"{legacy_vid}.json").write_text("{}", encoding="utf-8")
+
+            mod = load_module(POLLER, "codex_rollout_poller_legacy_cleanup")
+            vid = mod.virtual_id_for(sid)
+            cache = {}
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            self.assertFalse((sessions_dir / f"{legacy_vid}.json").exists())
+            self.assertFalse((state_dir / f"{legacy_vid}.json").exists())
 
     def test_rollout_interrupted_turns_do_not_leave_later_done_session_working(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -961,6 +1172,73 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue(cache[str(rollout)]["ignored"])
             self.assertEqual(cache[str(rollout)]["ignore_reason"], "exec")
+
+    def test_hookless_cli_working_rollout_creates_virtual_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "plain111-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": "cli"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_cli_working")
+            vid = mod.virtual_id_for(sid)
+
+            cache = {}
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["state"], "working")
+
+    def test_hookless_cli_done_rollout_creates_virtual_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "done1111-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": "cli"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_cli_done")
+            vid = mod.virtual_id_for(sid)
+
+            cache = {}
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["state"], "done")
 
     def test_hook_owned_rollout_is_not_reimported_after_pid_exit(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
