@@ -128,7 +128,7 @@ THEME = {
     "interrupted": "#fab387",   # peach/orange
     "idle":        "#585b70",   # grey
     "hover":       "#313244",
-    "recent_bg":   "#25283a",
+    "recent_bg":   "#303450",
     "close_hover": "#f38ba8",   # red
 }
 
@@ -1006,7 +1006,7 @@ class InstanceTracker:
                     old_state = inst.state
                     inst.state = state
                     inst.updated_at = updated_at
-                    if old_state != state:
+                    if old_state != state and state != "working":
                         inst.state_changed_at = updated_at or int(time.time())
                     if state == "done" and old_state != "done":
                         inst.done_since = time.monotonic()

@@ -799,6 +799,52 @@ class MonitorCoreTests(unittest.TestCase):
             "older",
         )
 
+    def test_working_state_change_does_not_update_recent_highlight_time(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({"pid": real_pid, "sessionId": "sid", "cwd": cwd}),
+                encoding="utf-8",
+            )
+            (state_dir / f"{real_pid}.json").write_text(
+                json.dumps({"pid": real_pid, "state": "done", "cwd": cwd, "updatedAt": 100}),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_working_highlight")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                tracker.poll()
+                self.assertEqual(tracker.instances[real_pid].state_changed_at, 100)
+
+                (state_dir / f"{real_pid}.json").write_text(
+                    json.dumps({"pid": real_pid, "state": "working", "cwd": cwd, "updatedAt": 200}),
+                    encoding="utf-8",
+                )
+                tracker.poll()
+
+                self.assertEqual(tracker.instances[real_pid].state, "working")
+                self.assertEqual(tracker.instances[real_pid].state_changed_at, 100)
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
     def test_rollout_cache_hit_repairs_working_pidless_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
