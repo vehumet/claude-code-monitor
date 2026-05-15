@@ -24,6 +24,13 @@ All notable changes to this project will be documented in this file.
 
 - Remove marketplace/plugin metadata, marketplace hook definitions, and the marketplace-specific `/update-monitor` command.
 
+## [0.0.21] - 2026-05-16
+
+### Fixed
+
+- Preserve Codex hook trust state when refreshing the managed hook block so reinstall/update does not delete `trusted_hash` entries.
+- Ignore Codex desktop app-server helper hooks and rows so non-interactive desktop background processes do not appear as sticky monitor sessions.
+
 ## [0.0.20] - 2026-05-08
 
 ### Added
