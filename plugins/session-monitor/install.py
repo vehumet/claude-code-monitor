@@ -143,9 +143,41 @@ def _replace_codex_hook_block(text: str, block: str):
         return text, False
     end += len(CODEX_HOOK_MARKER_CLOSE)
     old = text[start:end]
-    if old == block:
+    preserved = _extract_codex_unmanaged_tail(old)
+    replacement = block
+    if preserved:
+        replacement = f"{block}\n\n{preserved}"
+    if old == replacement:
         return text, False
-    return text[:start] + block + text[end:], True
+    return text[:start] + replacement + text[end:], True
+
+
+def _extract_codex_unmanaged_tail(block: str) -> str:
+    """Recover TOML sections Codex may have inserted inside our marker fence.
+
+    Codex stores hook trust under [hooks.state]. If that lands before our
+    closing marker, a plain marker-block replacement would delete the user's
+    trusted_hash entries and trigger approval prompts again.
+    """
+    allowed_sections = {
+        f"[[hooks.{event}]]" for event, _ in CODEX_HOOK_EVENTS
+    } | {
+        f"[[hooks.{event}.hooks]]" for event, _ in CODEX_HOOK_EVENTS
+    }
+    lines = block.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == CODEX_HOOK_MARKER_OPEN:
+            continue
+        if stripped == CODEX_HOOK_MARKER_CLOSE:
+            break
+        if stripped.startswith("[") and stripped not in allowed_sections:
+            tail = "\n".join(lines[i:])
+            close_idx = tail.find(CODEX_HOOK_MARKER_CLOSE)
+            if close_idx >= 0:
+                tail = tail[:close_idx]
+            return tail.strip()
+    return ""
 
 
 def _ensure_codex_hooks_flag(text: str):

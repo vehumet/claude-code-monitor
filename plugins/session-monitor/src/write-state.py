@@ -460,6 +460,22 @@ def _is_virtual_id(pid):
     return isinstance(pid, str) and pid.startswith("codex-")
 
 
+def _is_codex_desktop_app_pid(pid, tree):
+    """True for the Codex desktop app's background app-server process.
+
+    The Windows desktop app launches ``app/resources/codex.exe app-server``
+    under the GUI ``Codex.exe`` process. Hooks from that helper do not behave
+    like an interactive CLI session, so surfacing them creates sticky rows.
+    """
+    if not IS_WINDOWS or not isinstance(pid, int):
+        return False
+    entry = tree.get(pid)
+    if not entry or entry[1] != "codex.exe":
+        return False
+    parent = tree.get(entry[0])
+    return bool(parent and parent[1] == "codex.exe")
+
+
 def _find_ancestor_llm_pid(my_pid, tree):
     p = my_pid
     visited = set()
@@ -1547,6 +1563,14 @@ def main():
     if not provider:
         provider = "claude"
 
+    llm_pid = _find_ancestor_llm_pid(my_pid, tree)
+    if provider == "codex" and llm_pid and _is_codex_desktop_app_pid(llm_pid, tree):
+        _log.debug(
+            "=> Codex desktop app-server hook ignored: pid=%s session_id=%s",
+            llm_pid, session_id,
+        )
+        return
+
     if provider == "codex" and session_id and _codex_session_is_nested(session_id):
         _log.debug("=> Codex subagent hook ignored: session_id=%s", session_id)
         return
@@ -1554,7 +1578,6 @@ def main():
     if provider == "codex" and session_id:
         _mark_codex_hooked_session(session_id)
 
-    llm_pid = _find_ancestor_llm_pid(my_pid, tree)
     promoted_virtual_id = None
 
     # Phase 2: Match by session_id (full scan)

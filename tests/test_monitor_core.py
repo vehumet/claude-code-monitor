@@ -121,6 +121,85 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue((home / ".claude" / "session-monitor" / "codex-hooked" / f"{sid}.json").exists())
 
+    def test_codex_hook_block_refresh_preserves_trust_state(self):
+        mod = load_module(INSTALLER, "installer_preserve_codex_trust")
+        rendered = mod._render_codex_hook_block()
+        misplaced_state = "\n".join([
+            "[hooks.state]",
+            "",
+            "[hooks.state.'C:\\Users\\me\\.codex\\config.toml:permission_request:0:0']",
+            'trusted_hash = "sha256:abc123"',
+            "",
+            '[plugins."browser-use@openai-bundled"]',
+            "enabled = true",
+        ])
+        old_text = rendered.replace(
+            mod.CODEX_HOOK_MARKER_CLOSE,
+            f"{misplaced_state}\n\n{mod.CODEX_HOOK_MARKER_CLOSE}",
+        )
+
+        updated, modified = mod._replace_codex_hook_block(
+            old_text,
+            mod._render_codex_hook_block(),
+        )
+
+        self.assertTrue(modified)
+        self.assertIn('trusted_hash = "sha256:abc123"', updated)
+        close_idx = updated.index(mod.CODEX_HOOK_MARKER_CLOSE)
+        trust_idx = updated.index("[hooks.state]")
+        self.assertLess(close_idx, trust_idx)
+        managed = updated[
+            updated.index(mod.CODEX_HOOK_MARKER_OPEN):close_idx
+        ]
+        self.assertNotIn("[hooks.state]", managed)
+
+    def test_codex_desktop_app_server_hook_is_ignored(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = home / ".claude" / "session-monitor" / "state"
+            sessions_dir = home / ".claude" / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            sid = "appserv1-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            mod = load_module(WRITE_STATE, "write_state_codex_app_server")
+            mod.IS_WINDOWS = True
+            py_pid = 5252
+            app_pid = 4242
+            gui_pid = 3131
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (app_pid, "python.exe"),
+                app_pid: (gui_pid, "codex.exe"),
+                gui_pid: (1, "codex.exe"),
+                1: (0, "explorer.exe"),
+            }
+
+            payload = json.dumps({
+                "session_id": sid,
+                "sessionId": sid,
+                "cwd": cwd,
+                "hook_event_name": "UserPromptSubmit",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "codex", "question"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+
+            self.assertEqual(list(sessions_dir.glob("*.json")), [])
+            self.assertEqual(list(state_dir.glob("*.json")), [])
+            self.assertFalse(
+                (home / ".claude" / "session-monitor" / "codex-hooked" / f"{sid}.json").exists()
+            )
+
     def test_codex_subagent_hook_does_not_update_parent_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)

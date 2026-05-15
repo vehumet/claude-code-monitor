@@ -406,6 +406,17 @@ def is_claude_pid_alive(pid: int) -> bool:
     return known_llm_pid_provider(pid) is not None
 
 
+def is_codex_desktop_app_pid(pid: int, tree: dict) -> bool:
+    """True for the Codex desktop app's app-server helper, not CLI sessions."""
+    if not IS_WINDOWS or not isinstance(pid, int):
+        return False
+    entry = tree.get(pid)
+    if not entry or entry[1] != "codex.exe":
+        return False
+    parent = tree.get(entry[0])
+    return bool(parent and parent[1] == "codex.exe")
+
+
 def load_nested_pids(state_root: str) -> set:
     """Load PIDs marked nested by our summarizer; clean up stale markers."""
     d = os.path.join(state_root, "nested-pids")
@@ -900,7 +911,11 @@ class InstanceTracker:
                 # writes/evicts both files atomically. Don't attempt the
                 # alive check (no real PID) and don't delete on its behalf.
                 pass
-            elif not isinstance(pid, int) or not is_claude_pid_alive(pid):
+            elif (
+                not isinstance(pid, int)
+                or is_codex_desktop_app_pid(pid, proc_tree)
+                or not is_claude_pid_alive(pid)
+            ):
                 if pid in self.instances:
                     del self.instances[pid]
                     changed = True
@@ -975,7 +990,11 @@ class InstanceTracker:
             # eviction for those.
             if is_virtual_id(pid):
                 pass
-            elif not isinstance(pid, int) or not is_claude_pid_alive(pid):
+            elif (
+                not isinstance(pid, int)
+                or is_codex_desktop_app_pid(pid, proc_tree)
+                or not is_claude_pid_alive(pid)
+            ):
                 try:
                     os.remove(sf)
                 except OSError:
