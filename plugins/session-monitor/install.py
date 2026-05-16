@@ -97,6 +97,52 @@ HOOKS_CONFIG = {
             ],
         },
     ],
+    "StopFailure": [
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "interrupted"',
+                    "timeout": 5,
+                }
+            ],
+        },
+    ],
+    "PostToolUseFailure": [
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "tool_failure"',
+                    "timeout": 5,
+                }
+            ],
+        },
+    ],
+    "Notification": [
+        {
+            "matcher": "idle_prompt",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "idle_prompt"',
+                    "timeout": 5,
+                }
+            ],
+        },
+        {
+            "matcher": "permission_prompt",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
+                    "timeout": 5,
+                }
+            ],
+        },
+    ],
     "UserPromptSubmit": [
         {
             "matcher": "",

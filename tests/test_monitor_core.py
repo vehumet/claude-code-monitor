@@ -611,6 +611,48 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(len(post_hooks), 1)
         self.assertEqual(post_hooks[0]["matcher"], "Bash")
 
+    def test_installer_adds_stop_failure_hook_for_api_errors(self):
+        mod = load_module(INSTALLER, "installer_stop_failure_hook")
+        settings = {"hooks": {}}
+
+        self.assertTrue(mod.merge_hooks(settings))
+
+        stop_failure_hooks = settings["hooks"]["StopFailure"]
+        self.assertEqual(len(stop_failure_hooks), 1)
+        hook_entry = stop_failure_hooks[0]
+        self.assertEqual(hook_entry["matcher"], "")
+        self.assertEqual(
+            hook_entry["hooks"][0]["command"],
+            'python "$HOME/.claude/hooks/write-state.py" --provider claude "interrupted"',
+        )
+
+    def test_installer_adds_failure_and_notification_hooks(self):
+        mod = load_module(INSTALLER, "installer_failure_notification_hooks")
+        settings = {"hooks": {}}
+
+        self.assertTrue(mod.merge_hooks(settings))
+
+        tool_failure_hooks = settings["hooks"]["PostToolUseFailure"]
+        self.assertEqual(len(tool_failure_hooks), 1)
+        self.assertEqual(tool_failure_hooks[0]["matcher"], "")
+        self.assertEqual(
+            tool_failure_hooks[0]["hooks"][0]["command"],
+            'python "$HOME/.claude/hooks/write-state.py" --provider claude "tool_failure"',
+        )
+
+        notification_hooks = {
+            entry["matcher"]: entry["hooks"][0]["command"]
+            for entry in settings["hooks"]["Notification"]
+        }
+        self.assertEqual(
+            notification_hooks["idle_prompt"],
+            'python "$HOME/.claude/hooks/write-state.py" --provider claude "idle_prompt"',
+        )
+        self.assertEqual(
+            notification_hooks["permission_prompt"],
+            'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
+        )
+
     def test_question_state_records_file_snapshots(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
