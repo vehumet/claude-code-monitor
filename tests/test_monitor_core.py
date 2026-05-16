@@ -872,10 +872,38 @@ class MonitorCoreTests(unittest.TestCase):
 
         class Overlay:
             tracker = Tracker()
+            _recent_highlight_cleared_at = 0
 
         self.assertEqual(
             mod.MonitorOverlay._recent_state_change_key(Overlay(), [older, newer]),
             "older",
+        )
+
+    def test_recent_state_change_key_ignores_dismissed_changes(self):
+        mod = load_module(MONITOR, "session_monitor_recent_state_change_dismissed")
+        older = mod.Instance(1, "C:\\a", updated_at=100, session_id="older")
+        newer = mod.Instance(2, "C:\\b", updated_at=200, session_id="newer")
+        future = mod.Instance(3, "C:\\c", updated_at=400, session_id="future")
+        older.state_changed_at = 300
+        newer.state_changed_at = 200
+        future.state_changed_at = 400
+
+        class Tracker:
+            @staticmethod
+            def pin_key(inst):
+                return inst.session_id or str(inst.pid)
+
+        class Overlay:
+            tracker = Tracker()
+            _recent_highlight_cleared_at = 300
+
+        self.assertEqual(
+            mod.MonitorOverlay._recent_state_change_key(Overlay(), [older, newer]),
+            None,
+        )
+        self.assertEqual(
+            mod.MonitorOverlay._recent_state_change_key(Overlay(), [older, newer, future]),
+            "future",
         )
 
     def test_working_state_change_does_not_update_recent_highlight_time(self):

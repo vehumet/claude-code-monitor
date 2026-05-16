@@ -1095,6 +1095,7 @@ class MonitorOverlay:
         # delayed catch-up writes that land just after the widget opens.
         self._first_poll = True
         self._quiet_until = time.monotonic() + STARTUP_QUIET_SECONDS
+        self._recent_highlight_cleared_at = 0
         self.row_height = 22
         self.header_height = 22
         self.padding = 4
@@ -1355,7 +1356,10 @@ class MonitorOverlay:
         return text.rstrip() + "\u2026"
 
     def _recent_state_change_key(self, instances):
-        candidates = [i for i in instances if i.state_changed_at]
+        candidates = [
+            i for i in instances
+            if i.state_changed_at and i.state_changed_at > self._recent_highlight_cleared_at
+        ]
         if not candidates:
             return None
         inst = max(candidates, key=lambda i: (i.state_changed_at, str(i.pid)))
@@ -1394,6 +1398,7 @@ class MonitorOverlay:
         dot.pack(fill=tk.BOTH, expand=True)
 
         def on_dot_click(_e, pid=inst.pid):
+            self._clear_recent_highlight(pid)
             self._toggle_pin(pid)
 
         dot_box.bind("<Button-1>", on_dot_click)
@@ -1436,6 +1441,7 @@ class MonitorOverlay:
         name_lbl = summary_lbl
 
         def on_click(_event, pid=inst.pid):
+            self._clear_recent_highlight(pid)
             self._activate_terminal(pid)
 
         # Dot already has its own pin-toggle handler; it still participates in
@@ -1452,6 +1458,19 @@ class MonitorOverlay:
             "frame": frame, "dot": dot, "name": name_lbl,
             "state": state_lbl, "instance": inst, "base_bg": base_bg,
         })
+
+    def _clear_recent_highlight(self, pid):
+        """Dismiss the current recent-change highlight when its row is clicked."""
+        inst = self.tracker.instances.get(pid)
+        if not inst or not inst.state_changed_at:
+            return
+        if self.tracker.pin_key(inst) != self._recent_state_change_key(self.tracker.instances.values()):
+            return
+        self._recent_highlight_cleared_at = max(
+            self._recent_highlight_cleared_at,
+            inst.state_changed_at,
+        )
+        self._rebuild_rows()
 
     def _toggle_pin(self, pid):
         """Toggle pin state for the given instance and rerender rows."""
