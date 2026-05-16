@@ -24,6 +24,13 @@ All notable changes to this project will be documented in this file.
 
 - Remove marketplace/plugin metadata, marketplace hook definitions, and the marketplace-specific `/update-monitor` command.
 
+## [0.0.22] - 2026-05-17
+
+### Fixed
+
+- Restore Claude Code `StopFailure`, `PostToolUseFailure`, and `Notification` hook installation so API errors, tool interrupts, idle-prompt interrupts, and permission prompts are reflected in the monitor after reinstall.
+- Dismiss the recent state-change highlight when the highlighted row is clicked.
+
 ## [0.0.21] - 2026-05-16
 
 ### Fixed
