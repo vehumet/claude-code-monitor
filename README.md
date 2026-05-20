@@ -25,7 +25,7 @@ Click a row to focus that terminal. Drag the bar to move the widget; the positio
 The topic label in each row is generated automatically when a session goes idle (Stop hook), using a tiny model that runs as a detached background process so it doesn't block your interactive session.
 
 - **Claude rows**: `claude -p --model claude-haiku-4-5` over the session JSONL. Signal priority: ai-title (wezterm tab parity) → `/rename` slug → away_summary recap → first user messages.
-- **Codex rows**: the rollout JSONL is reduced locally into a bounded digest of recent user requests, assistant progress comments, final answers, tool calls, touched files, and plan updates. That digest is summarized with `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini`, keeping input size predictable while producing labels closer to the current task. `--ephemeral` keeps the summary call from writing a new rollout, and `--ignore-user-config` keeps it from re-firing our hooks. Override the model via `SESSION_MONITOR_CODEX_SUMMARY_MODEL` env var or `codex_summary_model` in `~/.claude/session-monitor/config.json`.
+- **Codex rows**: the rollout JSONL is reduced locally into a bounded digest of recent user requests, assistant progress comments, final answers, tool calls, touched files, and plan updates. That digest is summarized with `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini`, keeping input size predictable while producing labels closer to the current task. `--ephemeral` keeps the summary call from writing a new rollout, and `--ignore-user-config` keeps it from re-firing our hooks. Override the model via `SESSION_MONITOR_CODEX_SUMMARY_MODEL` env var or `codex_summary_model` in `~/.local/share/session-monitor/config.json`.
 
 Output language follows the OS locale (Korean → Korean, otherwise English); Codex summaries also try to follow the dominant user request language and preserve natural spacing. Calls are debounced (5-minute cooldown per session). They consume Claude or Codex usage like any other CLI invocation, but at the cheapest tier of each.
 
@@ -39,7 +39,7 @@ cd session-monitor
 python install.py
 ```
 
-The installer is idempotent. It copies Session Monitor into `~/.claude/session-monitor/`, installs the `/session-monitor` slash command into `~/.claude/commands/`, and merges the required hooks into `~/.claude/settings.json`. When `~/.codex/` exists, it also installs Codex CLI hooks into `~/.codex/config.toml` and the `$session-monitor` skill into `~/.codex/skills/`.
+The installer is idempotent. It copies Session Monitor into `~/.local/share/session-monitor/`, installs the `/session-monitor` slash command into `~/.claude/commands/`, and merges the required hooks into `~/.claude/settings.json`. When `~/.codex/` exists, it also installs Codex CLI hooks into `~/.codex/config.toml` and the `$session-monitor` skill into `~/.codex/skills/`. Existing runtime data from `~/.claude/session-monitor/` is copied forward on install.
 
 Useful options:
 
@@ -86,17 +86,17 @@ Or directly:
 
 ```powershell
 # Windows
-python "$env:USERPROFILE\.claude\session-monitor\start-session-monitor.py"
+python "$env:USERPROFILE\.local\share\session-monitor\start-session-monitor.py"
 ```
 
 ```bash
 # macOS/Linux
-python ~/.claude/session-monitor/start-session-monitor.py
+python ~/.local/share/session-monitor/start-session-monitor.py
 ```
 
 ## Config
 
-Optional `~/.claude/session-monitor/config.json`:
+Optional `~/.local/share/session-monitor/config.json`:
 
 ```json
 {

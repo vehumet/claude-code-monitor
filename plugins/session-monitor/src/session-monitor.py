@@ -22,11 +22,22 @@ import time
 import threading
 import tkinter as tk
 import urllib.parse
+import urllib.error
+import urllib.request
 from tkinter import font as tkfont
 
 # codex_rollout_poller lives next to this file; src/ isn't always on
 # sys.path when launched via the .vbs wrapper.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from session_monitor_paths import (
+    config_file,
+    logs_dir,
+    pins_file,
+    position_file,
+    sessions_dir,
+    state_dir as default_state_dir,
+    write_state_file,
+)
 try:
     from codex_rollout_poller import poll_codex_rollouts, is_virtual_id
 except ImportError:
@@ -77,7 +88,7 @@ if IS_WINDOWS:
 # ── Diagnostic logger ─────────────────────────────────────────────
 
 def _setup_logger():
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor")
+    log_dir = logs_dir()
     os.makedirs(log_dir, exist_ok=True)
     logger = logging.getLogger("session_monitor")
     logger.setLevel(logging.DEBUG)
@@ -129,6 +140,7 @@ THEME = {
     "idle":        "#585b70",   # grey
     "hover":       "#313244",
     "recent_bg":   "#303450",
+    "status_watch": "#94e2d5",  # teal
     "close_hover": "#f38ba8",   # red
 }
 
@@ -181,15 +193,16 @@ def _default_config():
         "blink_seconds": DONE_BLINK_SECONDS,
         "question_clear_grace_ms": 1000,
         "sound_enabled": True,
+        "claude_status_watch_enabled": True,
+        "claude_status_check_interval_s": 60,
+        "claude_status_watch_ttl_s": 14400,
     }
 
 
 def load_config():
-    """Load config from ~/.claude/session-monitor/config.json, falling back to defaults."""
+    """Load config from the Session Monitor runtime dir, falling back to defaults."""
     config = _default_config()
-    config_path = os.path.join(
-        os.path.expanduser("~"), ".claude", "session-monitor", "config.json"
-    )
+    config_path = config_file()
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             user = json.load(f)
@@ -206,16 +219,180 @@ CONFIG = load_config()
 
 def get_state_dir():
     """Return state directory path (env var > default)."""
-    return (
-        os.environ.get("SESSION_MONITOR_STATE_DIR")
-        or os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "state")
-    )
+    return default_state_dir()
 
 
 def get_label(key):
     """Return localized label."""
     lang = CONFIG.get("language", "en")
     return LABELS.get(lang, LABELS["en"]).get(key, key)
+
+
+CLAUDE_STATUS_SUMMARY_URL = "https://status.claude.com/api/v2/summary.json"
+
+
+def _shorten_status_text(text: str, max_chars: int = 34) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "\u2026"
+
+
+def summarize_claude_status(data: dict) -> tuple[bool, str]:
+    """Return (is_operational, compact_label) for Statuspage summary JSON."""
+    status = data.get("status") if isinstance(data, dict) else {}
+    indicator = (status or {}).get("indicator") or "none"
+    description = (status or {}).get("description") or ""
+    incidents = data.get("incidents") if isinstance(data, dict) else []
+    if not isinstance(incidents, list):
+        incidents = []
+    unresolved = [
+        inc for inc in incidents
+        if isinstance(inc, dict)
+        and str(inc.get("status") or "").lower() not in ("resolved", "postmortem")
+    ]
+
+    if indicator == "none" and not unresolved:
+        return True, "Claude status: operational"
+
+    latest = None
+    if unresolved:
+        latest = max(unresolved, key=lambda inc: str(inc.get("updated_at") or ""))
+    if latest:
+        name = latest.get("name") or description or "incident"
+        phase = latest.get("status") or indicator
+        return False, f"Claude: {phase} - {_shorten_status_text(name)}"
+
+    return False, f"Claude: {_shorten_status_text(description or indicator)}"
+
+
+class ClaudeStatusWatcher:
+    """On-demand Statuspage watcher, dormant until a Claude StopFailure."""
+
+    def __init__(self):
+        self.enabled = bool(CONFIG.get("claude_status_watch_enabled", True))
+        self.url = CLAUDE_STATUS_SUMMARY_URL
+        self.interval_s = max(15.0, float(CONFIG.get("claude_status_check_interval_s", 60)))
+        self.ttl_s = max(self.interval_s, float(CONFIG.get("claude_status_watch_ttl_s", 14400)))
+        self._lock = threading.Lock()
+        self._thread = None
+        self._active = False
+        self._deadline = 0.0
+        self._next_check = 0.0
+        self._etag = None
+        self._seen_issue = False
+        self._label = ""
+        self._color = THEME["dim"]
+        self._restored_notice_until = 0.0
+        self._restored_event_pending = False
+        self._last_trigger_at = 0
+
+    def trigger(self, interrupt_at: int):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if interrupt_at and interrupt_at <= self._last_trigger_at:
+                return
+            self._last_trigger_at = max(self._last_trigger_at, int(interrupt_at or time.time()))
+            if not self._active:
+                self._seen_issue = False
+            self._active = True
+            self._deadline = now + self.ttl_s
+            self._next_check = 0.0
+            self._label = "Claude status: checking"
+            self._color = THEME["status_watch"]
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+
+    def snapshot(self) -> tuple[str, str, bool]:
+        now = time.monotonic()
+        with self._lock:
+            if not self._active and now > self._restored_notice_until:
+                label = ""
+            else:
+                label = self._label
+            event = self._restored_event_pending
+            self._restored_event_pending = False
+            return label, self._color, event
+
+    def _run(self):
+        while True:
+            wait_s = 1.0
+            with self._lock:
+                if not self._active:
+                    return
+                now = time.monotonic()
+                if now >= self._deadline:
+                    self._active = False
+                    if not self._seen_issue:
+                        self._label = ""
+                    return
+                if now < self._next_check:
+                    wait_s = min(5.0, self._next_check - now)
+                    do_check = False
+                else:
+                    do_check = True
+            if not do_check:
+                time.sleep(wait_s)
+                continue
+            self._check_once()
+
+    def _check_once(self):
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "session-monitor/claude-status-watch",
+        }
+        with self._lock:
+            if self._etag:
+                headers["If-None-Match"] = self._etag
+        try:
+            req = urllib.request.Request(self.url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                raw = resp.read(128 * 1024).decode("utf-8", errors="replace")
+                etag = resp.headers.get("ETag")
+            data = json.loads(raw)
+            operational, label = summarize_claude_status(data)
+            self._record_result(operational, label, etag)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                self._schedule_next()
+            else:
+                self._record_error()
+        except Exception:
+            self._record_error()
+
+    def _record_result(self, operational: bool, label: str, etag: str | None):
+        with self._lock:
+            if etag:
+                self._etag = etag
+            if operational:
+                if self._seen_issue:
+                    self._label = "Claude status: restored"
+                    self._color = THEME["done"]
+                    self._restored_notice_until = time.monotonic() + 60.0
+                    self._restored_event_pending = True
+                    self._active = False
+                else:
+                    self._label = label
+                    self._color = THEME["dim"]
+                    self._next_check = time.monotonic() + self.interval_s
+            else:
+                self._seen_issue = True
+                self._label = label
+                self._color = THEME["interrupted"]
+                self._next_check = time.monotonic() + self.interval_s
+
+    def _record_error(self):
+        with self._lock:
+            self._label = "Claude status: retrying"
+            self._color = THEME["dim"]
+            self._next_check = time.monotonic() + min(300.0, self.interval_s * 2)
+
+    def _schedule_next(self):
+        with self._lock:
+            self._next_check = time.monotonic() + self.interval_s
 
 
 QUESTION_CLEAR_GRACE_S = max(
@@ -445,10 +622,6 @@ def load_nested_pids(state_root: str) -> set:
 _CODEX_SUMMARY_COOLDOWN_S = 300
 
 
-def _hooks_dir() -> str:
-    return os.path.join(os.path.expanduser("~"), ".claude", "hooks")
-
-
 def _should_spawn_codex_summary(state_data: dict) -> bool:
     """Same policy write-state.py applies on Stop hook fires."""
     src = state_data.get("summarySource")
@@ -467,7 +640,7 @@ def _spawn_codex_summary(virtual_id: str):
     so the overlay calls the same script directly when it sees the row
     transition into 'done'.
     """
-    write_state = os.path.join(_hooks_dir(), "write-state.py")
+    write_state = write_state_file()
     if not os.path.exists(write_state):
         _log.debug("write-state.py not at %s; skipping codex summary spawn", write_state)
         return
@@ -772,7 +945,7 @@ class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
                  "slot", "summary", "pinned_at", "provider", "session_id",
-                 "state_changed_at")
+                 "state_changed_at", "interrupt_source", "interrupt_at")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude", session_id=""):
         self.pid = pid
@@ -784,6 +957,8 @@ class Instance:
         self.slot = 0
         self.summary = ""
         self.provider = provider
+        self.interrupt_source = ""
+        self.interrupt_at = 0
         self.display_name = build_display_name(cwd, 0, "", provider)
         self.blink_on = True
         self.done_since = 0.0
@@ -797,13 +972,10 @@ class Instance:
 class InstanceTracker:
     """Polls session + state files to maintain live instance list."""
 
-    PINS_FILE = os.path.join(
-        os.path.expanduser("~"), ".claude", "monitor", "pins.json"
-    )
+    PINS_FILE = pins_file()
 
     def __init__(self):
-        home = os.path.expanduser("~")
-        self.sessions_dir = os.path.join(home, ".claude", "sessions")
+        self.sessions_dir = sessions_dir()
         self.state_dir = get_state_dir()
         # Keys are int PIDs for hook-driven rows and "codex:<sid8>" strings
         # for the rollout poller's PID-less virtual rows.
@@ -854,7 +1026,6 @@ class InstanceTracker:
         events = []
         seen_pids = set()
         proc_tree = build_process_tree() if IS_WINDOWS else {}
-        # nested-pids dir lives one level above state_dir (under monitor/)
         marker_pids = load_nested_pids(os.path.dirname(self.state_dir))
 
         # First pass: read every sessions/*.json once, then hand the
@@ -965,6 +1136,8 @@ class InstanceTracker:
                 saved_summary = st.get("summary", "")
                 saved_cwd = st.get("cwd") or ""
                 saved_provider = st.get("provider", "claude")
+                saved_interrupt_source = st.get("interruptSource", "") or ""
+                saved_interrupt_at = int(st.get("interruptAt", 0) or 0)
             except Exception:
                 continue
 
@@ -1014,6 +1187,12 @@ class InstanceTracker:
                     changed = True
                 if saved_provider and saved_provider != inst.provider:
                     inst.provider = saved_provider
+                    changed = True
+                if saved_interrupt_source != inst.interrupt_source:
+                    inst.interrupt_source = saved_interrupt_source
+                    changed = True
+                if saved_interrupt_at != inst.interrupt_at:
+                    inst.interrupt_at = saved_interrupt_at
                     changed = True
                 # state JSON wins for cwd: sessions/*.json may have been
                 # rebuilt with a stale subdirectory cwd after a Claude Code
@@ -1081,9 +1260,7 @@ class InstanceTracker:
 # ── Overlay UI ────────────────────────────────────────────────────
 
 class MonitorOverlay:
-    POSITION_FILE = os.path.join(
-        os.path.expanduser("~"), ".claude", "session-monitor", "position.json"
-    )
+    POSITION_FILE = position_file()
 
     def __init__(self):
         self.poll_ms = CONFIG.get("poll_interval_ms", 500)
@@ -1101,6 +1278,7 @@ class MonitorOverlay:
         self.padding = 4
 
         self.tracker = InstanceTracker()
+        self.status_watcher = ClaudeStatusWatcher()
         self.root = tk.Tk()
         self.root.title("Session Monitor")
         self.root.overrideredirect(True)
@@ -1143,9 +1321,7 @@ class MonitorOverlay:
 
         # Persist max-chars so write-state.py reads the same source-of-truth.
         try:
-            cfg_path = os.path.join(
-        os.path.expanduser("~"), ".claude", "session-monitor", "config.json"
-            )
+            cfg_path = config_file()
             os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
             try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1191,6 +1367,12 @@ class MonitorOverlay:
         self.close_btn.bind("<Enter>", lambda _: self.close_btn.config(fg=THEME["close_hover"]))
         self.close_btn.bind("<Leave>", lambda _: self.close_btn.config(fg=THEME["dim"]))
 
+        self.status_label = tk.Label(
+            self.header, text="", font=self.font_state,
+            bg=THEME["bg"], fg=THEME["dim"], anchor="e",
+        )
+        self.status_label.pack(side=tk.RIGHT, padx=(0, 6), fill=tk.X, expand=True)
+
         # Content frame
         self.content = tk.Frame(self.root, bg=THEME["bg"])
         self.content.pack(fill=tk.BOTH, expand=True, padx=self.padding, pady=(2, 4))
@@ -1199,7 +1381,7 @@ class MonitorOverlay:
 
         # Drag support
         self._drag_data = {"x": 0, "y": 0}
-        for w in (self.header,):
+        for w in (self.header, self.status_label):
             w.bind("<Button-1>", self._on_drag_start)
             w.bind("<B1-Motion>", self._on_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_drag_end)
@@ -1253,6 +1435,7 @@ class MonitorOverlay:
                 self._first_poll = False
             if changed:
                 self._rebuild_rows()
+            self._update_status_watch()
             if self.sound_enabled:
                 for ev in events:
                     self._play_sound(ev)
@@ -1261,6 +1444,33 @@ class MonitorOverlay:
             _log.exception("poll loop error")
         finally:
             self.root.after(self.poll_ms, self._poll_loop)
+
+    def _update_status_watch(self):
+        for inst in self.tracker.instances.values():
+            if (
+                inst.provider == "claude"
+                and inst.state == "interrupted"
+                and inst.interrupt_source == "stop_failure"
+            ):
+                self.status_watcher.trigger(inst.interrupt_at or inst.updated_at)
+
+        label, color, restored_event = self.status_watcher.snapshot()
+        if label:
+            max_px = max(40, self.width - self.close_btn.winfo_reqwidth() - 14)
+            label = self._fit_status_label(label, max_px)
+        if self.status_label.cget("text") != label:
+            self.status_label.config(text=label)
+        self.status_label.config(fg=color)
+        if restored_event and self.sound_enabled:
+            self._play_sound("status_restored")
+
+    def _fit_status_label(self, text: str, max_pixels: int) -> str:
+        font = self.font_state
+        if max_pixels <= 0 or font.measure(text) <= max_pixels:
+            return text
+        while text and font.measure(text + "\u2026") > max_pixels:
+            text = text[:-1]
+        return text.rstrip() + "\u2026"
 
     @staticmethod
     def _play_sound(event: str):
@@ -1271,6 +1481,7 @@ class MonitorOverlay:
             "done": [(880, 80), (1175, 80), (1397, 120)],      # A5-D6-F6 rising major
             "question": [(1047, 100), (880, 130)],              # C6-A5 descending
             "interrupted": [(880, 80), (660, 80), (440, 120)],  # A5-E5-A4 descending
+            "status_restored": [(660, 80), (880, 80), (1175, 140)],
         }
         seq = chimes.get(event)
         if seq:

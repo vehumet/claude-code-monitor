@@ -17,9 +17,13 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
+RUNTIME_DIR = os.environ.get("SESSION_MONITOR_ROOT") or os.path.join(
+    HOME, ".local", "share", "session-monitor"
+)
 CLAUDE_DIR = os.path.join(HOME, ".claude")
-MONITOR_DIR = os.path.join(CLAUDE_DIR, "session-monitor")
-HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
+MONITOR_DIR = RUNTIME_DIR
+LEGACY_MONITOR_DIR = os.path.join(CLAUDE_DIR, "session-monitor")
+LEGACY_HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
 COMMANDS_DIR = os.path.join(CLAUDE_DIR, "commands")
 SETTINGS_FILE = os.path.join(CLAUDE_DIR, "settings.json")
 CODEX_CONFIG = os.path.join(HOME, ".codex", "config.toml")
@@ -34,7 +38,7 @@ CODEX_FEATURE_FLAG_TAG = "added by session-monitor"
 CONFIG_FILES = {"config.json", "position.json", "pins.json"}
 
 # Files to remove
-HOOK_FILES = [os.path.join(HOOKS_DIR, "write-state.py")]
+HOOK_FILES = [os.path.join(LEGACY_HOOKS_DIR, "write-state.py")]
 COMMAND_FILES = [
     os.path.join(COMMANDS_DIR, "session-monitor.md"),
 ]
@@ -159,13 +163,37 @@ def remove_hooks(settings: dict) -> bool:
     return modified
 
 
+def _remove_monitor_dir(path, dry_run=False, keep_config=False):
+    if not os.path.isdir(path):
+        print(f"  (not found) {path}")
+        return
+    if keep_config:
+        for item in os.listdir(path):
+            item_path = os.path.join(path, item)
+            if item in CONFIG_FILES:
+                print(f"  (keeping) {item_path}")
+                continue
+            if os.path.isdir(item_path):
+                print(f"  rmdir {item_path}")
+                if not dry_run:
+                    shutil.rmtree(item_path)
+            else:
+                print(f"  rm {item_path}")
+                if not dry_run:
+                    os.remove(item_path)
+    else:
+        print(f"  rmdir {path}")
+        if not dry_run:
+            shutil.rmtree(path)
+
+
 def uninstall(dry_run=False, keep_config=False):
     print("Session Monitor - Uninstaller")
     print("=" * 35)
     print()
 
-    # 1. Remove hook files
-    print("Removing hook files...")
+    # 1. Remove legacy hook files
+    print("Removing legacy hook files...")
     for fpath in HOOK_FILES:
         if os.path.exists(fpath):
             print(f"  rm {fpath}")
@@ -188,31 +216,12 @@ def uninstall(dry_run=False, keep_config=False):
         else:
             print(f"  (not found) {fpath}")
 
-    # 3. Remove monitor directory
+    # 3. Remove monitor directories
     print()
-    print("Removing session monitor directory...")
-    if os.path.isdir(MONITOR_DIR):
-        if keep_config:
-            # Remove everything except config files
-            for item in os.listdir(MONITOR_DIR):
-                item_path = os.path.join(MONITOR_DIR, item)
-                if item in CONFIG_FILES:
-                    print(f"  (keeping) {item_path}")
-                    continue
-                if os.path.isdir(item_path):
-                    print(f"  rmdir {item_path}")
-                    if not dry_run:
-                        shutil.rmtree(item_path)
-                else:
-                    print(f"  rm {item_path}")
-                    if not dry_run:
-                        os.remove(item_path)
-        else:
-            print(f"  rmdir {MONITOR_DIR}")
-            if not dry_run:
-                shutil.rmtree(MONITOR_DIR)
-    else:
-        print(f"  (not found) {MONITOR_DIR}")
+    print("Removing session monitor directories...")
+    _remove_monitor_dir(MONITOR_DIR, dry_run=dry_run, keep_config=keep_config)
+    if os.path.normcase(os.path.abspath(LEGACY_MONITOR_DIR)) != os.path.normcase(os.path.abspath(MONITOR_DIR)):
+        _remove_monitor_dir(LEGACY_MONITOR_DIR, dry_run=dry_run, keep_config=False)
 
     # 4. Clean hooks from settings.json
     print()

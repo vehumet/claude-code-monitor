@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Python installer for Session Monitor.
 
-Copies files to ~/.claude/session-monitor/ and merges hooks into settings.json.
+Copies runtime files to ~/.local/share/session-monitor/ and merges hooks into
+Claude Code / Codex settings.
 No external dependencies — stdlib only.
 
 Usage:
@@ -17,10 +18,16 @@ import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
+RUNTIME_DIR = os.environ.get("SESSION_MONITOR_ROOT") or os.path.join(
+    HOME, ".local", "share", "session-monitor"
+)
 CLAUDE_DIR = os.path.join(HOME, ".claude")
-MONITOR_DIR = os.path.join(CLAUDE_DIR, "session-monitor")
-HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
+MONITOR_DIR = RUNTIME_DIR
+LEGACY_MONITOR_DIR = os.path.join(CLAUDE_DIR, "session-monitor")
+LEGACY_HOOKS_DIR = os.path.join(CLAUDE_DIR, "hooks")
 STATE_DIR = os.path.join(MONITOR_DIR, "state")
+SESSIONS_DIR = os.path.join(MONITOR_DIR, "sessions")
+LOGS_DIR = os.path.join(MONITOR_DIR, "logs")
 COMMANDS_DIR = os.path.join(CLAUDE_DIR, "commands")
 SETTINGS_FILE = os.path.join(CLAUDE_DIR, "settings.json")
 CODEX_DIR = os.path.join(HOME, ".codex")
@@ -30,6 +37,7 @@ CODEX_SKILLS_DIR = os.path.join(CODEX_DIR, "skills")
 # Files to copy
 SRC_DIR = os.path.join(SCRIPT_DIR, "src")
 MONITOR_FILES = [
+    "session_monitor_paths.py",
     "session-monitor.py",
     "codex_rollout_poller.py",
     "start-session-monitor.py",
@@ -61,6 +69,21 @@ CODEX_HOOK_EVENTS = [
     ("Stop", "done"),
 ]
 
+
+def _shell_hook_path(path: str) -> str:
+    path_abs = os.path.abspath(path)
+    home_abs = os.path.abspath(HOME)
+    try:
+        rel = os.path.relpath(path_abs, home_abs)
+    except ValueError:
+        rel = path_abs
+    if not rel.startswith("..") and rel != os.curdir and not os.path.isabs(rel):
+        return "$HOME/" + rel.replace("\\", "/")
+    return path_abs.replace("\\", "/")
+
+
+WRITE_STATE_HOOK_PATH = _shell_hook_path(os.path.join(MONITOR_DIR, "write-state.py"))
+
 # Hook definitions to merge into settings.json
 HOOKS_CONFIG = {
     "PreToolUse": [
@@ -69,7 +92,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "question"',
                     "timeout": 5,
                 }
             ],
@@ -79,7 +102,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "question"',
                     "timeout": 5,
                 }
             ],
@@ -91,7 +114,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "done"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "done"',
                     "timeout": 10,
                 }
             ],
@@ -103,7 +126,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "interrupted"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "interrupted"',
                     "timeout": 5,
                 }
             ],
@@ -115,7 +138,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "tool_failure"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "tool_failure"',
                     "timeout": 5,
                 }
             ],
@@ -127,7 +150,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "idle_prompt"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "idle_prompt"',
                     "timeout": 5,
                 }
             ],
@@ -137,7 +160,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "question"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "question"',
                     "timeout": 5,
                 }
             ],
@@ -149,7 +172,7 @@ HOOKS_CONFIG = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": 'python "$HOME/.claude/hooks/write-state.py" --provider claude "working"',
+                    "command": f'python "{WRITE_STATE_HOOK_PATH}" --provider claude "working"',
                     "timeout": 5,
                 }
             ],
@@ -163,7 +186,7 @@ def _render_codex_hook_block() -> str:
     # Forward slashes — Windows backslashes inside a TOML basic string would
     # be interpreted as escape sequences (`\U`, `\v`, …) and corrupt the
     # path. POSIX paths render identically and Windows accepts them.
-    write_state_abs = os.path.join(HOOKS_DIR, "write-state.py").replace("\\", "/")
+    write_state_abs = os.path.join(MONITOR_DIR, "write-state.py").replace("\\", "/")
     lines = [
         CODEX_HOOK_MARKER_OPEN,
         "# Auto-generated by session-monitor install.py.",
@@ -183,11 +206,10 @@ def _render_codex_hook_block() -> str:
 
 
 def _replace_codex_hook_block(text: str, block: str):
-    start = text.find(CODEX_HOOK_MARKER_OPEN)
-    end = text.find(CODEX_HOOK_MARKER_CLOSE)
-    if start < 0 or end < start:
+    span = _find_codex_managed_block_span(text)
+    if span is None:
         return text, False
-    end += len(CODEX_HOOK_MARKER_CLOSE)
+    start, end = span
     old = text[start:end]
     preserved = _extract_codex_unmanaged_tail(old)
     replacement = block
@@ -196,6 +218,56 @@ def _replace_codex_hook_block(text: str, block: str):
     if old == replacement:
         return text, False
     return text[:start] + replacement + text[end:], True
+
+
+def _find_codex_managed_block_span(text: str):
+    """Return the byte span of our Codex hook block, including legacy shapes.
+
+    Older installs accidentally placed the opening marker after
+    ``[[hooks.SessionStart.hooks]]``. Replacing from the marker alone leaves an
+    empty hook entry that Codex may reject. Users may also manually remove the
+    opening marker while keeping the closing marker; treat that as managed too
+    when the enclosed hooks clearly point at write-state.py.
+    """
+    close = text.find(CODEX_HOOK_MARKER_CLOSE)
+    if close < 0:
+        return None
+    end = close + len(CODEX_HOOK_MARKER_CLOSE)
+    open_idx = text.find(CODEX_HOOK_MARKER_OPEN)
+    if 0 <= open_idx < close:
+        start = _include_legacy_session_start_headers(text, open_idx)
+        return start, end
+
+    start = _find_codex_hook_block_start_before(text, close)
+    if start is None:
+        return None
+    candidate = text[start:end]
+    if "write-state.py" not in candidate:
+        return None
+    return start, end
+
+
+def _include_legacy_session_start_headers(text: str, marker_idx: int) -> int:
+    start = _find_codex_hook_block_start_before(text, marker_idx)
+    if start is None:
+        return marker_idx
+    between = text[start:marker_idx]
+    allowed = {"[[hooks.SessionStart]]", "[[hooks.SessionStart.hooks]]"}
+    for line in between.splitlines():
+        stripped = line.strip()
+        if stripped and stripped not in allowed:
+            return marker_idx
+    return start
+
+
+def _find_codex_hook_block_start_before(text: str, end_idx: int):
+    token = "[[hooks.SessionStart]]"
+    start = text.rfind("\n" + token, 0, end_idx)
+    if start >= 0:
+        return start + 1
+    if text.startswith(token):
+        return 0
+    return None
 
 
 def _extract_codex_unmanaged_tail(block: str) -> str:
@@ -295,7 +367,7 @@ def merge_codex_hooks(dry_run=False) -> bool:
         except OSError as e:
             print(f"  WARNING: failed to read {CODEX_CONFIG}: {e}")
             return False
-    if CODEX_HOOK_MARKER_OPEN in text:
+    if _find_codex_managed_block_span(text) is not None:
         # Hook block already injected. Still migrate the feature-flag line if
         # it's on the deprecated `codex_hooks` name (Codex 0.128+ warns),
         # and refresh the managed block when our default hook set changes.
@@ -402,6 +474,41 @@ def _sync_write_state_hook(existing_entry: dict, desired_entry: dict) -> bool:
     return modified
 
 
+def _merge_copytree(src: str, dst: str):
+    if not os.path.isdir(src):
+        return 0
+    copied = 0
+    os.makedirs(dst, exist_ok=True)
+    for name in os.listdir(src):
+        src_path = os.path.join(src, name)
+        dst_path = os.path.join(dst, name)
+        if os.path.isdir(src_path):
+            copied += _merge_copytree(src_path, dst_path)
+        elif not os.path.exists(dst_path):
+            shutil.copy2(src_path, dst_path)
+            copied += 1
+    return copied
+
+
+def migrate_legacy_runtime(dry_run=False):
+    """Copy existing ~/.claude/session-monitor data into the neutral runtime."""
+    if not os.path.isdir(LEGACY_MONITOR_DIR):
+        return
+    if os.path.normcase(os.path.abspath(LEGACY_MONITOR_DIR)) == os.path.normcase(os.path.abspath(MONITOR_DIR)):
+        return
+    if dry_run:
+        print()
+        print("Migrating legacy runtime data...")
+        print(f"  {LEGACY_MONITOR_DIR} -> {MONITOR_DIR}")
+        return
+    os.makedirs(MONITOR_DIR, exist_ok=True)
+    copied = _merge_copytree(LEGACY_MONITOR_DIR, MONITOR_DIR)
+    if copied:
+        print()
+        print("Migrating legacy runtime data...")
+        print(f"  {LEGACY_MONITOR_DIR} -> {MONITOR_DIR} ({copied} files)")
+
+
 def merge_hooks(settings: dict) -> bool:
     """Merge monitor hooks into settings, skipping duplicates. Returns True if modified."""
     if "hooks" not in settings:
@@ -458,11 +565,13 @@ def install(dry_run=False, skip_codex_hooks=False):
     print()
 
     # 1. Create directories
-    for d in [MONITOR_DIR, HOOKS_DIR, STATE_DIR, COMMANDS_DIR]:
+    for d in [MONITOR_DIR, STATE_DIR, SESSIONS_DIR, LOGS_DIR, COMMANDS_DIR]:
         if not os.path.isdir(d):
             print(f"  mkdir {d}")
             if not dry_run:
                 os.makedirs(d, exist_ok=True)
+
+    migrate_legacy_runtime(dry_run=dry_run)
 
     # 2. Copy monitor files
     print()
@@ -477,10 +586,10 @@ def install(dry_run=False, skip_codex_hooks=False):
         else:
             print(f"  WARNING: {src} not found, skipping")
 
-    # 3. Copy hook files
+    # 3. Copy hook files into the neutral runtime
     for fname in HOOK_FILES:
         src = os.path.join(SRC_DIR, fname)
-        dst = os.path.join(HOOKS_DIR, fname)
+        dst = os.path.join(MONITOR_DIR, fname)
         if os.path.exists(src):
             print(f"  {src} -> {dst}")
             if not dry_run:
@@ -571,10 +680,10 @@ def install(dry_run=False, skip_codex_hooks=False):
         print("Usage:")
         print("  Launch in Claude Code: /session-monitor  (after restarting Claude Code)")
         print("  Launch in Codex: $session-monitor  (after restarting Codex)")
-        print("  Or manually:     python ~/.claude/session-monitor/start-session-monitor.py")
+        print("  Or manually:     python ~/.local/share/session-monitor/start-session-monitor.py")
         print()
         print("Configuration (optional):")
-        print("  Create ~/.claude/session-monitor/config.json to customize:")
+        print("  Create ~/.local/share/session-monitor/config.json to customize:")
         print('  {"language": "ko", "opacity": 0.8, "sound_enabled": true}')
 
 

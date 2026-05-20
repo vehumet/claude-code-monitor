@@ -24,6 +24,14 @@ import io
 import ctypes
 import ctypes.wintypes as wintypes
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from session_monitor_paths import (
+    config_file,
+    logs_dir,
+    sessions_dir as default_sessions_dir,
+    state_dir as default_state_dir,
+)
+
 IS_WINDOWS = sys.platform == "win32"
 QUESTION_GUARD_SECONDS = 2  # catch-all "working"이 "question"과 레이스하는 것을 방지
 
@@ -49,7 +57,7 @@ class PROCESSENTRY32(ctypes.Structure):
 # ── Logger ───────────────────────────────────────────────────────
 
 def _setup_logger():
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor")
+    log_dir = logs_dir()
     os.makedirs(log_dir, exist_ok=True)
     logger = logging.getLogger("write_state")
     logger.setLevel(logging.DEBUG)
@@ -214,10 +222,7 @@ def _resolve_wezterm_info(existing):
 
 def get_state_dir():
     """Return state directory path (env var > default)."""
-    return (
-        os.environ.get("SESSION_MONITOR_STATE_DIR")
-        or os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "state")
-    )
+    return default_state_dir()
 
 
 def _monitor_root():
@@ -636,7 +641,7 @@ def _iter_user_messages(jsonl_fp):
 
 
 def _nested_pids_dir():
-    return os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "nested-pids")
+    return os.path.join(_monitor_root(), "nested-pids")
 
 
 def _mark_nested_pid(pid):
@@ -678,7 +683,7 @@ def _spawn_summarizer(target_pid):
 
 def _load_monitor_config():
     """Read the widget's config (summary_max_chars + language)."""
-    cfg = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor", "config.json")
+    cfg = config_file()
     try:
         with open(cfg, "r", encoding="utf-8") as f:
             d = json.load(f)
@@ -1331,7 +1336,7 @@ def _do_summarize(target_pid):
     home = os.path.expanduser("~")
     state_dir = get_state_dir()
     state_file = os.path.join(state_dir, f"{target_pid}.json")
-    sess_file = os.path.join(home, ".claude", "sessions", f"{target_pid}.json")
+    sess_file = os.path.join(default_sessions_dir(), f"{target_pid}.json")
 
     try:
         with open(state_file, "r", encoding="utf-8") as f:
@@ -1506,9 +1511,10 @@ def main():
     if not args:
         sys.exit(0)
     state = args[0]  # working / done / question
+    requested_state = state
     home = os.path.expanduser("~")
     state_dir = get_state_dir()
-    sessions_dir = os.path.join(home, ".claude", "sessions")
+    sessions_dir = default_sessions_dir()
     my_pid = os.getpid()
 
     os.makedirs(state_dir, exist_ok=True)
@@ -1881,6 +1887,19 @@ def main():
         "lastSignalSource": "hook",
         "lastSignalAt": now,
     }
+    if state == "interrupted":
+        hook_event = hook_data.get("hook_event_name") or ""
+        if provider == "claude" and (requested_state == "interrupted" or hook_event == "StopFailure"):
+            state_data["interruptSource"] = "stop_failure"
+            state_data["interruptAt"] = now
+            if hook_event:
+                state_data["interruptHookEvent"] = hook_event
+        elif requested_state == "idle_prompt":
+            state_data["interruptSource"] = "idle_prompt"
+            state_data["interruptAt"] = now
+        elif requested_state == "tool_failure":
+            state_data["interruptSource"] = "tool_failure"
+            state_data["interruptAt"] = now
     if captured_hwnd is not None:
         state_data["hwnd"] = captured_hwnd
     if wezterm_info is not None:

@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 - Clarify that Claude Code and Codex CLI sessions should be restarted after install/update before using `/session-monitor` or `$session-monitor`.
 - Rename user-facing branding, install path, source paths, and environment variables to Session Monitor names.
 - Claude hooks now pass `--provider claude` explicitly, and reinstalling updates older managed hook commands in place.
+- Move the shared runtime from `~/.claude/session-monitor` to `~/.local/share/session-monitor`, with installer migration for existing runtime data.
 
 ### Fixed
 

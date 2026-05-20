@@ -10,11 +10,11 @@ them to a real process.
 Files written:
 
 Ownership: when a real hook fires for a session, write-state.py records a
-``~/.claude/session-monitor/codex-hooked/<sessionId>.json`` marker. The poller then
-treats that rollout as hook-owned forever and will not recreate it as a
-PID-less fallback row after the real Codex process exits. Subagent and exec
-rollouts are also classified as ignored. In all cases the source rollout JSONL
-is left untouched; only monitor-generated virtual files are cleaned up.
+``~/.local/share/session-monitor/codex-hooked/<sessionId>.json`` marker. The
+poller then treats that rollout as hook-owned forever and will not recreate it
+as a PID-less fallback row after the real Codex process exits. Subagent and
+exec rollouts are also classified as ignored. In all cases the source rollout
+JSONL is left untouched; only monitor-generated virtual files are cleaned up.
 """
 
 import glob
@@ -280,7 +280,7 @@ _PRESERVED_STATE_FIELDS = (
 
 
 def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
-    """Sync ~/.codex/sessions rollouts to ~/.claude sessions+state JSONs.
+    """Sync ~/.codex/sessions rollouts to monitor sessions+state JSONs.
 
     The InstanceTracker's standard sessions/state loops pick up the files
     we write on the next tick, so this function only does I/O — it returns
