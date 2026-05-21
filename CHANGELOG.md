@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.24] - 2026-05-21
+
+### Fixed
+
+- Handle Codex CLI sessionId rollover on an existing PID so active sessions keep updating the monitor instead of being skipped as stale PID reuse.
+- Clear stale Codex summary fields when a PID rolls over to a new sessionId so the row label belongs to the current session.
+
 ## [0.0.23] - 2026-05-21
 
 ### Changed
