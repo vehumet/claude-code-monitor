@@ -255,6 +255,13 @@ _PRESERVED_FIELDS = (
     "slot", "summary", "summarySource",
     "summaryAt", "summaryMsgCount", "summarySessionId",
 )
+_SUMMARY_FIELDS = {
+    "summary",
+    "summarySource",
+    "summaryAt",
+    "summaryMsgCount",
+    "summarySessionId",
+}
 
 def _file_snapshot(path):
     if not path:
@@ -1585,6 +1592,7 @@ def main():
         _mark_codex_hooked_session(session_id)
 
     promoted_virtual_id = None
+    session_rollover = False
 
     # Phase 2: Match by session_id (full scan)
     session_matched = False
@@ -1620,12 +1628,13 @@ def main():
                 existing_sid = sess.get("sessionId")
                 if provider == "codex" and existing_sid and existing_sid != session_id:
                     _log.debug(
-                        "Phase 2.5: refusing to overwrite codex sessionId in %s.json old=%s new=%s",
+                        "Phase 2.5: codex session rollover in %s.json old=%s new=%s",
                         real_pid, existing_sid, session_id,
                     )
-                    return
+                    session_rollover = True
                 if existing_sid != session_id:
                     sess["sessionId"] = session_id
+                    sess["startedAt"] = int(time.time() * 1000)
                     _atomic_write_json(sess_file, sess, "session-register")
                     _log.debug("Phase 2.5: updated sessionId in %s.json", real_pid)
                 pid = real_pid
@@ -1908,6 +1917,16 @@ def main():
     # Preserve slot/summary across writes; assign slot on first sight
     for k in _PRESERVED_FIELDS:
         if existing and k in existing:
+            if session_rollover and k in _SUMMARY_FIELDS:
+                continue
+            if (
+                provider == "codex"
+                and session_id
+                and k in _SUMMARY_FIELDS
+                and existing.get("summarySessionId")
+                and existing.get("summarySessionId") != session_id
+            ):
+                continue
             state_data[k] = existing[k]
     if "slot" not in state_data:
         state_data["slot"] = _allocate_slot(state_dir, pid, matched_cwd)
