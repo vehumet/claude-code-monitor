@@ -40,6 +40,7 @@ _WORKING_FRESHNESS_S = 30
 _START_TYPES = {"task_started"}
 _COMPLETE_TYPES = {"task_complete", "agent_turn_complete", "turn_complete"}
 _FAIL_TYPES = {"error", "task_failed", "turn_failed", "turn_aborted"}
+_QUESTION_TOOL_NAMES = {"request_user_input"}
 
 # Filename prefix for our PID-less virtual rows. Kept ASCII + dashes so
 # every filesystem (and our int-PID parsers) handle it cleanly.
@@ -187,15 +188,97 @@ def _scan_turn_markers(path):
     return started, terminal, latest_marker == "failed"
 
 
-def _infer_state(mtime, started, completed, failed):
+def _scan_activity(path):
+    """Return turn markers plus whether Codex is awaiting user input.
+
+    Codex's in-chat questions are emitted as a ``request_user_input`` tool call,
+    not as a PermissionRequest hook. The call remains pending until its matching
+    ``function_call_output`` is appended to the rollout.
+    """
+    started = 0
+    terminal = 0
+    latest_marker = None
+    pending_questions = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                line_type = d.get("type")
+                payload = d.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                if line_type == "event_msg":
+                    pt = payload.get("type")
+                    if pt in _START_TYPES:
+                        started += 1
+                        latest_marker = "started"
+                    elif pt in _COMPLETE_TYPES:
+                        terminal += 1
+                        latest_marker = "completed"
+                    elif pt in _FAIL_TYPES:
+                        terminal += 1
+                        latest_marker = "failed"
+                elif line_type == "response_item":
+                    item_type = payload.get("type")
+                    call_id = payload.get("call_id")
+                    if (
+                        item_type == "function_call"
+                        and payload.get("name") in _QUESTION_TOOL_NAMES
+                        and call_id
+                    ):
+                        pending_questions.add(call_id)
+                    elif item_type == "function_call_output" and call_id:
+                        pending_questions.discard(call_id)
+    except OSError:
+        return 0, 0, False, False
+    return started, terminal, latest_marker == "failed", bool(pending_questions)
+
+
+def _infer_state(mtime, started, completed, failed, waiting_for_user=False):
     """Map turn markers + mtime to our state vocabulary."""
     if failed:
         return "interrupted"
+    if waiting_for_user:
+        return "question"
     if started > 0 or completed > 0:
         return "working" if started > completed else "done"
     if time.time() - mtime < _WORKING_FRESHNESS_S:
         return "working"
     return "done"
+
+
+def find_rollout_for_session(session_id):
+    """Locate Codex's rollout JSONL for a session ID."""
+    if not session_id:
+        return None
+    root = _codex_sessions_root()
+    if not os.path.isdir(root):
+        return None
+    for path in glob.glob(os.path.join(root, "*", "*", "*", f"rollout-*-{session_id}.jsonl")):
+        return path
+    for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")):
+        meta = _read_first_json_line(path)
+        if meta and meta.get("type") == "session_meta" and (meta.get("payload") or {}).get("id") == session_id:
+            return path
+    return None
+
+
+def infer_rollout_state_for_session(session_id):
+    """Return current rollout-derived state for a Codex session, or None."""
+    path = find_rollout_for_session(session_id)
+    if not path:
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    started, completed, failed, waiting = _scan_activity(path)
+    return _infer_state(mtime, started, completed, failed, waiting)
 
 
 def _atomic_write_json(path, data):
@@ -353,6 +436,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             started = cached["started"]
             completed = cached["completed"]
             failed = cached["failed"]
+            waiting = cached.get("waiting", False)
         else:
             meta = _read_first_json_line(path)
             if not meta or meta.get("type") != "session_meta":
@@ -370,7 +454,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                     sessions_dir, state_dir,
                 )
                 continue
-            started, completed, failed = _scan_turn_markers(path)
+            started, completed, failed, waiting = _scan_activity(path)
             prev_cache[path] = {
                 "mtime": mtime,
                 "session_id": session_id,
@@ -378,6 +462,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                 "started": started,
                 "completed": completed,
                 "failed": failed,
+                "waiting": waiting,
             }
 
         seen_rollout_paths.add(path)
@@ -408,7 +493,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
 
         seen_virtual_ids.add(vid)
 
-        state = _infer_state(mtime, started, completed, failed)
+        state = _infer_state(mtime, started, completed, failed, waiting)
 
         sess_record = {
             "pid": vid,

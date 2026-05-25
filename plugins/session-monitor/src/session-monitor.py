@@ -39,9 +39,14 @@ from session_monitor_paths import (
     write_state_file,
 )
 try:
-    from codex_rollout_poller import poll_codex_rollouts, is_virtual_id
+    from codex_rollout_poller import (
+        infer_rollout_state_for_session,
+        is_virtual_id,
+        poll_codex_rollouts,
+    )
 except ImportError:
     poll_codex_rollouts = None  # standalone fallback: degrade gracefully
+    infer_rollout_state_for_session = None
     def is_virtual_id(_pid):  # type: ignore[no-redef]
         return False
 
@@ -188,7 +193,8 @@ def _default_config():
         # The widget width is derived from this; write-state.py reads the same
         # value to cap Haiku output to what will actually fit on screen.
         "summary_max_chars": 12,
-        "poll_interval_ms": 500,
+        "poll_interval_ms": 1000,
+        "codex_question_check_interval_ms": 2000,
         "blink_interval_ms": 600,
         "blink_seconds": DONE_BLINK_SECONDS,
         "question_clear_grace_ms": 1000,
@@ -493,7 +499,6 @@ def session_waits_for_user(session_data) -> bool:
     status = str(session_data.get("status") or "").lower()
     waiting_for = str(session_data.get("waitingFor") or "").strip()
     return status == "waiting" or bool(waiting_for)
-
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -984,6 +989,14 @@ class InstanceTracker:
         # metadata (cwd, sessionId) keyed by file path so we don't re-parse
         # the first line of every rollout JSONL on every poll.
         self._codex_rollout_cache: dict = {}
+        # PID-owning Codex rows need rollout inspection to detect
+        # request_user_input waits; keep it throttled because rollout files can
+        # grow large.
+        self._codex_question_cache: dict = {}
+        self._codex_question_check_s = max(
+            0.5,
+            float(CONFIG.get("codex_question_check_interval_ms", 2000)) / 1000.0,
+        )
         self.pins = self._load_pins()
 
     @staticmethod
@@ -1019,6 +1032,25 @@ class InstanceTracker:
             self.pins = data
         except Exception:
             _log.debug("failed to save pins", exc_info=True)
+
+    def _codex_waits_for_user_cached(self, session_id) -> bool:
+        if not session_id:
+            return False
+        now = time.monotonic()
+        cached = self._codex_question_cache.get(session_id)
+        if cached and now - cached.get("checked_at", 0) < self._codex_question_check_s:
+            return cached.get("state") == "question"
+        state = None
+        if infer_rollout_state_for_session is not None:
+            try:
+                state = infer_rollout_state_for_session(session_id)
+            except Exception:
+                _log.debug("failed to infer Codex rollout state", exc_info=True)
+        self._codex_question_cache[session_id] = {
+            "checked_at": now,
+            "state": state,
+        }
+        return state == "question"
 
     def poll(self):
         """Refresh instance list. Returns (changed, events)."""
@@ -1143,6 +1175,10 @@ class InstanceTracker:
 
             session_data = session_by_pid.get(pid)
             if saved_provider == "claude" and session_waits_for_user(session_data):
+                state = "question"
+            elif saved_provider == "codex" and self._codex_waits_for_user_cached(
+                (session_data or {}).get("sessionId")
+            ):
                 state = "question"
 
             replacement_state = resolve_question_state_from_files(st, sessions_data)

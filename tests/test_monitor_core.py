@@ -53,6 +53,13 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(mod._session_pid({"sessionId": "sid"}, "12345"), 12345)
         self.assertEqual(mod._session_pid({"pid": 777}, "codex-abcdefgh"), 777)
 
+    def test_monitor_default_polling_is_less_aggressive(self):
+        mod = load_module(MONITOR, "session_monitor_default_polling")
+        defaults = mod._default_config()
+
+        self.assertEqual(defaults["poll_interval_ms"], 1000)
+        self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
+
     def test_codex_hook_promotes_virtual_session_to_real_pid(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -1040,6 +1047,95 @@ class MonitorCoreTests(unittest.TestCase):
                 else:
                     os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
 
+    def test_monitor_overlays_pending_codex_user_input_as_question(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            sid = "codex-question-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "working",
+                    "cwd": cwd,
+                    "provider": "codex",
+                    "updatedAt": 123,
+                    "slot": 4,
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_codex_question")
+                mod.poll_codex_rollouts = None
+                mod.infer_rollout_state_for_session = lambda _sid: "question"
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                changed, events = tracker.poll()
+
+                self.assertTrue(changed)
+                self.assertEqual(events, ["question"])
+                self.assertEqual(tracker.instances[real_pid].state, "question")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
+    def test_codex_question_rollout_check_is_throttled(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = runtime_dir(home) / "state"
+            state_dir.mkdir(parents=True)
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_codex_question_throttle")
+                calls = []
+
+                def fake_infer(_sid):
+                    calls.append(_sid)
+                    return "question" if len(calls) == 1 else "working"
+
+                mod.infer_rollout_state_for_session = fake_infer
+                tracker = mod.InstanceTracker()
+                tracker._codex_question_check_s = 60
+
+                self.assertTrue(tracker._codex_waits_for_user_cached("sid"))
+                self.assertTrue(tracker._codex_waits_for_user_cached("sid"))
+                self.assertEqual(calls, ["sid"])
+
+                tracker._codex_question_cache["sid"]["checked_at"] = 0
+                self.assertFalse(tracker._codex_waits_for_user_cached("sid"))
+                self.assertEqual(calls, ["sid", "sid"])
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
     def test_question_file_change_resolves_to_working_or_done(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -1401,6 +1497,71 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(
                 mod._infer_state(rollout.stat().st_mtime, started, terminal, failed),
                 "interrupted",
+            )
+
+    def test_rollout_pending_user_input_is_question(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "request_user_input",
+                            "call_id": "call_question",
+                        },
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_user_input_question")
+
+            started, terminal, failed, waiting = mod._scan_activity(str(rollout))
+
+            self.assertEqual(started, 1)
+            self.assertEqual(terminal, 0)
+            self.assertFalse(failed)
+            self.assertTrue(waiting)
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting),
+                "question",
+            )
+
+    def test_rollout_answered_user_input_returns_to_working(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "request_user_input",
+                            "call_id": "call_question",
+                        },
+                    }),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call_question",
+                            "output": "approved",
+                        },
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_user_input_answered")
+
+            started, terminal, failed, waiting = mod._scan_activity(str(rollout))
+
+            self.assertFalse(waiting)
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting),
+                "working",
             )
 
     def test_pidless_codex_row_uses_cwd_focus_fallback(self):
