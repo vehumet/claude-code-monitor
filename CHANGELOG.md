@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.25] - 2026-06-02
+
+### Changed
+
+- Make the overlay background opacity configurable via `background_opacity`, keep legacy `opacity` support, and raise the default opacity to `0.85` for a darker monitor background.
+
+### Fixed
+
+- Prevent Codex `session_start` hooks with a different sessionId from overwriting an existing active PID session before a real state update arrives.
+
 ## [0.0.24] - 2026-05-21
 
 ### Fixed
