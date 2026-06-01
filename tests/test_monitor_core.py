@@ -60,6 +60,42 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(defaults["poll_interval_ms"], 1000)
         self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
 
+    def test_monitor_background_opacity_defaults_darker(self):
+        mod = load_module(MONITOR, "session_monitor_default_opacity")
+        defaults = mod._default_config()
+
+        self.assertEqual(defaults["background_opacity"], 0.85)
+        self.assertEqual(defaults["opacity"], 0.85)
+        self.assertEqual(mod._coerce_opacity("0.7"), 0.7)
+        self.assertEqual(mod._coerce_opacity("bad"), 0.85)
+        self.assertEqual(mod._coerce_opacity(3), 1.0)
+        self.assertEqual(mod._coerce_opacity(0), 0.1)
+
+    def test_monitor_legacy_opacity_config_still_applies(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            old_home = os.environ.get("HOME")
+            old_userprofile = os.environ.get("USERPROFILE")
+            try:
+                os.environ["HOME"] = td
+                os.environ["USERPROFILE"] = td
+                cfg_dir = runtime_dir(Path(td))
+                cfg_dir.mkdir(parents=True)
+                (cfg_dir / "config.json").write_text('{"opacity": 0.42}', encoding="utf-8")
+
+                mod = load_module(MONITOR, "session_monitor_legacy_opacity")
+
+                self.assertEqual(mod.CONFIG["background_opacity"], 0.42)
+                self.assertEqual(mod.get_background_opacity(), 0.42)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_userprofile is None:
+                    os.environ.pop("USERPROFILE", None)
+                else:
+                    os.environ["USERPROFILE"] = old_userprofile
+
     def test_codex_hook_promotes_virtual_session_to_real_pid(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)

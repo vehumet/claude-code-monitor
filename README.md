@@ -101,14 +101,14 @@ Optional `~/.local/share/session-monitor/config.json`:
 ```json
 {
   "language": "ko",
-  "opacity": 0.65,
+  "background_opacity": 0.85,
   "summary_max_chars": 12,
   "blink_seconds": 10,
   "sound_enabled": true
 }
 ```
 
-Language is auto-detected from the OS locale (`ko` on Korean systems, `en` otherwise) — set it explicitly to override. `summary_max_chars` controls both the summary column width and the cap passed to Haiku.
+Language is auto-detected from the OS locale (`ko` on Korean systems, `en` otherwise) — set it explicitly to override. `background_opacity` controls overlay opacity (`1.0` is fully opaque; legacy `opacity` still works). `summary_max_chars` controls both the summary column width and the cap passed to Haiku.
 
 ## Uninstall
 

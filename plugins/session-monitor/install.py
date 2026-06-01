@@ -684,7 +684,7 @@ def install(dry_run=False, skip_codex_hooks=False):
         print()
         print("Configuration (optional):")
         print("  Create ~/.local/share/session-monitor/config.json to customize:")
-        print('  {"language": "ko", "opacity": 0.8, "sound_enabled": true}')
+        print('  {"language": "ko", "background_opacity": 0.85, "sound_enabled": true}')
 
 
 def main():

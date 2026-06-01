@@ -151,6 +151,7 @@ THEME = {
 
 DONE_BLINK_SECONDS = 10  # "done"/"interrupted" blink this long, then stay solid
 STARTUP_QUIET_SECONDS = 3  # suppress stale catch-up events after opening
+DEFAULT_BACKGROUND_OPACITY = 0.85
 
 
 # ── Config ────────────────────────────────────────────────────────
@@ -188,7 +189,9 @@ def _detect_system_language():
 def _default_config():
     return {
         "language": _detect_system_language(),
-        "opacity": 0.65,
+        # 1.0 is fully opaque. "opacity" is kept as a legacy alias.
+        "background_opacity": DEFAULT_BACKGROUND_OPACITY,
+        "opacity": DEFAULT_BACKGROUND_OPACITY,
         # Number of Korean-width chars reserved for the summary column.
         # The widget width is derived from this; write-state.py reads the same
         # value to cap Haiku output to what will actually fit on screen.
@@ -205,6 +208,14 @@ def _default_config():
     }
 
 
+def _coerce_opacity(value, default=DEFAULT_BACKGROUND_OPACITY):
+    try:
+        opacity = float(value)
+    except (TypeError, ValueError):
+        opacity = default
+    return min(1.0, max(0.1, opacity))
+
+
 def load_config():
     """Load config from the Session Monitor runtime dir, falling back to defaults."""
     config = _default_config()
@@ -215,12 +226,20 @@ def load_config():
         for key in config:
             if key in user:
                 config[key] = user[key]
+        if "background_opacity" not in user and "opacity" in user:
+            config["background_opacity"] = user["opacity"]
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return config
 
 
 CONFIG = load_config()
+
+
+def get_background_opacity():
+    """Return configured overlay opacity, accepting the legacy opacity key."""
+    value = CONFIG.get("background_opacity", CONFIG.get("opacity", DEFAULT_BACKGROUND_OPACITY))
+    return _coerce_opacity(value)
 
 
 def get_state_dir():
@@ -1319,7 +1338,7 @@ class MonitorOverlay:
         self.root.title("Session Monitor")
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
-        self.root.wm_attributes("-alpha", CONFIG.get("opacity", 0.65))
+        self.root.wm_attributes("-alpha", get_background_opacity())
         self.root.configure(bg=THEME["bg"])
 
         # Fonts (must precede width derivation that calls font.measure)

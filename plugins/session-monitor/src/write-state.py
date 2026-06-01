@@ -1627,6 +1627,12 @@ def main():
                     sess = json.load(f)
                 existing_sid = sess.get("sessionId")
                 if provider == "codex" and existing_sid and existing_sid != session_id:
+                    if state == "session_start":
+                        _log.debug(
+                            "Phase 2.5: codex session_start mismatch ignored in %s.json old=%s new=%s",
+                            real_pid, existing_sid, session_id,
+                        )
+                        return
                     _log.debug(
                         "Phase 2.5: codex session rollover in %s.json old=%s new=%s",
                         real_pid, existing_sid, session_id,
