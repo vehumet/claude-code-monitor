@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.28] - 2026-06-11
+
+### Fixed
+
+- Keep resumed Codex sessions visible when the Codex thread database is newer than an old hook-owned marker.
+- Scope Codex fork rollout scanning to the active session segment so parent transcript markers and questions do not leak into child rows or summaries.
+- Treat Codex rollouts whose latest marker is `task_started` as Working even when start and complete counts are tied.
+- Open PID-less Codex rows by thread deep link whenever a session id is available, reducing slow fallback focus scans.
+- Reduce unnecessary overlay redraws and topmost/geometry updates so timestamp-only refreshes do not flicker the widget.
+
 ## [0.0.27] - 2026-06-11
 
 ### Added
