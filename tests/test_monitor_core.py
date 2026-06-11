@@ -60,6 +60,13 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(defaults["poll_interval_ms"], 1000)
         self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
 
+    def test_claude_desktop_rows_use_distinct_marker(self):
+        mod = load_module(MONITOR, "session_monitor_claude_desktop_marker")
+
+        self.assertEqual(mod.row_marker("claude"), "●")
+        self.assertEqual(mod.row_marker("claude", "claude-desktop"), "◉")
+        self.assertEqual(mod.row_marker("codex", "claude-desktop"), "◆")
+
     def test_monitor_background_opacity_defaults_darker(self):
         mod = load_module(MONITOR, "session_monitor_default_opacity")
         defaults = mod._default_config()
@@ -1210,6 +1217,175 @@ class MonitorCoreTests(unittest.TestCase):
                 "done",
             )
 
+    def test_pending_ask_user_question_keeps_question_after_file_change(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            session = home / "session.json"
+            transcript = home / "transcript.jsonl"
+            session.write_text(json.dumps({"status": "busy"}), encoding="utf-8")
+            transcript.write_text("{}\n", encoding="utf-8")
+
+            mod = load_module(MONITOR, "session_monitor_pending_ask_user_question")
+            question_at = 100.0
+            state = {
+                "state": "question",
+                "questionAt": question_at,
+                "questionSessionPath": str(session),
+                "questionSessionMtimeNs": session.stat().st_mtime_ns,
+                "questionSessionSize": session.stat().st_size,
+                "questionTranscriptPath": str(transcript),
+                "questionTranscriptMtimeNs": transcript.stat().st_mtime_ns,
+                "questionTranscriptSize": transcript.stat().st_size,
+            }
+
+            transcript.write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_question",
+                            "name": "AskUserQuestion",
+                            "input": {"questions": []},
+                        }]
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                mod.resolve_question_state_from_files(state, now=question_at + 2.0)
+            )
+
+    def test_answered_ask_user_question_resolves_to_working(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            session = home / "session.json"
+            transcript = home / "transcript.jsonl"
+            session.write_text(json.dumps({"status": "busy"}), encoding="utf-8")
+            transcript.write_text("{}\n", encoding="utf-8")
+
+            mod = load_module(MONITOR, "session_monitor_answered_ask_user_question")
+            question_at = 100.0
+            state = {
+                "state": "question",
+                "questionAt": question_at,
+                "questionSessionPath": str(session),
+                "questionSessionMtimeNs": session.stat().st_mtime_ns,
+                "questionSessionSize": session.stat().st_size,
+                "questionTranscriptPath": str(transcript),
+                "questionTranscriptMtimeNs": transcript.stat().st_mtime_ns,
+                "questionTranscriptSize": transcript.stat().st_size,
+            }
+
+            transcript.write_text(
+                "\n".join([
+                    json.dumps({
+                        "type": "assistant",
+                        "message": {
+                            "content": [{
+                                "type": "tool_use",
+                                "id": "toolu_question",
+                                "name": "AskUserQuestion",
+                                "input": {"questions": []},
+                            }]
+                        },
+                    }),
+                    json.dumps({
+                        "type": "user",
+                        "message": {
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_question",
+                                "content": "15~25 minutes",
+                            }]
+                        },
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                mod.resolve_question_state_from_files(state, now=question_at + 2.0),
+                "working",
+            )
+
+    def test_tracker_overlays_pending_ask_user_question_from_transcript(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            transcript_dir = home / ".claude" / "projects" / "project"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            transcript_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            sid = "desktop-question-session"
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": sid,
+                    "cwd": str(home / "project"),
+                    "provider": "claude",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "working",
+                    "cwd": str(home / "project"),
+                    "updatedAt": 100,
+                    "provider": "claude",
+                }),
+                encoding="utf-8",
+            )
+            (transcript_dir / f"{sid}.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_question",
+                            "name": "AskUserQuestion",
+                            "input": {"questions": []},
+                        }]
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_overlay_ask_user_question")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+                mod.IS_WINDOWS = False
+
+                tracker = mod.InstanceTracker()
+                changed, events = tracker.poll()
+
+                self.assertTrue(changed)
+                self.assertIn("question", events)
+                self.assertEqual(tracker.instances[real_pid].state, "question")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
     def test_recent_state_change_key_uses_state_change_time(self):
         mod = load_module(MONITOR, "session_monitor_recent_state_change")
         older = mod.Instance(1, "C:\\a", updated_at=100, session_id="older")
@@ -1397,6 +1573,65 @@ class MonitorCoreTests(unittest.TestCase):
                     os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
                 else:
                     os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
+    def test_tracker_loads_claude_desktop_entrypoint(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            native_sessions_dir = home / ".claude" / "sessions"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            native_sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (native_sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "desktop-session",
+                    "cwd": cwd,
+                    "startedAt": 1780000000000,
+                    "entrypoint": "claude-desktop",
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_claude_desktop_entrypoint")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+                mod.IS_WINDOWS = True
+                mod.build_process_tree = lambda: {
+                    real_pid: (1111, "claude.exe"),
+                    1111: (1, "claude.exe"),
+                    1: (0, "explorer.exe"),
+                }
+
+                tracker = mod.InstanceTracker()
+                tracker.poll()
+                inst = tracker.instances[real_pid]
+
+                self.assertEqual(inst.entrypoint, "claude-desktop")
+                self.assertEqual(inst.provider, "claude")
+                self.assertEqual(inst.state, "idle")
+                self.assertTrue((sessions_dir / f"{real_pid}.json").exists())
+                self.assertTrue((state_dir / f"{real_pid}.json").exists())
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
 
     def test_rollout_cache_hit_repairs_working_pidless_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

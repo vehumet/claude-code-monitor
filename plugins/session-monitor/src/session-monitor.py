@@ -459,6 +459,69 @@ def _path_changed_since(path, old_mtime_ns, old_size):
         return False
 
 
+def _message_content_items(obj):
+    if not isinstance(obj, dict):
+        return ()
+    message = obj.get("message")
+    content = None
+    if isinstance(message, dict):
+        content = message.get("content")
+    if content is None:
+        content = obj.get("content")
+    if isinstance(content, list):
+        return [item for item in content if isinstance(item, dict)]
+    return ()
+
+
+def _transcript_has_pending_ask_user_question(path):
+    if not path:
+        return False
+    pending = set()
+    try:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                for item in _message_content_items(obj):
+                    item_type = item.get("type")
+                    if item_type == "tool_use" and item.get("name") == "AskUserQuestion":
+                        tool_id = item.get("id")
+                        if tool_id:
+                            pending.add(str(tool_id))
+                    elif item_type == "tool_result":
+                        tool_id = item.get("tool_use_id")
+                        if tool_id:
+                            pending.discard(str(tool_id))
+    except OSError:
+        return False
+    return bool(pending)
+
+
+def _find_claude_transcript_path(session_id):
+    if not session_id:
+        return ""
+    root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    pattern = os.path.join(root, "*", f"{session_id}.jsonl")
+    try:
+        matches = glob.glob(pattern)
+    except OSError:
+        return ""
+    return matches[0] if matches else ""
+
+
+def claude_session_has_pending_ask_user_question(session_data):
+    if not isinstance(session_data, dict):
+        return False
+    transcript_path = (
+        session_data.get("transcriptPath")
+        or session_data.get("transcript_path")
+        or _find_claude_transcript_path(session_data.get("sessionId"))
+    )
+    return _transcript_has_pending_ask_user_question(transcript_path)
+
+
 def _strip_question_fields(data):
     out = dict(data)
     for key in _QUESTION_FIELDS:
@@ -497,8 +560,9 @@ def resolve_question_state_from_files(state_data, sessions_data=None, now=None):
     if session_status == "idle":
         return "done"
 
+    transcript_path = state_data.get("questionTranscriptPath")
     transcript_changed = _path_changed_since(
-        state_data.get("questionTranscriptPath"),
+        transcript_path,
         state_data.get("questionTranscriptMtimeNs"),
         state_data.get("questionTranscriptSize"),
     )
@@ -508,6 +572,8 @@ def resolve_question_state_from_files(state_data, sessions_data=None, now=None):
         state_data.get("questionSessionSize"),
     )
     if transcript_changed or session_changed:
+        if _transcript_has_pending_ask_user_question(transcript_path):
+            return None
         return "working"
     return None
 
@@ -640,6 +706,85 @@ def load_nested_pids(state_root: str) -> set:
             except OSError:
                 pass
     return alive
+
+
+def load_claude_native_session(pid):
+    """Read Claude Code's own ~/.claude/sessions/{pid}.json metadata."""
+    if not isinstance(pid, int):
+        return {}
+    path = os.path.join(os.path.expanduser("~"), ".claude", "sessions", f"{pid}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def sync_claude_desktop_sessions(sessions_root: str, state_root: str):
+    """Mirror live Claude Desktop agent sessions into the monitor runtime.
+
+    Claude Desktop starts Claude Code as a child claude.exe process. Those agent
+    sessions can be discovered from ~/.claude/sessions even if our hook-owned
+    runtime files were removed by an older monitor build.
+    """
+    native_root = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
+    if not os.path.isdir(native_root):
+        return
+    now = int(time.time())
+    try:
+        os.makedirs(sessions_root, exist_ok=True)
+        os.makedirs(state_root, exist_ok=True)
+    except OSError:
+        return
+
+    for path in glob.glob(os.path.join(native_root, "*.json")):
+        data = _read_json_file(path)
+        if not isinstance(data, dict) or data.get("entrypoint") != "claude-desktop":
+            continue
+        pid = data.get("pid")
+        if not isinstance(pid, int) or not is_claude_pid_alive(pid):
+            continue
+        cwd = data.get("cwd", "") or ""
+        session_id = data.get("sessionId", "") or ""
+        sess_path = os.path.join(sessions_root, f"{pid}.json")
+        state_path = os.path.join(state_root, f"{pid}.json")
+
+        existing_sess = _read_json_file(sess_path)
+        if not isinstance(existing_sess, dict) or existing_sess.get("entrypoint") != "claude-desktop":
+            started_at = data.get("startedAt")
+            if not started_at:
+                try:
+                    started_at = int(os.path.getmtime(path) * 1000)
+                except OSError:
+                    started_at = now * 1000
+            sess_record = {
+                "pid": pid,
+                "sessionId": session_id,
+                "cwd": cwd,
+                "startedAt": started_at,
+                "provider": "claude",
+                "entrypoint": "claude-desktop",
+            }
+            try:
+                _atomic_write_json(sess_path, sess_record)
+            except OSError:
+                pass
+
+        if not os.path.exists(state_path):
+            state_record = {
+                "pid": pid,
+                "state": "idle",
+                "cwd": cwd,
+                "updatedAt": now,
+                "provider": "claude",
+                "lastSignalSource": "desktop_session",
+                "lastSignalAt": now,
+            }
+            try:
+                _atomic_write_json(state_path, state_record)
+            except OSError:
+                pass
 
 
 # Cooldown that mirrors write-state.py's _HAIKU_REFRESH_SECONDS so virtual
@@ -921,6 +1066,8 @@ _FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
 # that can't render the geometric shapes cleanly.
 _GLYPH_UNICODE = {"claude": "●", "codex": "◆"}
 _GLYPH_ASCII = {"claude": "[C]", "codex": "[X]"}
+_SURFACE_GLYPH_UNICODE = {("claude", "claude-desktop"): "◉"}
+_SURFACE_GLYPH_ASCII = {("claude", "claude-desktop"): "[D]"}
 
 
 def provider_glyph(provider) -> str:
@@ -936,6 +1083,15 @@ def provider_marker(provider) -> str:
     ascii_glyph = os.environ.get("SESSION_MONITOR_ASCII_GLYPH")
     table = _GLYPH_ASCII if ascii_glyph == "1" else _GLYPH_UNICODE
     return table.get(provider, "")
+
+
+def row_marker(provider, entrypoint="") -> str:
+    """Marker glyph for a row, including known app/desktop surfaces."""
+    if not provider:
+        return ""
+    ascii_glyph = os.environ.get("SESSION_MONITOR_ASCII_GLYPH")
+    table = _SURFACE_GLYPH_ASCII if ascii_glyph == "1" else _SURFACE_GLYPH_UNICODE
+    return table.get((provider, entrypoint), provider_marker(provider))
 
 
 def slot_glyph(slot) -> str:
@@ -971,7 +1127,8 @@ class Instance:
                  "blink_on", "done_since", "hwnd", "wezterm",
                  "slot", "summary", "pinned_at", "provider", "session_id",
                  "state_changed_at", "interrupt_source", "interrupt_at",
-                 "codex_source", "codex_originator", "codex_surface")
+                 "codex_source", "codex_originator", "codex_surface",
+                 "entrypoint")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude", session_id=""):
         self.pid = pid
@@ -983,6 +1140,7 @@ class Instance:
         self.slot = 0
         self.summary = ""
         self.provider = provider
+        self.entrypoint = ""
         self.codex_source = ""
         self.codex_originator = ""
         self.codex_surface = ""
@@ -1091,6 +1249,10 @@ class InstanceTracker:
         # isn't decoded twice).
         sessions_data = {}
         session_by_pid = {}
+        try:
+            sync_claude_desktop_sessions(self.sessions_dir, self.state_dir)
+        except Exception:
+            _log.debug("claude desktop session sync failed", exc_info=True)
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
             try:
                 with open(sf, "r", encoding="utf-8") as f:
@@ -1127,6 +1289,13 @@ class InstanceTracker:
                 pid = sess.get("pid")
                 cwd = sess.get("cwd", "")
                 session_id = sess.get("sessionId", "") or ""
+                entrypoint = sess.get("entrypoint", "") or ""
+                provider = sess.get("provider", "claude") or "claude"
+                if provider == "claude" and isinstance(pid, int) and not entrypoint:
+                    native_sess = load_claude_native_session(pid)
+                    entrypoint = native_sess.get("entrypoint", "") or ""
+                    cwd = cwd or native_sess.get("cwd", "") or ""
+                    session_id = session_id or native_sess.get("sessionId", "") or ""
                 if pid is None:
                     continue
                 session_by_pid[pid] = sess
@@ -1159,13 +1328,18 @@ class InstanceTracker:
                 continue
 
             # Skip nested `claude -p` subprocesses (e.g. our own summarizer).
-            if IS_WINDOWS and is_nested_claude_pid(pid, proc_tree, marker_pids):
+            if (
+                IS_WINDOWS
+                and entrypoint != "claude-desktop"
+                and is_nested_claude_pid(pid, proc_tree, marker_pids)
+            ):
                 continue
 
             seen_pids.add(pid)
 
             if pid not in self.instances:
                 self.instances[pid] = Instance(pid, cwd, session_id=session_id)
+                self.instances[pid].entrypoint = entrypoint
                 key = self.pin_key(self.instances[pid])
                 if key in self.pins:
                     self.instances[pid].pinned_at = self.pins[key]
@@ -1177,6 +1351,9 @@ class InstanceTracker:
                 self.instances[pid].session_id = session_id
                 key = self.pin_key(self.instances[pid])
                 self.instances[pid].pinned_at = self.pins.get(key)
+                changed = True
+            if self.instances[pid].entrypoint != entrypoint:
+                self.instances[pid].entrypoint = entrypoint
                 changed = True
 
         for sf in glob.glob(os.path.join(self.state_dir, "*.json")):
@@ -1202,6 +1379,8 @@ class InstanceTracker:
 
             session_data = session_by_pid.get(pid)
             if saved_provider == "claude" and session_waits_for_user(session_data):
+                state = "question"
+            elif saved_provider == "claude" and claude_session_has_pending_ask_user_question(session_data):
                 state = "question"
             elif saved_provider == "codex" and self._codex_waits_for_user_cached(
                 (session_data or {}).get("sessionId")
@@ -1665,7 +1844,7 @@ class MonitorOverlay:
 
         cell_h = self.row_height - 2
 
-        dot_glyph = provider_marker(inst.provider) or "\u25cf"
+        dot_glyph = row_marker(inst.provider, inst.entrypoint) or "\u25cf"
         dot_box = tk.Frame(
             frame, bg=base_bg,
             width=self.col_dot_w, height=cell_h,
@@ -1811,6 +1990,14 @@ class MonitorOverlay:
                 else:
                     inst.hwnd = 0  # stale handle 클리어
 
+            if (
+                inst
+                and inst.provider == "claude"
+                and inst.entrypoint == "claude-desktop"
+                and self._activate_claude_desktop(inst)
+            ):
+                return
+
             # 폴백: 프로세스 트리 탐색
             tree = build_process_tree()
             cwd = inst.cwd if inst else ""
@@ -1821,6 +2008,20 @@ class MonitorOverlay:
                 _log.warning("_activate_terminal: no hwnd found for pid=%d", claude_pid)
         except Exception:
             _log.error("_activate_terminal failed for pid=%s", claude_pid, exc_info=True)
+
+    def _activate_claude_desktop(self, inst: Instance) -> bool:
+        """Raise the Claude Desktop window for a Claude Code agent subprocess."""
+        if not IS_WINDOWS or not isinstance(inst.pid, int):
+            return False
+        try:
+            tree = build_process_tree()
+            hwnd = find_window_for_pid(inst.pid, tree, inst.cwd)
+            if hwnd:
+                activate_window(hwnd)
+                return True
+        except Exception:
+            _log.debug("_activate_claude_desktop failed", exc_info=True)
+        return False
 
     def _activate_codex_pidless(
         self,
