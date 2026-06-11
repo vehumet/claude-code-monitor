@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.27] - 2026-06-11
+
+### Added
+
+- Allow monitor rows to be dismissed with right-click, secondary click, or Ctrl-click without terminating the underlying Claude/Codex session.
+
+### Changed
+
+- Dismissed rows reappear automatically when a newer hook signal or Codex rollout update is detected.
+
 ## [0.0.26] - 2026-06-11
 
 ### Added
