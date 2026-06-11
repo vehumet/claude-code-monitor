@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.26] - 2026-06-11
+
+### Added
+
+- Detect Codex desktop app sessions from rollout metadata, use local Codex thread titles when available, and open `codex://threads/{sessionId}` for app-backed Codex rows.
+- Restore live Claude Desktop Code sessions from `~/.claude/sessions/*.json`, distinguish them with a desktop marker, and focus the Claude app window for those rows.
+
+### Fixed
+
+- Keep Claude Desktop `AskUserQuestion` rows in the Waiting state while the transcript still has an unanswered question, including sessions that were previously reset to Working by file-change detection.
+
 ## [0.0.25] - 2026-06-02
 
 ### Changed
