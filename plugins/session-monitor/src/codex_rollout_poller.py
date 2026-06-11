@@ -20,6 +20,7 @@ JSONL is left untouched; only monitor-generated virtual files are cleaned up.
 import glob
 import json
 import os
+import sqlite3
 import tempfile
 import time
 
@@ -48,10 +49,15 @@ VIRTUAL_PREFIX = "codex-"
 IGNORE_NESTED = "nested"
 IGNORE_HOOK_OWNED = "hook_owned"
 IGNORE_EXEC = "exec"
+_THREAD_META_CACHE_KEY = "__codex_thread_meta__"
 
 
 def _codex_sessions_root():
     return os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+
+
+def _codex_state_db():
+    return os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
 
 
 def _codex_hooked_dir(state_dir):
@@ -325,6 +331,83 @@ def _read_existing(path):
         return {}
 
 
+def _trim_summary(value, limit=32):
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _thread_meta_mtime(db_path):
+    mtimes = []
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            mtimes.append(os.path.getmtime(db_path + suffix))
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else 0
+
+
+def _load_thread_metadata(prev_cache):
+    """Read Codex's normalized thread index when available.
+
+    Rollout JSONL is the real-time signal, while state_5.sqlite carries useful
+    app metadata such as the thread title and token usage. Treat it as optional:
+    schema or lock failures should never hide rollout-derived rows.
+    """
+    db_path = _codex_state_db()
+    mtime = _thread_meta_mtime(db_path)
+    if not mtime:
+        return {}
+
+    cached = prev_cache.get(_THREAD_META_CACHE_KEY)
+    if cached and cached.get("mtime") == mtime:
+        return cached.get("data", {})
+
+    data = {}
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.1)
+        con.row_factory = sqlite3.Row
+        for row in con.execute(
+            "select id, title, tokens_used, updated_at, source, cwd, rollout_path "
+            "from threads"
+        ):
+            sid = row["id"]
+            if not sid:
+                continue
+            data[sid] = {
+                "title": row["title"] or "",
+                "tokensUsed": row["tokens_used"],
+                "threadUpdatedAt": row["updated_at"],
+                "source": row["source"] or "",
+                "cwd": row["cwd"] or "",
+                "rolloutPath": row["rollout_path"] or "",
+            }
+    except sqlite3.Error:
+        data = {}
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+    prev_cache[_THREAD_META_CACHE_KEY] = {"mtime": mtime, "data": data}
+    return data
+
+
+def _codex_surface(source, originator):
+    if str(originator or "").lower() == "codex desktop":
+        return "app"
+    source_text = str(source or "").lower()
+    if source_text == "cli":
+        return "cli"
+    if source_text in ("vscode", "ide"):
+        return "ide"
+    return source_text or "unknown"
+
+
 def _norm_path(p):
     if not p:
         return ""
@@ -390,6 +473,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
     cutoff = now - _SCAN_MAX_AGE_S
     seen_virtual_ids = set()
     seen_rollout_paths = set()
+    thread_meta = _load_thread_metadata(prev_cache)
 
     for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")):
         try:
@@ -437,6 +521,8 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             completed = cached["completed"]
             failed = cached["failed"]
             waiting = cached.get("waiting", False)
+            source = cached.get("source", "")
+            originator = cached.get("originator", "")
         else:
             meta = _read_first_json_line(path)
             if not meta or meta.get("type") != "session_meta":
@@ -444,6 +530,8 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             payload = meta.get("payload") or {}
             session_id = payload.get("id")
             cwd = payload.get("cwd")
+            source = payload.get("source") or ""
+            originator = payload.get("originator") or ""
             if not session_id or not cwd:
                 continue
             reason = _ignore_reason(state_dir, session_id, payload)
@@ -463,9 +551,17 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                 "completed": completed,
                 "failed": failed,
                 "waiting": waiting,
+                "source": source,
+                "originator": originator,
             }
 
         seen_rollout_paths.add(path)
+        metadata = thread_meta.get(session_id, {})
+        title = metadata.get("title") or ""
+        tokens_used = metadata.get("tokensUsed")
+        thread_updated_at = metadata.get("threadUpdatedAt")
+        db_source = metadata.get("source") or source
+        surface = _codex_surface(db_source, originator)
         vid = virtual_id_for(session_id)
         legacy_vid = _legacy_virtual_id_for(session_id)
         sess_path = os.path.join(sessions_dir, f"{vid}.json")
@@ -502,6 +598,10 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             "cwd": cwd,
             "startedAt": int(mtime * 1000),
             "provider": "codex",
+            "codexSource": db_source,
+            "codexOriginator": originator,
+            "codexSurface": surface,
+            "title": title,
         }
 
         existing = _read_existing(state_path)
@@ -515,10 +615,22 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             "lastSignalAt": int(now),
             "rolloutPath": path,
             "rolloutMtime": int(mtime),
+            "codexSource": db_source,
+            "codexOriginator": originator,
+            "codexSurface": surface,
+            "codexTitle": title,
         }
+        if tokens_used is not None:
+            new_state["tokensUsed"] = tokens_used
+        if thread_updated_at is not None:
+            new_state["threadUpdatedAt"] = thread_updated_at
         for k in _PRESERVED_STATE_FIELDS:
             if k in existing:
                 new_state[k] = existing[k]
+        if title and not new_state.get("summary"):
+            new_state["summary"] = _trim_summary(title)
+            new_state["summarySource"] = "trim"
+            new_state["summaryAt"] = int(now)
         if "slot" not in new_state:
             new_state["slot"] = _allocate_slot(state_dir, vid, cwd)
 
@@ -535,6 +647,8 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                 state_existing.get("pid") != vid
                 or state_existing.get("rolloutMtime") != int(mtime)
                 or state_existing.get("state") != state
+                or state_existing.get("codexTitle") != title
+                or state_existing.get("codexSurface") != surface
             ):
                 _atomic_write_json(state_path, new_state)
             continue

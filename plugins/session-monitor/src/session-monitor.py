@@ -24,6 +24,7 @@ import tkinter as tk
 import urllib.parse
 import urllib.error
 import urllib.request
+import webbrowser
 from tkinter import font as tkfont
 
 # codex_rollout_poller lives next to this file; src/ isn't always on
@@ -969,7 +970,8 @@ class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
                  "slot", "summary", "pinned_at", "provider", "session_id",
-                 "state_changed_at", "interrupt_source", "interrupt_at")
+                 "state_changed_at", "interrupt_source", "interrupt_at",
+                 "codex_source", "codex_originator", "codex_surface")
 
     def __init__(self, pid, cwd, state="idle", updated_at=0, provider="claude", session_id=""):
         self.pid = pid
@@ -981,6 +983,9 @@ class Instance:
         self.slot = 0
         self.summary = ""
         self.provider = provider
+        self.codex_source = ""
+        self.codex_originator = ""
+        self.codex_surface = ""
         self.interrupt_source = ""
         self.interrupt_at = 0
         self.display_name = build_display_name(cwd, 0, "", provider)
@@ -1189,6 +1194,9 @@ class InstanceTracker:
                 saved_provider = st.get("provider", "claude")
                 saved_interrupt_source = st.get("interruptSource", "") or ""
                 saved_interrupt_at = int(st.get("interruptAt", 0) or 0)
+                saved_codex_source = st.get("codexSource", "") or ""
+                saved_codex_originator = st.get("codexOriginator", "") or ""
+                saved_codex_surface = st.get("codexSurface", "") or ""
             except Exception:
                 continue
 
@@ -1248,6 +1256,15 @@ class InstanceTracker:
                     changed = True
                 if saved_interrupt_at != inst.interrupt_at:
                     inst.interrupt_at = saved_interrupt_at
+                    changed = True
+                if saved_codex_source != inst.codex_source:
+                    inst.codex_source = saved_codex_source
+                    changed = True
+                if saved_codex_originator != inst.codex_originator:
+                    inst.codex_originator = saved_codex_originator
+                    changed = True
+                if saved_codex_surface != inst.codex_surface:
+                    inst.codex_surface = saved_codex_surface
                     changed = True
                 # state JSON wins for cwd: sessions/*.json may have been
                 # rebuilt with a stale subdirectory cwd after a Claude Code
@@ -1775,7 +1792,12 @@ class MonitorOverlay:
             # PID-less rows clickable when hooks are unavailable.
             if not isinstance(claude_pid, int):
                 if inst and inst.provider == "codex":
-                    self._activate_codex_pidless(inst.cwd, inst.session_id)
+                    self._activate_codex_pidless(
+                        inst.cwd,
+                        inst.session_id,
+                        getattr(inst, "codex_surface", ""),
+                        getattr(inst, "codex_originator", ""),
+                    )
                 else:
                     _log.debug("_activate_terminal: pid-less row has no focus target pid=%s", claude_pid)
                 return
@@ -1798,13 +1820,29 @@ class MonitorOverlay:
             else:
                 _log.warning("_activate_terminal: no hwnd found for pid=%d", claude_pid)
         except Exception:
-            _log.error("_activate_terminal failed for pid=%d", claude_pid, exc_info=True)
+            _log.error("_activate_terminal failed for pid=%s", claude_pid, exc_info=True)
 
-    def _activate_codex_pidless(self, cwd: str, session_id: str = ""):
+    def _activate_codex_pidless(
+        self,
+        cwd: str,
+        session_id: str = "",
+        codex_surface: str = "",
+        codex_originator: str = "",
+    ):
         """Best-effort window activation for a Codex row the rollout poller
-        registered without a PID. Prefer a wezterm pane session-id match, then
-        a unique cwd match, then live codex.exe process/window ownership."""
+        registered without a PID. App rows can be opened directly by thread
+        deep link; CLI rows prefer terminal/pane activation."""
         try:
+            if (
+                session_id
+                and (
+                    str(codex_surface or "").lower() == "app"
+                    or str(codex_originator or "").lower() == "codex desktop"
+                )
+                and self._open_codex_thread(session_id)
+            ):
+                return
+
             if self._activate_wezterm_pane_for_codex_row(cwd, session_id):
                 return
 
@@ -1819,6 +1857,21 @@ class MonitorOverlay:
                        cwd, len(codex_pids))
         except Exception:
             _log.error("_activate_codex_pidless failed", exc_info=True)
+
+    def _open_codex_thread(self, session_id: str) -> bool:
+        """Open a local Codex app thread via the documented codex:// scheme."""
+        sid = (session_id or "").strip()
+        if not sid:
+            return False
+        url = "codex://threads/" + urllib.parse.quote(sid, safe="")
+        try:
+            if IS_WINDOWS and hasattr(os, "startfile"):
+                os.startfile(url)  # type: ignore[attr-defined]
+                return True
+            return bool(webbrowser.open(url))
+        except Exception:
+            _log.debug("failed to open Codex thread deep link: %s", url, exc_info=True)
+            return False
 
     @staticmethod
     def _normalize_wezterm_cwd(cwd: str) -> str:

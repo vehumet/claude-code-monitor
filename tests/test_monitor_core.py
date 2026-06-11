@@ -1617,12 +1617,34 @@ class MonitorCoreTests(unittest.TestCase):
                     }
                 })()
 
-            def _activate_codex_pidless(self, cwd, session_id=""):
+            def _activate_codex_pidless(self, cwd, session_id="", *_args):
                 called.append((cwd, session_id))
 
         mod.MonitorOverlay._activate_terminal(Dummy(), "codex-abc")
 
         self.assertEqual(called, [("C:\\project", "")])
+
+    def test_pidless_codex_app_focus_opens_thread_deep_link_first(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_app_deeplink")
+        opened = []
+
+        class Dummy:
+            def _open_codex_thread(self, session_id):
+                opened.append(session_id)
+                return True
+
+            def _activate_wezterm_pane_for_codex_row(self, *_args):
+                raise AssertionError("terminal fallback should not run")
+
+        mod.MonitorOverlay._activate_codex_pidless(
+            Dummy(),
+            "C:\\project",
+            "019e-desktop-thread",
+            "app",
+            "Codex Desktop",
+        )
+
+        self.assertEqual(opened, ["019e-desktop-thread"])
 
     def test_pidless_codex_focus_does_nothing_without_window_match(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_no_match")
@@ -1869,6 +1891,72 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertTrue((state_dir / f"{vid}.json").exists())
             state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["state"], "working")
+
+    def test_codex_desktop_rollout_creates_app_row_with_title(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            codex_dir = home / ".codex"
+            rollout_dir = codex_dir / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "desktop1-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": sid,
+                            "cwd": cwd,
+                            "originator": "Codex Desktop",
+                            "source": "vscode",
+                            "thread_source": "user",
+                        },
+                    }),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+
+            import sqlite3
+            con = sqlite3.connect(codex_dir / "state_5.sqlite")
+            try:
+                con.execute(
+                    "create table threads ("
+                    "id text, title text, tokens_used integer, updated_at integer, "
+                    "source text, cwd text, rollout_path text)"
+                )
+                con.execute(
+                    "insert into threads values (?, ?, ?, ?, ?, ?, ?)",
+                    (sid, "Codex 앱 모니터링 조사", 1234, 1780000000, "vscode", cwd, str(rollout)),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            mod = load_module(POLLER, "codex_rollout_poller_desktop_app")
+            vid = mod.virtual_id_for(sid)
+            cache = {}
+
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            session = json.loads((sessions_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["codexSurface"], "app")
+            self.assertEqual(session["codexOriginator"], "Codex Desktop")
+            self.assertEqual(state["state"], "working")
+            self.assertEqual(state["codexSurface"], "app")
+            self.assertEqual(state["codexTitle"], "Codex 앱 모니터링 조사")
+            self.assertEqual(state["summary"], "Codex 앱 모니터링 조사")
+            self.assertEqual(state["summarySource"], "trim")
+            self.assertEqual(state["tokensUsed"], 1234)
 
     def test_hookless_cli_done_rollout_creates_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

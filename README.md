@@ -1,8 +1,8 @@
 # Session Monitor
 
-Always-on-top overlay widget that shows the live status of every Claude Code **and Codex CLI** session running on your machine.
+Always-on-top overlay widget that shows the live status of every Claude Code, **Codex CLI**, and **Codex desktop app** session running on your machine.
 
-Built with Claude Code and Codex CLI, for personal use. Tested on Windows; other platforms work in part but aren't a focus.
+Built with Claude Code and Codex, for personal use. Tested on Windows; other platforms work in part but aren't a focus.
 
 ![demo](docs/cm_demo.webp)
 
@@ -18,7 +18,7 @@ Each row is one Claude Code or Codex session: a provider marker (`●` Claude, `
 | Interrupted | Stopped via ESC or error |
 | Idle | Session open, no activity |
 
-Click a row to focus that terminal. Drag the bar to move the widget; the position is remembered.
+Click a row to focus that terminal or app window. Drag the bar to move the widget; the position is remembered.
 
 ## How the summary is generated
 
@@ -50,11 +50,13 @@ python install.py --skip-codex-hooks
 
 Requires Git, Python 3.10+ with tkinter (bundled with the standard Python installer), and the Claude Code CLI.
 
-### Codex CLI support
+### Codex support
 
 When `~/.codex/` is present, the installer appends a marker-fenced block to `~/.codex/config.toml` that enables `[features] hooks = true` and registers `SessionStart` / `UserPromptSubmit` / `PermissionRequest` / `Stop` hooks calling `write-state.py --provider codex <state>`. The block is idempotent on rerun and `~/.codex/config.toml` is backed up to `config.toml.bak.<unix_ts>` before any change. `python uninstall.py` removes the block cleanly.
 
 If you'd rather wire the hooks yourself or run Codex with hooks disabled, the overlay still picks up user-facing Codex sessions through the rollout JSONL fallback poller — sessions are scanned from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and shown as PID-less rows. Click-to-focus is best-effort for those rows because the fallback has to match a live Codex process by project folder instead of using an exact terminal pane id. Subagent/nested rollouts are ignored, and any session that has ever been seen by a real hook is treated as hook-owned so it won't be resurrected later as a fallback row. Pass `--skip-codex-hooks` to opt out of the auto-injection.
+
+Codex desktop app sessions are detected from the same rollout stream. When the rollout identifies `originator: "Codex Desktop"`, the row is treated as an app-backed Codex session: the monitor uses Codex's local state database for thread titles when available, keeps the app surface distinct from CLI rows internally, and opens `codex://threads/{sessionId}` for click-to-focus before falling back to process/window matching.
 
 If you move the monitor's install location after the fact, run `python uninstall.py` then `python install.py` again so the absolute paths in `config.toml` are regenerated.
 
