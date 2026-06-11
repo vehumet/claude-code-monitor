@@ -18,7 +18,7 @@ Each row is one Claude Code or Codex session: a provider marker (`●` Claude, `
 | Interrupted | Stopped via ESC or error |
 | Idle | Session open, no activity |
 
-Click a row to focus that terminal or app window. Drag the bar to move the widget; the position is remembered.
+Click a row to focus that terminal or app window. Right-click a row to remove it from the current monitor view without terminating the underlying Claude/Codex session; it reappears when a newer turn or rollout update is detected. On macOS, use a two-finger/secondary click or Ctrl-click. Drag the bar to move the widget; the position is remembered.
 
 Claude Desktop rows are best-effort: Session Monitor can raise the Claude app window, but Claude Desktop does not currently expose a documented desktop deep link for switching to an existing Claude Code session. The documented `claude://` links support regular chats/projects and new Code sessions; `claude://code/{sessionId}` is documented for mobile and did not switch the active Desktop Code chat in local testing. A future version may add an optional UI Automation fallback, but the stable behavior is window focus only.
 

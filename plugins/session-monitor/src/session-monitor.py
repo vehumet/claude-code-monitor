@@ -1179,11 +1179,78 @@ class InstanceTracker:
             0.5,
             float(CONFIG.get("codex_question_check_interval_ms", 2000)) / 1000.0,
         )
+        self._dismissed_keys = {}
         self.pins = self._load_pins()
 
     @staticmethod
     def pin_key(inst: Instance) -> str:
         return inst.session_id or str(inst.pid)
+
+    @staticmethod
+    def dismiss_key(provider, session_id, pid) -> str:
+        if session_id:
+            return f"{provider or 'claude'}:session:{session_id}"
+        return f"{provider or 'claude'}:pid:{pid}"
+
+    @staticmethod
+    def _dismiss_observed_at(state_data) -> float:
+        if not isinstance(state_data, dict):
+            return 0.0
+        # Native Claude Desktop session discovery recreates idle files for live
+        # agents. That is not a new turn signal, so don't use it to undo a
+        # manual dismissal.
+        if state_data.get("lastSignalSource") == "desktop_session":
+            return 0.0
+        for key in ("rolloutMtime", "lastSignalAt", "updatedAt"):
+            try:
+                value = float(state_data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value:
+                return value
+        return 0.0
+
+    def _state_observed_at_for_pid(self, pid) -> float:
+        try:
+            data = _read_json_file(os.path.join(self.state_dir, f"{pid}.json"))
+        except Exception:
+            data = None
+        return self._dismiss_observed_at(data)
+
+    def _is_dismissed(self, provider, session_id, pid, observed_at=0.0) -> bool:
+        key = self.dismiss_key(provider, session_id, pid)
+        dismissed_at = self._dismissed_keys.get(key)
+        if dismissed_at is None:
+            return False
+        try:
+            observed_at = float(observed_at or 0)
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        if observed_at > dismissed_at:
+            self._dismissed_keys.pop(key, None)
+            return False
+        return True
+
+    def _remove_monitor_files(self, pid):
+        for root in (self.sessions_dir, self.state_dir):
+            try:
+                os.remove(os.path.join(root, f"{pid}.json"))
+            except OSError:
+                pass
+
+    def dismiss_instance(self, pid) -> bool:
+        """Hide a row for the current monitor run and remove its runtime files."""
+        inst = self.instances.get(pid)
+        if not inst:
+            return False
+        key = self.dismiss_key(inst.provider, inst.session_id, inst.pid)
+        self._dismissed_keys[key] = time.time()
+        pin_key = self.pin_key(inst)
+        self.pins.pop(pin_key, None)
+        self._remove_monitor_files(inst.pid)
+        del self.instances[pid]
+        self.save_pins()
+        return True
 
     def _load_pins(self) -> dict:
         try:
@@ -1302,6 +1369,10 @@ class InstanceTracker:
             except Exception:
                 continue
 
+            if self._is_dismissed(provider, session_id, pid, self._state_observed_at_for_pid(pid)):
+                self._remove_monitor_files(pid)
+                continue
+
             if is_virtual_id(pid):
                 # Virtual rows are owned by codex_rollout_poller, which
                 # writes/evicts both files atomically. Don't attempt the
@@ -1378,6 +1449,11 @@ class InstanceTracker:
                 continue
 
             session_data = session_by_pid.get(pid)
+            state_session_id = (session_data or {}).get("sessionId") or st.get("sessionId") or ""
+            if self._is_dismissed(saved_provider, state_session_id, pid, self._dismiss_observed_at(st)):
+                self._remove_monitor_files(pid)
+                continue
+
             if saved_provider == "claude" and session_waits_for_user(session_data):
                 state = "question"
             elif saved_provider == "claude" and claude_session_has_pending_ask_user_question(session_data):
@@ -1906,11 +1982,20 @@ class MonitorOverlay:
             self._clear_recent_highlight(pid)
             self._activate_terminal(pid)
 
+        def on_row_dismiss(event, pid=inst.pid):
+            self._dismiss_row(pid)
+            return "break"
+
         # Dot already has its own pin-toggle handler; it still participates in
         # row-hover recoloring via the generic Enter/Leave below.
         for w in (frame, folder_box, folder_lbl,
                   summary_box, summary_lbl, state_lbl):
             w.bind("<Button-1>", on_click)
+        for w in (frame, dot_box, dot, folder_box, folder_lbl,
+                  summary_box, summary_lbl, state_lbl):
+            w.bind("<Button-3>", on_row_dismiss)
+            w.bind("<Button-2>", on_row_dismiss)
+            w.bind("<Control-Button-1>", on_row_dismiss)
         for w in (frame, dot_box, dot, folder_box, folder_lbl,
                   summary_box, summary_lbl, state_lbl):
             w.bind("<Enter>", lambda _e, f=frame: self._row_hover(f, True))
@@ -1920,6 +2005,11 @@ class MonitorOverlay:
             "frame": frame, "dot": dot, "name": name_lbl,
             "state": state_lbl, "instance": inst, "base_bg": base_bg,
         })
+
+    def _dismiss_row(self, pid):
+        """Remove a row from the current monitor view without killing the session."""
+        if self.tracker.dismiss_instance(pid):
+            self._rebuild_rows()
 
     def _clear_recent_highlight(self, pid):
         """Dismiss the current recent-change highlight when its row is clicked."""

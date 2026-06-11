@@ -1574,6 +1574,158 @@ class MonitorCoreTests(unittest.TestCase):
                 else:
                     os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
 
+    def test_dismiss_instance_removes_files_and_suppresses_same_session(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            sid = "dismiss-session"
+            cwd = str(home / "project")
+            session_payload = {"pid": real_pid, "sessionId": sid, "cwd": cwd}
+            state_payload = {
+                "pid": real_pid,
+                "state": "done",
+                "cwd": cwd,
+                "updatedAt": 100,
+                "provider": "claude",
+            }
+            session_path = sessions_dir / f"{real_pid}.json"
+            state_path = state_dir / f"{real_pid}.json"
+            session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+            state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_dismiss_instance")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+                mod.IS_WINDOWS = False
+
+                tracker = mod.InstanceTracker()
+                tracker.poll()
+                self.assertIn(real_pid, tracker.instances)
+
+                tracker.instances[real_pid].pinned_at = 1.0
+                tracker.save_pins()
+                self.assertTrue(tracker.dismiss_instance(real_pid))
+
+                self.assertNotIn(real_pid, tracker.instances)
+                self.assertFalse(session_path.exists())
+                self.assertFalse(state_path.exists())
+                self.assertNotIn(sid, tracker.pins)
+
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+                tracker.poll()
+
+                self.assertNotIn(real_pid, tracker.instances)
+                self.assertFalse(session_path.exists())
+                self.assertFalse(state_path.exists())
+
+                fresh_state_payload = dict(state_payload)
+                fresh_state_payload["state"] = "working"
+                fresh_state_payload["updatedAt"] = int(mod.time.time()) + 10
+                fresh_state_payload["lastSignalSource"] = "hook"
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(fresh_state_payload), encoding="utf-8")
+                tracker.poll()
+
+                self.assertIn(real_pid, tracker.instances)
+                self.assertEqual(tracker.instances[real_pid].state, "working")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_dismissed_codex_virtual_row_reappears_after_new_rollout_mtime(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_dismissed_codex_reappears")
+                mod.poll_codex_rollouts = None
+
+                pid = "codex-dismissed"
+                sid = "dismissed-codex"
+                cwd = str(home / "project")
+                session_payload = {
+                    "pid": pid,
+                    "virtualId": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }
+                old_state_payload = {
+                    "pid": pid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "updatedAt": 100,
+                    "provider": "codex",
+                    "lastSignalSource": "rollout",
+                    "rolloutMtime": 100,
+                }
+                session_path = sessions_dir / f"{pid}.json"
+                state_path = state_dir / f"{pid}.json"
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(old_state_payload), encoding="utf-8")
+
+                tracker = mod.InstanceTracker()
+                tracker.poll()
+                self.assertIn(pid, tracker.instances)
+
+                self.assertTrue(tracker.dismiss_instance(pid))
+                self.assertNotIn(pid, tracker.instances)
+
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(old_state_payload), encoding="utf-8")
+                tracker.poll()
+
+                self.assertNotIn(pid, tracker.instances)
+
+                fresh_state_payload = dict(old_state_payload)
+                fresh_state_payload["state"] = "working"
+                fresh_state_payload["updatedAt"] = int(mod.time.time()) + 10
+                fresh_state_payload["rolloutMtime"] = int(mod.time.time()) + 10
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(fresh_state_payload), encoding="utf-8")
+                tracker.poll()
+
+                self.assertIn(pid, tracker.instances)
+                self.assertEqual(tracker.instances[pid].state, "working")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
     def test_tracker_loads_claude_desktop_entrypoint(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
