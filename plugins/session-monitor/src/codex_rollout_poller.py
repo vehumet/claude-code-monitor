@@ -64,10 +64,31 @@ def _codex_hooked_dir(state_dir):
     return os.path.join(os.path.dirname(state_dir), "codex-hooked")
 
 
-def _is_hook_owned_session(state_dir, session_id):
+def _hook_owned_at(state_dir, session_id):
     if not session_id:
+        return 0.0
+    path = os.path.join(_codex_hooked_dir(state_dir), f"{session_id}.json")
+    if not os.path.exists(path):
+        return 0.0
+    data = _read_existing(path)
+    value = _safe_float(data.get("updatedAt"))
+    if value:
+        return value
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 1.0
+
+
+def _thread_newer_than_hook(metadata, hook_owned_at):
+    return bool(hook_owned_at and _safe_float(metadata.get("threadUpdatedAt")) > hook_owned_at)
+
+
+def _is_hook_owned_session(state_dir, session_id, metadata=None):
+    hook_owned_at = _hook_owned_at(state_dir, session_id)
+    if not hook_owned_at:
         return False
-    return os.path.exists(os.path.join(_codex_hooked_dir(state_dir), f"{session_id}.json"))
+    return not _thread_newer_than_hook(metadata or {}, hook_owned_at)
 
 
 def virtual_id_for(session_id: str) -> str:
@@ -113,13 +134,13 @@ def _is_exec_rollout_payload(payload):
     return payload.get("originator") == "codex_exec" or payload.get("source") == "exec"
 
 
-def _ignore_reason(state_dir, session_id, payload):
+def _ignore_reason(state_dir, session_id, payload, metadata=None):
     """Return why this rollout should not create a monitor row, or None."""
     if _is_nested_rollout_payload(payload):
         return IGNORE_NESTED
     if _is_exec_rollout_payload(payload):
         return IGNORE_EXEC
-    if _is_hook_owned_session(state_dir, session_id):
+    if _is_hook_owned_session(state_dir, session_id, metadata):
         return IGNORE_HOOK_OWNED
     return None
 
@@ -155,7 +176,20 @@ def _ignore_rollout(prev_cache, path, mtime, session_id, reason, sessions_dir, s
     _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
 
 
-def _scan_turn_markers(path):
+def _payload_session_id(record):
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload") or {}
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("id")
+
+
+def _is_target_session(current_session_id, target_session_id):
+    return not target_session_id or current_session_id is None or current_session_id == target_session_id
+
+
+def _scan_turn_markers(path, session_id=None):
     """Single-pass walk of rollout turn markers.
 
     Returns ``(started, terminal, latest_failed)``. Older Codex rollouts can
@@ -165,6 +199,7 @@ def _scan_turn_markers(path):
     started = 0
     terminal = 0
     latest_marker = None
+    current_session_id = None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -173,6 +208,12 @@ def _scan_turn_markers(path):
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    continue
+                record_session_id = _payload_session_id(d)
+                if record_session_id:
+                    current_session_id = record_session_id
+                    continue
+                if not _is_target_session(current_session_id, session_id):
                     continue
                 if d.get("type") != "event_msg":
                     continue
@@ -194,7 +235,7 @@ def _scan_turn_markers(path):
     return started, terminal, latest_marker == "failed"
 
 
-def _scan_activity(path):
+def _scan_activity(path, session_id=None, include_latest=False):
     """Return turn markers plus whether Codex is awaiting user input.
 
     Codex's in-chat questions are emitted as a ``request_user_input`` tool call,
@@ -205,6 +246,7 @@ def _scan_activity(path):
     terminal = 0
     latest_marker = None
     pending_questions = set()
+    current_session_id = None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -213,6 +255,12 @@ def _scan_activity(path):
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    continue
+                record_session_id = _payload_session_id(d)
+                if record_session_id:
+                    current_session_id = record_session_id
+                    continue
+                if not _is_target_session(current_session_id, session_id):
                     continue
                 line_type = d.get("type")
                 payload = d.get("payload") or {}
@@ -241,16 +289,20 @@ def _scan_activity(path):
                     elif item_type == "function_call_output" and call_id:
                         pending_questions.discard(call_id)
     except OSError:
-        return 0, 0, False, False
-    return started, terminal, latest_marker == "failed", bool(pending_questions)
+        result = (0, 0, False, False)
+        return result + (None,) if include_latest else result
+    result = (started, terminal, latest_marker == "failed", bool(pending_questions))
+    return result + (latest_marker,) if include_latest else result
 
 
-def _infer_state(mtime, started, completed, failed, waiting_for_user=False):
+def _infer_state(mtime, started, completed, failed, waiting_for_user=False, latest_marker=None):
     """Map turn markers + mtime to our state vocabulary."""
     if failed:
         return "interrupted"
     if waiting_for_user:
         return "question"
+    if latest_marker == "started":
+        return "working"
     if started > 0 or completed > 0:
         return "working" if started > completed else "done"
     if time.time() - mtime < _WORKING_FRESHNESS_S:
@@ -283,8 +335,10 @@ def infer_rollout_state_for_session(session_id):
         mtime = os.path.getmtime(path)
     except OSError:
         return None
-    started, completed, failed, waiting = _scan_activity(path)
-    return _infer_state(mtime, started, completed, failed, waiting)
+    started, completed, failed, waiting, latest_marker = _scan_activity(
+        path, session_id, include_latest=True
+    )
+    return _infer_state(mtime, started, completed, failed, waiting, latest_marker)
 
 
 def _atomic_write_json(path, data):
@@ -397,6 +451,28 @@ def _load_thread_metadata(prev_cache):
     return data
 
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _thread_metadata_recent(metadata, cutoff):
+    if not isinstance(metadata, dict):
+        return False
+    return _safe_float(metadata.get("threadUpdatedAt")) >= cutoff
+
+
+def _norm_rollout_path(path):
+    if not path:
+        return ""
+    value = str(path)
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normcase(os.path.abspath(os.path.normpath(value)))
+
+
 def _codex_surface(source, originator):
     if str(originator or "").lower() == "codex desktop":
         return "app"
@@ -474,15 +550,19 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
     seen_virtual_ids = set()
     seen_rollout_paths = set()
     thread_meta = _load_thread_metadata(prev_cache)
+    thread_rollout_paths = {
+        _norm_rollout_path(metadata.get("rolloutPath"))
+        for metadata in thread_meta.values()
+        if metadata.get("rolloutPath") and _thread_metadata_recent(metadata, cutoff)
+    }
 
     for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")):
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             continue
-        if mtime < cutoff:
-            continue
-        if now - mtime > _STALE_EVICTION_S:
+        path_key = _norm_rollout_path(path)
+        if mtime < cutoff and path_key not in thread_rollout_paths:
             continue
 
         cached = prev_cache.get(path)
@@ -493,19 +573,52 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         # the disk write below as well — Codex sessions can have rollouts
         # in the multi-megabyte range and re-parsing them every 500ms
         # turned the poller into the dominant cost on the hot path.
-        cache_hit = cached is not None and cached.get("mtime") == mtime
-        if cache_hit and cached.get("ignored"):
-            session_id = cached.get("session_id")
+        cache_valid = cached is not None and cached.get("mtime") == mtime
+        ignored_cache_hit = cache_valid and cached.get("ignored")
+        cache_hit = cache_valid and not cached.get("ignored")
+        session_id = cached.get("session_id") if cache_valid else None
+        metadata = thread_meta.get(session_id, {}) if session_id else {}
+        if ignored_cache_hit and session_id:
+            reason = cached.get("ignore_reason")
+            if reason == IGNORE_HOOK_OWNED and not _is_hook_owned_session(state_dir, session_id, metadata):
+                ignored_cache_hit = False
+            elif reason:
+                _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
+                seen_rollout_paths.add(path)
+                continue
+        if not cache_hit:
+            meta = _read_first_json_line(path)
+            if not meta or meta.get("type") != "session_meta":
+                continue
+            payload = meta.get("payload") or {}
+            session_id = payload.get("id")
+            cwd = payload.get("cwd")
+            source = payload.get("source") or ""
+            originator = payload.get("originator") or ""
+            if not session_id or not cwd:
+                continue
+            metadata = thread_meta.get(session_id, {})
+        if mtime < cutoff and not _thread_metadata_recent(metadata, cutoff):
+            continue
+        if now - mtime > _STALE_EVICTION_S and not metadata:
+            continue
+        if ignored_cache_hit:
+            reason = _ignore_reason(state_dir, session_id, payload, metadata)
+            if not reason:
+                ignored_cache_hit = False
+            else:
+                _cache_ignored(prev_cache, path, mtime, session_id, reason)
+        if ignored_cache_hit:
             if session_id:
                 # Hook ownership may be learned after a rollout was first
                 # cached for another ignore reason. Keep the current row hidden
                 # and refresh the reason for diagnostics.
-                if _is_hook_owned_session(state_dir, session_id):
+                if _is_hook_owned_session(state_dir, session_id, metadata):
                     cached["ignore_reason"] = IGNORE_HOOK_OWNED
                 _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
             seen_rollout_paths.add(path)
             continue
-        if cache_hit and _is_hook_owned_session(state_dir, cached.get("session_id")):
+        if cache_hit and _is_hook_owned_session(state_dir, cached.get("session_id"), metadata):
             session_id = cached.get("session_id")
             if session_id:
                 _ignore_rollout(
@@ -521,20 +634,11 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             completed = cached["completed"]
             failed = cached["failed"]
             waiting = cached.get("waiting", False)
+            latest_marker = cached.get("latest_marker")
             source = cached.get("source", "")
             originator = cached.get("originator", "")
         else:
-            meta = _read_first_json_line(path)
-            if not meta or meta.get("type") != "session_meta":
-                continue
-            payload = meta.get("payload") or {}
-            session_id = payload.get("id")
-            cwd = payload.get("cwd")
-            source = payload.get("source") or ""
-            originator = payload.get("originator") or ""
-            if not session_id or not cwd:
-                continue
-            reason = _ignore_reason(state_dir, session_id, payload)
+            reason = _ignore_reason(state_dir, session_id, payload, metadata)
             if reason:
                 seen_rollout_paths.add(path)
                 _ignore_rollout(
@@ -542,7 +646,9 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                     sessions_dir, state_dir,
                 )
                 continue
-            started, completed, failed, waiting = _scan_activity(path)
+            started, completed, failed, waiting, latest_marker = _scan_activity(
+                path, session_id, include_latest=True
+            )
             prev_cache[path] = {
                 "mtime": mtime,
                 "session_id": session_id,
@@ -551,12 +657,12 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
                 "completed": completed,
                 "failed": failed,
                 "waiting": waiting,
+                "latest_marker": latest_marker,
                 "source": source,
                 "originator": originator,
             }
 
         seen_rollout_paths.add(path)
-        metadata = thread_meta.get(session_id, {})
         title = metadata.get("title") or ""
         tokens_used = metadata.get("tokensUsed")
         thread_updated_at = metadata.get("threadUpdatedAt")
@@ -589,7 +695,8 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
 
         seen_virtual_ids.add(vid)
 
-        state = _infer_state(mtime, started, completed, failed, waiting)
+        state = _infer_state(mtime, started, completed, failed, waiting, latest_marker)
+        activity_time = max(int(mtime), int(_safe_float(thread_updated_at)))
 
         sess_record = {
             "pid": vid,
@@ -607,9 +714,10 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         existing = _read_existing(state_path)
         new_state = {
             "pid": vid,
+            "sessionId": session_id,
             "state": state,
             "cwd": cwd,
-            "updatedAt": int(mtime),
+            "updatedAt": activity_time,
             "provider": "codex",
             "lastSignalSource": "rollout",
             "lastSignalAt": int(now),
@@ -646,9 +754,11 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
             if (
                 state_existing.get("pid") != vid
                 or state_existing.get("rolloutMtime") != int(mtime)
+                or state_existing.get("updatedAt") != activity_time
                 or state_existing.get("state") != state
                 or state_existing.get("codexTitle") != title
                 or state_existing.get("codexSurface") != surface
+                or state_existing.get("threadUpdatedAt") != thread_updated_at
             ):
                 _atomic_write_json(state_path, new_state)
             continue
@@ -663,11 +773,16 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         if base in seen_virtual_ids:
             continue
         d = _read_existing(sf)
+        session_id = d.get("sessionId")
+        if not session_id and base.startswith(VIRTUAL_PREFIX):
+            session_id = base[len(VIRTUAL_PREFIX):]
+        metadata = thread_meta.get(session_id, {})
+        metadata_recent = _thread_metadata_recent(metadata, cutoff)
         rollout_path = d.get("rolloutPath")
         rollout_mtime = d.get("rolloutMtime", 0)
         is_stale = (
-            (not rollout_path or not os.path.exists(rollout_path))
-            or (now - rollout_mtime > _STALE_EVICTION_S)
+            ((not rollout_path or not os.path.exists(rollout_path)) and not metadata_recent)
+            or (now - rollout_mtime > _STALE_EVICTION_S and not metadata_recent)
         )
         if is_stale:
             for p in (sf, os.path.join(sessions_dir, f"{base}.json")):

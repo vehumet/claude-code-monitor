@@ -515,6 +515,21 @@ class MonitorCoreTests(unittest.TestCase):
 
             self.assertFalse(mod._codex_task_complete("sid"))
 
+    def test_codex_task_complete_false_when_complete_then_started_tie(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_complete_started_tie")
+            mod._find_codex_rollout = lambda _sid: str(rollout)
+
+            self.assertFalse(mod._codex_task_complete("sid"))
+
     def test_codex_task_complete_treats_turn_aborted_as_terminal(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             rollout = Path(td) / "rollout.jsonl"
@@ -586,6 +601,34 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertIn("shell_command", scan["digest"])
             self.assertIn("Assets/_Project/Scripts/Localization/Loc.cs", scan["digest"])
             self.assertIn("missing localization guard", scan["digest"])
+
+    def test_codex_rollout_digest_ignores_parent_fork_segment(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            parent_sid = "parent11-1111-2222-3333-abcdefghijkl"
+            child_sid = "child111-1111-2222-3333-abcdefghijkl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": child_sid}}),
+                    json.dumps({"type": "session_meta", "payload": {"id": parent_sid}}),
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "parent-only request"},
+                    }),
+                    json.dumps({"type": "session_meta", "payload": {"id": child_sid}}),
+                    json.dumps({
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "child fork request"},
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(WRITE_STATE, "write_state_codex_digest_fork")
+
+            scan = mod._scan_codex_rollout(str(rollout), child_sid)
+
+            self.assertIn("child fork request", scan["digest"])
+            self.assertNotIn("parent-only request", scan["digest"])
 
     def test_codex_rollout_digest_is_bounded(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -1526,6 +1569,104 @@ class MonitorCoreTests(unittest.TestCase):
                 else:
                     os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
 
+    def test_done_timestamp_refresh_updates_recent_highlight_time(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({"pid": real_pid, "sessionId": "sid", "cwd": cwd}),
+                encoding="utf-8",
+            )
+            state_path = state_dir / f"{real_pid}.json"
+            state_path.write_text(
+                json.dumps({"pid": real_pid, "state": "done", "cwd": cwd, "updatedAt": 100}),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_done_refresh_highlight")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                changed, events = tracker.poll()
+                self.assertTrue(changed)
+                self.assertIn("done", events)
+                self.assertEqual(tracker.instances[real_pid].state_changed_at, 100)
+
+                state_path.write_text(
+                    json.dumps({"pid": real_pid, "state": "done", "cwd": cwd, "updatedAt": 200}),
+                    encoding="utf-8",
+                )
+                changed, events = tracker.poll()
+
+                self.assertTrue(changed)
+                self.assertIn("done", events)
+                self.assertEqual(tracker.instances[real_pid].state_changed_at, 200)
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
+    def test_working_timestamp_refresh_does_not_request_redraw(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({"pid": real_pid, "sessionId": "sid", "cwd": cwd}),
+                encoding="utf-8",
+            )
+            state_path = state_dir / f"{real_pid}.json"
+            state_path.write_text(
+                json.dumps({"pid": real_pid, "state": "working", "cwd": cwd, "updatedAt": 100}),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_working_refresh_no_redraw")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                changed, _events = tracker.poll()
+                self.assertTrue(changed)
+
+                state_path.write_text(
+                    json.dumps({"pid": real_pid, "state": "working", "cwd": cwd, "updatedAt": 200}),
+                    encoding="utf-8",
+                )
+                changed, events = tracker.poll()
+
+                self.assertFalse(changed)
+                self.assertEqual(events, [])
+                self.assertEqual(tracker.instances[real_pid].updated_at, 200)
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
     def test_tracker_loads_stop_failure_interrupt_metadata(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -1709,7 +1850,6 @@ class MonitorCoreTests(unittest.TestCase):
                 fresh_state_payload = dict(old_state_payload)
                 fresh_state_payload["state"] = "working"
                 fresh_state_payload["updatedAt"] = int(mod.time.time()) + 10
-                fresh_state_payload["rolloutMtime"] = int(mod.time.time()) + 10
                 session_path.write_text(json.dumps(session_payload), encoding="utf-8")
                 state_path.write_text(json.dumps(fresh_state_payload), encoding="utf-8")
                 tracker.poll()
@@ -1952,6 +2092,43 @@ class MonitorCoreTests(unittest.TestCase):
                 "question",
             )
 
+    def test_rollout_fork_scan_ignores_parent_pending_question(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            parent_sid = "parent11-1111-2222-3333-abcdefghijkl"
+            child_sid = "child111-1111-2222-3333-abcdefghijkl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": child_sid}}),
+                    json.dumps({"type": "session_meta", "payload": {"id": parent_sid}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "request_user_input",
+                            "call_id": "parent_question",
+                        },
+                    }),
+                    json.dumps({"type": "session_meta", "payload": {"id": child_sid}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_fork_question")
+
+            started, terminal, failed, waiting = mod._scan_activity(str(rollout), child_sid)
+
+            self.assertEqual(started, 1)
+            self.assertEqual(terminal, 1)
+            self.assertFalse(failed)
+            self.assertFalse(waiting)
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting),
+                "done",
+            )
+
     def test_rollout_answered_user_input_returns_to_working(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             rollout = Path(td) / "rollout.jsonl"
@@ -1984,6 +2161,30 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse(waiting)
             self.assertEqual(
                 mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting),
+                "working",
+            )
+
+    def test_rollout_complete_then_started_tie_is_working(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_complete_started_tie")
+
+            started, terminal, failed, waiting, latest = mod._scan_activity(
+                str(rollout), include_latest=True
+            )
+
+            self.assertEqual(started, 1)
+            self.assertEqual(terminal, 1)
+            self.assertEqual(latest, "started")
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting, latest),
                 "working",
             )
 
@@ -2032,6 +2233,28 @@ class MonitorCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(opened, ["019e-desktop-thread"])
+
+    def test_pidless_codex_cli_focus_opens_thread_deep_link_first(self):
+        mod = load_module(MONITOR, "session_monitor_pidless_codex_cli_deeplink")
+        opened = []
+
+        class Dummy:
+            def _open_codex_thread(self, session_id):
+                opened.append(session_id)
+                return True
+
+            def _activate_wezterm_pane_for_codex_row(self, *_args):
+                raise AssertionError("terminal fallback should not run")
+
+        mod.MonitorOverlay._activate_codex_pidless(
+            Dummy(),
+            "C:\\project",
+            "019e-cli-thread",
+            "cli",
+            "codex-tui",
+        )
+
+        self.assertEqual(opened, ["019e-cli-thread"])
 
     def test_pidless_codex_focus_does_nothing_without_window_match(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_no_match")
@@ -2345,6 +2568,75 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(state["summarySource"], "trim")
             self.assertEqual(state["tokensUsed"], 1234)
 
+    def test_codex_desktop_thread_metadata_restores_stale_rollout(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            codex_dir = home / ".codex"
+            rollout_dir = codex_dir / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            mod = load_module(POLLER, "codex_rollout_poller_desktop_stale_restore")
+            sid = "stale111-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": sid,
+                            "cwd": cwd,
+                            "originator": "Codex Desktop",
+                            "source": "vscode",
+                            "thread_source": "user",
+                        },
+                    }),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            old_mtime = int(mod.time.time()) - mod._STALE_EVICTION_S - 60
+            os.utime(rollout, (old_mtime, old_mtime))
+            thread_updated_at = int(mod.time.time())
+
+            import sqlite3
+            con = sqlite3.connect(codex_dir / "state_5.sqlite")
+            try:
+                con.execute(
+                    "create table threads ("
+                    "id text, title text, tokens_used integer, updated_at integer, "
+                    "source text, cwd text, rollout_path text)"
+                )
+                con.execute(
+                    "insert into threads values (?, ?, ?, ?, ?, ?, ?)",
+                    (sid, "재개된 오래된 앱 세션", 42, thread_updated_at, "vscode", cwd, str(rollout)),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            vid = mod.virtual_id_for(sid)
+            cache = {}
+
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["sessionId"], sid)
+            self.assertEqual(state["state"], "done")
+            self.assertEqual(state["rolloutMtime"], old_mtime)
+            self.assertEqual(state["threadUpdatedAt"], thread_updated_at)
+            self.assertEqual(state["updatedAt"], thread_updated_at)
+            self.assertEqual(state["codexTitle"], "재개된 오래된 앱 세션")
+
     def test_hookless_cli_done_rollout_creates_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -2417,6 +2709,113 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue(cache[str(rollout)]["ignored"])
             self.assertEqual(cache[str(rollout)]["ignore_reason"], "hook_owned")
+
+    def test_ignored_hook_owned_cache_hit_skips_first_line_read(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            hooked_dir = runtime_dir(home) / "codex-hooked"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            hooked_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "cached11-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd}}),
+                encoding="utf-8",
+            )
+            (hooked_dir / f"{sid}.json").write_text(
+                json.dumps({"sessionId": sid, "updatedAt": int(rollout.stat().st_mtime)}),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_ignored_cache_fast")
+            mod._read_first_json_line = lambda _path: self.fail("first line should stay cached")
+            cache = {
+                str(rollout): {
+                    "mtime": rollout.stat().st_mtime,
+                    "session_id": sid,
+                    "ignored": True,
+                    "ignore_reason": "hook_owned",
+                }
+            }
+
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue(cache[str(rollout)]["ignored"])
+
+    def test_hook_owned_rollout_reappears_after_new_thread_update(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            hooked_dir = runtime_dir(home) / "codex-hooked"
+            codex_dir = home / ".codex"
+            rollout_dir = codex_dir / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            hooked_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "rehook11-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": "cli"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            (hooked_dir / f"{sid}.json").write_text(
+                json.dumps({"sessionId": sid, "updatedAt": 100}),
+                encoding="utf-8",
+            )
+
+            import sqlite3
+            con = sqlite3.connect(codex_dir / "state_5.sqlite")
+            try:
+                con.execute(
+                    "create table threads ("
+                    "id text, title text, tokens_used integer, updated_at integer, "
+                    "source text, cwd text, rollout_path text)"
+                )
+                con.execute(
+                    "insert into threads values (?, ?, ?, ?, ?, ?, ?)",
+                    (sid, "resumed hook-owned session", 7, 200, "cli", cwd, str(rollout)),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            mod = load_module(POLLER, "codex_rollout_poller_hooked_resumed")
+            vid = mod.virtual_id_for(sid)
+            cache = {
+                str(rollout): {
+                    "mtime": rollout.stat().st_mtime,
+                    "session_id": sid,
+                    "ignored": True,
+                    "ignore_reason": "hook_owned",
+                }
+            }
+
+            mod.poll_codex_rollouts(set(), cache, str(sessions_dir), str(state_dir))
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["sessionId"], sid)
+            self.assertEqual(state["state"], "done")
+            self.assertEqual(state["threadUpdatedAt"], 200)
 
 
 if __name__ == "__main__":

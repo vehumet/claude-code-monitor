@@ -1201,14 +1201,14 @@ class InstanceTracker:
         # manual dismissal.
         if state_data.get("lastSignalSource") == "desktop_session":
             return 0.0
-        for key in ("rolloutMtime", "lastSignalAt", "updatedAt"):
+        observed = 0.0
+        for key in ("rolloutMtime", "lastSignalAt", "updatedAt", "threadUpdatedAt"):
             try:
                 value = float(state_data.get(key) or 0)
             except (TypeError, ValueError):
                 value = 0.0
-            if value:
-                return value
-        return 0.0
+            observed = max(observed, value)
+        return observed
 
     def _state_observed_at_for_pid(self, pid) -> float:
         try:
@@ -1527,13 +1527,21 @@ class InstanceTracker:
                 if saved_cwd and saved_cwd != inst.cwd:
                     inst.cwd = saved_cwd
                     changed = True
-                if inst.state != state or inst.updated_at != updated_at:
+                old_updated_at = inst.updated_at
+                state_changed = inst.state != state
+                terminal_refreshed = (
+                    not state_changed
+                    and state == "done"
+                    and updated_at
+                    and updated_at > old_updated_at
+                )
+                if state_changed or old_updated_at != updated_at:
                     old_state = inst.state
                     inst.state = state
                     inst.updated_at = updated_at
-                    if old_state != state and state != "working":
+                    if (state_changed or terminal_refreshed) and state != "working":
                         inst.state_changed_at = updated_at or int(time.time())
-                    if state == "done" and old_state != "done":
+                    if state == "done" and (old_state != "done" or terminal_refreshed):
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")
@@ -1551,7 +1559,8 @@ class InstanceTracker:
                         events.append("question")
                     elif state not in ("done", "interrupted"):
                         inst.done_since = 0.0
-                    changed = True
+                    if state_changed or terminal_refreshed:
+                        changed = True
 
         # Proactively resolve hwnd for instances that don't have one yet
         if IS_WINDOWS:
@@ -1766,7 +1775,11 @@ class MonitorOverlay:
             if self.sound_enabled:
                 for ev in events:
                     self._play_sound(ev)
-            self.root.wm_attributes("-topmost", True)
+            try:
+                if not self.root.attributes("-topmost"):
+                    self.root.wm_attributes("-topmost", True)
+            except Exception:
+                self.root.wm_attributes("-topmost", True)
         except Exception:
             _log.exception("poll loop error")
         finally:
@@ -1882,7 +1895,9 @@ class MonitorOverlay:
         parts = geo.split("+")
         x_pos = parts[1] if len(parts) > 1 else "0"
         y_pos = parts[2] if len(parts) > 2 else "0"
-        self.root.geometry(f"{self.width}x{height}+{x_pos}+{y_pos}")
+        new_geo = f"{self.width}x{height}+{x_pos}+{y_pos}"
+        if geo != new_geo:
+            self.root.geometry(new_geo)
 
     def _fit_label(self, text: str, max_pixels: int) -> str:
         """Trim text with '\u2026' if it would exceed max_pixels rendered in font_row."""
@@ -2124,14 +2139,7 @@ class MonitorOverlay:
         registered without a PID. App rows can be opened directly by thread
         deep link; CLI rows prefer terminal/pane activation."""
         try:
-            if (
-                session_id
-                and (
-                    str(codex_surface or "").lower() == "app"
-                    or str(codex_originator or "").lower() == "codex desktop"
-                )
-                and self._open_codex_thread(session_id)
-            ):
+            if session_id and self._open_codex_thread(session_id):
                 return
 
             if self._activate_wezterm_pane_for_codex_row(cwd, session_id):

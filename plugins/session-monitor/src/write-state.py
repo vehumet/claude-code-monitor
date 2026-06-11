@@ -925,7 +925,20 @@ def _codex_item(payload):
     return item if isinstance(item, dict) else payload
 
 
-def _scan_codex_rollout(rollout_path):
+def _codex_record_session_id(record):
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload") or {}
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("id")
+
+
+def _codex_is_target_session(current_session_id, target_session_id):
+    return not target_session_id or current_session_id is None or current_session_id == target_session_id
+
+
+def _scan_codex_rollout(rollout_path, session_id=None):
     """Single-pass scan of a Codex rollout JSONL pulling out the signals
     the summarizer cares about.
 
@@ -949,12 +962,19 @@ def _scan_codex_rollout(rollout_path):
     seen_files = set()
     if not rollout_path or not os.path.exists(rollout_path):
         return out
+    current_session_id = None
     try:
         with open(rollout_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    continue
+                record_session_id = _codex_record_session_id(d)
+                if record_session_id:
+                    current_session_id = record_session_id
+                    continue
+                if not _codex_is_target_session(current_session_id, session_id):
                     continue
                 line_type = d.get("type")
                 if line_type not in ("event_msg", "response_item", "compacted"):
@@ -1060,6 +1080,7 @@ def _codex_task_complete(session_id):
     started = 0
     completed = 0
     latest_marker = None
+    current_session_id = None
     try:
         with open(rollout, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -1068,6 +1089,12 @@ def _codex_task_complete(session_id):
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    continue
+                record_session_id = _codex_record_session_id(d)
+                if record_session_id:
+                    current_session_id = record_session_id
+                    continue
+                if not _codex_is_target_session(current_session_id, session_id):
                     continue
                 if d.get("type") != "event_msg":
                     continue
@@ -1086,6 +1113,8 @@ def _codex_task_complete(session_id):
         return True
     if started == 0 and completed == 0:
         return True  # no markers yet — conservative
+    if latest_marker == "started":
+        return False
     if latest_marker == "completed":
         return True
     return completed >= started
@@ -1372,7 +1401,7 @@ def _do_summarize(target_pid):
         if not rollout:
             _log.debug("summarizer: codex rollout not found sid=%s", session_id)
             return
-        scan = _scan_codex_rollout(rollout)
+        scan = _scan_codex_rollout(rollout, session_id)
         msgs = scan["user_messages"]
         full_count = len(msgs)
 
