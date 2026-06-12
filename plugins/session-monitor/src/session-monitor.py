@@ -1202,7 +1202,11 @@ class InstanceTracker:
         if state_data.get("lastSignalSource") == "desktop_session":
             return 0.0
         observed = 0.0
-        for key in ("rolloutMtime", "lastSignalAt", "updatedAt", "threadUpdatedAt"):
+        if state_data.get("lastSignalSource") == "rollout":
+            keys = ("rolloutMtime", "updatedAt", "threadUpdatedAt")
+        else:
+            keys = ("lastSignalAt", "updatedAt", "threadUpdatedAt", "rolloutMtime")
+        for key in keys:
             try:
                 value = float(state_data.get(key) or 0)
             except (TypeError, ValueError):

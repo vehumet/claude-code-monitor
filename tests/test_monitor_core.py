@@ -1847,6 +1847,14 @@ class MonitorCoreTests(unittest.TestCase):
 
                 self.assertNotIn(pid, tracker.instances)
 
+                repaired_state_payload = dict(old_state_payload)
+                repaired_state_payload["lastSignalAt"] = int(mod.time.time()) + 10
+                session_path.write_text(json.dumps(session_payload), encoding="utf-8")
+                state_path.write_text(json.dumps(repaired_state_payload), encoding="utf-8")
+                tracker.poll()
+
+                self.assertNotIn(pid, tracker.instances)
+
                 fresh_state_payload = dict(old_state_payload)
                 fresh_state_payload["state"] = "working"
                 fresh_state_payload["updatedAt"] = int(mod.time.time()) + 10
