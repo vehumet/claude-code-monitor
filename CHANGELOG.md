@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.29] - 2026-06-13
+
+### Fixed
+
+- Prevent dismissed Codex rollout rows from immediately reappearing just because the poller repaired their runtime files.
+
 ## [0.0.28] - 2026-06-11
 
 ### Fixed
