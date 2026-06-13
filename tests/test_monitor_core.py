@@ -2082,9 +2082,26 @@ class MonitorCoreTests(unittest.TestCase):
                 os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
                 mod = load_module(MONITOR, "session_monitor_startup_filter_old_codex")
                 mod.poll_codex_rollouts = None
+                now = int(mod.time.time())
+                old_at = now - 3600
+                (state_dir / f"{pid}.json").write_text(
+                    json.dumps({
+                        "pid": pid,
+                        "sessionId": sid,
+                        "state": "done",
+                        "cwd": cwd,
+                        "updatedAt": old_at,
+                        "provider": "codex",
+                        "lastSignalSource": "rollout",
+                        "rolloutMtime": old_at,
+                        "codexSurface": "app",
+                    }),
+                    encoding="utf-8",
+                )
 
                 tracker = mod.InstanceTracker()
-                tracker.started_at = 200.0
+                tracker.started_at = float(now)
+                tracker._app_done_ttl_s = 1800
                 tracker.poll()
 
                 self.assertNotIn(pid, tracker.instances)
@@ -2144,13 +2161,30 @@ class MonitorCoreTests(unittest.TestCase):
                 os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
                 mod = load_module(MONITOR, "session_monitor_startup_filter_fresh_codex")
                 mod.poll_codex_rollouts = None
+                now = int(mod.time.time())
+                recent_at = now - 60
+                (state_dir / f"{pid}.json").write_text(
+                    json.dumps({
+                        "pid": pid,
+                        "sessionId": sid,
+                        "state": "done",
+                        "cwd": cwd,
+                        "updatedAt": recent_at,
+                        "provider": "codex",
+                        "lastSignalSource": "rollout",
+                        "rolloutMtime": recent_at,
+                        "codexSurface": "app",
+                    }),
+                    encoding="utf-8",
+                )
 
                 tracker = mod.InstanceTracker()
-                tracker.started_at = 200.0
+                tracker.started_at = float(now)
+                tracker._app_done_ttl_s = 1800
                 tracker.poll()
 
                 self.assertIn(pid, tracker.instances)
-                self.assertEqual(tracker.instances[pid].state, "working")
+                self.assertEqual(tracker.instances[pid].state, "done")
             finally:
                 if old_state_dir is None:
                     os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
@@ -2322,6 +2356,46 @@ class MonitorCoreTests(unittest.TestCase):
             },
             now=2000,
         ))
+
+    def test_startup_cutoff_passed_to_codex_poller_uses_ttl_window(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_poller_ttl_cutoff")
+                captured = []
+
+                def fake_poll(_known, _cache, _sessions, _state, started_after=0):
+                    captured.append(started_after)
+
+                mod.poll_codex_rollouts = fake_poll
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                tracker.started_at = 1000.0
+                tracker._app_done_ttl_s = 300.0
+                tracker.poll()
+
+                self.assertEqual(captured, [700.0])
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
 
     def test_claude_desktop_sync_skips_sessions_observed_before_startup(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

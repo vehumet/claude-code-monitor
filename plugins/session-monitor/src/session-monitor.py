@@ -1503,7 +1503,8 @@ class InstanceTracker:
         return False
 
     def _is_pre_start_passive_row(self, provider, entrypoint, pid, state_data) -> bool:
-        if not self.started_at:
+        cutoff = self._startup_visibility_cutoff()
+        if not cutoff:
             return False
         passive = (
             is_virtual_id(pid)
@@ -1514,7 +1515,12 @@ class InstanceTracker:
                 and state_data.get("lastSignalSource") == "desktop_session"
             )
         )
-        return passive and self._activity_observed_at(state_data) < self.started_at
+        return passive and self._activity_observed_at(state_data) < cutoff
+
+    def _startup_visibility_cutoff(self) -> float:
+        if not self.started_at or self._app_done_ttl_s <= 0:
+            return 0.0
+        return max(0.0, self.started_at - self._app_done_ttl_s)
 
     def _is_app_done_expired(self, provider, entrypoint, pid, session_id, state_data, now=None) -> bool:
         if self._app_done_ttl_s <= 0:
@@ -1637,7 +1643,11 @@ class InstanceTracker:
         sessions_data = {}
         session_by_pid = {}
         try:
-            sync_claude_desktop_sessions(self.sessions_dir, self.state_dir, self.started_at)
+            sync_claude_desktop_sessions(
+                self.sessions_dir,
+                self.state_dir,
+                self._startup_visibility_cutoff(),
+            )
         except Exception:
             _log.debug("claude desktop session sync failed", exc_info=True)
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
@@ -1659,7 +1669,7 @@ class InstanceTracker:
                     self._codex_rollout_cache,
                     self.sessions_dir,
                     self.state_dir,
-                    started_after=self.started_at,
+                    started_after=self._startup_visibility_cutoff(),
                 )
             except Exception:
                 _log.debug("codex rollout poller failed", exc_info=True)
