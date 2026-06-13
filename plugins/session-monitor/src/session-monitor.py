@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import subprocess
 import sys
 import glob
@@ -203,6 +204,10 @@ def _default_config():
         "blink_seconds": DONE_BLINK_SECONDS,
         "question_clear_grace_ms": 1000,
         "sound_enabled": True,
+        # Optional event -> audio file path map. Supports done, question,
+        # interrupted, and status_restored. File playback is best-effort and
+        # falls back to the built-in beep sequence on failure.
+        "sound_files": {},
         "claude_status_watch_enabled": True,
         "claude_status_check_interval_s": 60,
         "claude_status_watch_ttl_s": 14400,
@@ -1818,9 +1823,7 @@ class MonitorOverlay:
 
     @staticmethod
     def _play_sound(event: str):
-        """Play a short chime in a background thread (non-blocking). Windows only."""
-        if not IS_WINDOWS:
-            return
+        """Play a configured sound file or a short fallback chime."""
         chimes = {
             "done": [(880, 80), (1175, 80), (1397, 120)],      # A5-D6-F6 rising major
             "question": [(1047, 100), (880, 130)],              # C6-A5 descending
@@ -1828,11 +1831,92 @@ class MonitorOverlay:
             "status_restored": [(660, 80), (880, 80), (1175, 140)],
         }
         seq = chimes.get(event)
-        if seq:
+        sound_file = MonitorOverlay._sound_file_for_event(event)
+        if sound_file or (IS_WINDOWS and seq):
             def _play():
+                if sound_file and MonitorOverlay._play_sound_file(sound_file):
+                    return
+                if not IS_WINDOWS or not seq:
+                    return
                 for freq, ms in seq:
                     winsound.Beep(freq, ms)
             threading.Thread(target=_play, daemon=True).start()
+
+    @staticmethod
+    def _sound_file_for_event(event: str) -> str:
+        files = CONFIG.get("sound_files")
+        if not isinstance(files, dict):
+            return ""
+        value = files.get(event)
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        path = os.path.expandvars(os.path.expanduser(value.strip()))
+        return path if os.path.exists(path) else ""
+
+    @staticmethod
+    def _play_sound_file(path: str) -> bool:
+        """Best-effort cross-platform audio playback without extra deps."""
+        if not path:
+            return False
+        try:
+            if IS_WINDOWS:
+                return MonitorOverlay._play_sound_file_windows(path)
+            if sys.platform == "darwin":
+                return MonitorOverlay._run_sound_player(["afplay", path])
+            players = (
+                ("paplay", [path]),
+                ("aplay", [path]),
+                ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", path]),
+                ("mpg123", ["-q", path]),
+                ("mpv", ["--no-video", "--really-quiet", path]),
+                ("cvlc", ["--play-and-exit", "--intf", "dummy", path]),
+            )
+            for exe, args in players:
+                if MonitorOverlay._run_sound_player([exe, *args]):
+                    return True
+        except Exception:
+            _log.debug("sound file playback failed: %s", path, exc_info=True)
+        return False
+
+    @staticmethod
+    def _play_sound_file_windows(path: str) -> bool:
+        if not IS_WINDOWS:
+            return False
+        alias = (
+            f"session_monitor_sound_{os.getpid()}_"
+            f"{threading.get_ident()}_{int(time.time() * 1000)}"
+        )
+        winmm = ctypes.windll.winmm
+
+        def mci(command: str) -> int:
+            return int(winmm.mciSendStringW(command, None, 0, None))
+
+        quoted = path.replace('"', '')
+        ext = os.path.splitext(path)[1].lower()
+        type_arg = " type mpegvideo" if ext in (".mp3", ".mpeg", ".mpg") else ""
+        if mci(f'open "{quoted}"{type_arg} alias {alias}') != 0:
+            return False
+        try:
+            return mci(f"play {alias} wait") == 0
+        finally:
+            mci(f"close {alias}")
+
+    @staticmethod
+    def _run_sound_player(cmd: list[str]) -> bool:
+        exe = shutil.which(cmd[0])
+        if not exe:
+            return False
+        try:
+            result = subprocess.run(
+                [exe, *cmd[1:]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
 
     def _blink_loop(self):
         try:

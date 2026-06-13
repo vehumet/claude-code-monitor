@@ -59,6 +59,99 @@ class MonitorCoreTests(unittest.TestCase):
 
         self.assertEqual(defaults["poll_interval_ms"], 1000)
         self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
+        self.assertEqual(defaults["sound_files"], {})
+
+    def test_monitor_sound_files_config_resolves_existing_path(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            sound = home / "done.mp3"
+            sound.write_text("", encoding="utf-8")
+            cfg_dir = runtime_dir(home)
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.json").write_text(
+                json.dumps({"sound_files": {"done": str(sound)}}),
+                encoding="utf-8",
+            )
+            old_home = os.environ.get("HOME")
+            old_userprofile = os.environ.get("USERPROFILE")
+            try:
+                os.environ["HOME"] = td
+                os.environ["USERPROFILE"] = td
+                mod = load_module(MONITOR, "session_monitor_sound_files_config")
+
+                self.assertEqual(mod.MonitorOverlay._sound_file_for_event("done"), str(sound))
+                self.assertEqual(mod.MonitorOverlay._sound_file_for_event("question"), "")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_userprofile is None:
+                    os.environ.pop("USERPROFILE", None)
+                else:
+                    os.environ["USERPROFILE"] = old_userprofile
+
+    def test_monitor_sound_file_uses_afplay_on_macos(self):
+        mod = load_module(MONITOR, "session_monitor_sound_file_macos")
+        calls = []
+
+        class Result:
+            returncode = 0
+
+        old_is_windows = mod.IS_WINDOWS
+        old_platform = mod.sys.platform
+        old_which = mod.shutil.which
+        old_run = mod.subprocess.run
+        try:
+            mod.IS_WINDOWS = False
+            mod.sys.platform = "darwin"
+            mod.shutil.which = lambda exe: "/usr/bin/afplay" if exe == "afplay" else None
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(cmd)
+                return Result()
+
+            mod.subprocess.run = fake_run
+
+            self.assertTrue(mod.MonitorOverlay._play_sound_file("/tmp/done.mp3"))
+        finally:
+            mod.IS_WINDOWS = old_is_windows
+            mod.sys.platform = old_platform
+            mod.shutil.which = old_which
+            mod.subprocess.run = old_run
+
+        self.assertEqual(calls, [["/usr/bin/afplay", "/tmp/done.mp3"]])
+
+    def test_monitor_sound_file_uses_available_linux_player(self):
+        mod = load_module(MONITOR, "session_monitor_sound_file_linux")
+        calls = []
+
+        class Result:
+            returncode = 0
+
+        old_is_windows = mod.IS_WINDOWS
+        old_platform = mod.sys.platform
+        old_which = mod.shutil.which
+        old_run = mod.subprocess.run
+        try:
+            mod.IS_WINDOWS = False
+            mod.sys.platform = "linux"
+            mod.shutil.which = lambda exe: f"/usr/bin/{exe}" if exe == "mpg123" else None
+
+            def fake_run(cmd, **_kwargs):
+                calls.append(cmd)
+                return Result()
+
+            mod.subprocess.run = fake_run
+
+            self.assertTrue(mod.MonitorOverlay._play_sound_file("/tmp/done.mp3"))
+        finally:
+            mod.IS_WINDOWS = old_is_windows
+            mod.sys.platform = old_platform
+            mod.shutil.which = old_which
+            mod.subprocess.run = old_run
+
+        self.assertEqual(calls, [["/usr/bin/mpg123", "-q", "/tmp/done.mp3"]])
 
     def test_claude_desktop_rows_use_distinct_marker(self):
         mod = load_module(MONITOR, "session_monitor_claude_desktop_marker")
