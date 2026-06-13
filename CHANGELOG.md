@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.30] - 2026-06-14
+
+### Added
+
+- Add configurable sound files for monitor events, including custom `done`, `question`, `interrupted`, and `status_restored` sounds.
+- Add a disabled-by-default Windows hotkey that focuses the most recently completed visible session.
+- Add Korean README documentation alongside the English default README.
+
+### Changed
+
+- Auto-hide completed app-backed Claude/Codex rows after a configurable TTL while keeping recent rows visible on startup.
+- Use bold `C`/`G` letter markers for Claude/Codex provider identity instead of small geometric glyphs.
+- Generate Codex row labels as short chat-list titles with JSON `title` output for more task-name-like labels.
+- Refresh README structure and support tables around Claude and Codex as first-class monitor targets.
+
+### Fixed
+
+- Persist each session's completion time so the latest-completed hotkey does not prefer old rows just because their state file refreshed later.
+- Keep dismissed Codex rollout rows hidden until a genuinely newer turn or rollout update arrives.
+
 ## [0.0.29] - 2026-06-13
 
 ### Fixed
