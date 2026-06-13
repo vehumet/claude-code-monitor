@@ -1198,6 +1198,135 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(state["interruptHookEvent"], "StopFailure")
             self.assertIsInstance(state["interruptAt"], int)
 
+    def test_done_state_records_completed_at_once(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "done-session",
+                    "cwd": cwd,
+                }),
+                encoding="utf-8",
+            )
+            state_path = state_dir / f"{real_pid}.json"
+            state_path.write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "provider": "claude",
+                    "updatedAt": 100,
+                    "completedAt": 111,
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_done_completed_at")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (real_pid, "python.exe"),
+                real_pid: (1, "claude.exe"),
+                1: (0, "cmd.exe"),
+            }
+            old_time = mod.time.time
+            mod.time.time = lambda: 222
+
+            payload = json.dumps({
+                "session_id": "done-session",
+                "cwd": cwd,
+                "hook_event_name": "Stop",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "claude", "done"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+                mod.time.time = old_time
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["updatedAt"], 222)
+            self.assertEqual(state["completedAt"], 111)
+
+    def test_done_state_backfills_missing_completed_at(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir.mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "done-session",
+                    "cwd": cwd,
+                }),
+                encoding="utf-8",
+            )
+            state_path = state_dir / f"{real_pid}.json"
+            state_path.write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "provider": "claude",
+                    "slot": 3,
+                    "updatedAt": 100,
+                }),
+                encoding="utf-8",
+            )
+
+            mod = load_module(WRITE_STATE, "write_state_done_completed_at_backfill")
+            py_pid = 5252
+            mod.os.getpid = lambda: py_pid
+            mod._build_process_tree = lambda: {
+                py_pid: (real_pid, "python.exe"),
+                real_pid: (1, "claude.exe"),
+                1: (0, "cmd.exe"),
+            }
+            old_time = mod.time.time
+            mod.time.time = lambda: 222
+
+            payload = json.dumps({
+                "session_id": "done-session",
+                "cwd": cwd,
+                "hook_event_name": "Stop",
+            }).encode("utf-8")
+            old_argv = mod.sys.argv
+            old_stdin = mod.sys.stdin
+            try:
+                mod.sys.argv = ["write-state.py", "--provider", "claude", "done"]
+                mod.sys.stdin = _FakeStdin(payload)
+                mod.main()
+            finally:
+                mod.sys.argv = old_argv
+                mod.sys.stdin = old_stdin
+                mod.time.time = old_time
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["slot"], 3)
+            self.assertEqual(state["updatedAt"], 222)
+            self.assertEqual(state["completedAt"], 222)
+
     def test_monitor_overlays_waiting_session_as_question(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -1802,6 +1931,51 @@ class MonitorCoreTests(unittest.TestCase):
                 else:
                     os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
 
+    def test_tracker_restores_completed_at_from_state_file(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            cwd = str(home / "project")
+            (sessions_dir / f"{real_pid}.json").write_text(
+                json.dumps({"pid": real_pid, "sessionId": "sid", "cwd": cwd}),
+                encoding="utf-8",
+            )
+            (state_dir / f"{real_pid}.json").write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "updatedAt": 1000,
+                    "completedAt": 123,
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                mod = load_module(MONITOR, "session_monitor_restore_completed_at")
+                mod.poll_codex_rollouts = None
+                mod.is_claude_pid_alive = lambda _pid: True
+
+                tracker = mod.InstanceTracker()
+                tracker.poll()
+
+                self.assertEqual(tracker.instances[real_pid].updated_at, 1000)
+                self.assertEqual(tracker.instances[real_pid].completed_at, 123)
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+
     def test_working_timestamp_refresh_does_not_request_redraw(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             home = Path(td)
@@ -2068,8 +2242,8 @@ class MonitorCoreTests(unittest.TestCase):
             sessions_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
 
-            pid = "codex-old-session"
-            sid = "old-session"
+            sid = "019e27ec-b184-7192-b398-ef2d33000d02"
+            pid = f"codex-{sid}"
             cwd = str(home / "project")
             (sessions_dir / f"{pid}.json").write_text(
                 json.dumps({
@@ -2788,6 +2962,33 @@ class MonitorCoreTests(unittest.TestCase):
                 mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting, latest),
                 "working",
             )
+
+    def test_rollout_completed_at_uses_task_complete_timestamp(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({
+                        "timestamp": "2026-06-14T01:02:03Z",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete"},
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_completed_at")
+
+            started, terminal, failed, waiting, latest, completed_at = mod._scan_activity(
+                str(rollout), include_latest=True, include_completed_at=True
+            )
+
+            self.assertEqual(started, 1)
+            self.assertEqual(terminal, 1)
+            self.assertFalse(failed)
+            self.assertFalse(waiting)
+            self.assertEqual(latest, "completed")
+            self.assertEqual(completed_at, 1781398923)
 
     def test_pidless_codex_row_uses_cwd_focus_fallback(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_focus")

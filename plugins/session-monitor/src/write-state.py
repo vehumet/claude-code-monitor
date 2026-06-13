@@ -254,6 +254,7 @@ def _mark_codex_hooked_session(session_id):
 _PRESERVED_FIELDS = (
     "slot", "summary", "summarySource",
     "summaryAt", "summaryMsgCount", "summarySessionId",
+    "completedAt",
 )
 _SUMMARY_FIELDS = {
     "summary",
@@ -1904,12 +1905,14 @@ def main():
         has_slot = isinstance(existing.get("slot"), int)
         same_provider = existing.get("provider") == provider
         needs_question_snapshot = state == "question" and not existing.get("questionAt")
+        needs_completed_at = state == "done" and not existing.get("completedAt")
         if (
             wezterm_info == existing_wt
             and has_slot
             and same_provider
             and not is_user_prompt
             and not needs_question_snapshot
+            and not needs_completed_at
         ):
             _log.debug("=> State unchanged (%s), skipping write", state)
             return
@@ -1931,6 +1934,12 @@ def main():
         "lastSignalSource": "hook",
         "lastSignalAt": now,
     }
+    if state == "done":
+        state_data["completedAt"] = (
+            existing.get("completedAt")
+            if existing and existing.get("state") == "done" and existing.get("completedAt")
+            else now
+        )
     if state == "interrupted":
         hook_event = hook_data.get("hook_event_name") or ""
         if provider == "claude" and (requested_state == "interrupted" or hook_event == "StopFailure"):
@@ -1952,6 +1961,8 @@ def main():
     # Preserve slot/summary across writes; assign slot on first sight
     for k in _PRESERVED_FIELDS:
         if existing and k in existing:
+            if k == "completedAt" and not (state == "done" and existing.get("state") == "done"):
+                continue
             if session_rollover and k in _SUMMARY_FIELDS:
                 continue
             if (

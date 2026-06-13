@@ -1784,6 +1784,7 @@ class InstanceTracker:
                 saved_provider = st.get("provider", "claude")
                 saved_interrupt_source = st.get("interruptSource", "") or ""
                 saved_interrupt_at = int(st.get("interruptAt", 0) or 0)
+                saved_completed_at = int(st.get("completedAt", 0) or 0)
                 saved_codex_source = st.get("codexSource", "") or ""
                 saved_codex_originator = st.get("codexOriginator", "") or ""
                 saved_codex_surface = st.get("codexSurface", "") or ""
@@ -1863,6 +1864,12 @@ class InstanceTracker:
                 if saved_interrupt_at != inst.interrupt_at:
                     inst.interrupt_at = saved_interrupt_at
                     changed = True
+                desired_completed_at = saved_completed_at if state == "done" else 0
+                if state == "done" and not desired_completed_at:
+                    desired_completed_at = inst.completed_at or updated_at or 0
+                if desired_completed_at != inst.completed_at:
+                    inst.completed_at = desired_completed_at
+                    changed = True
                 if saved_codex_source != inst.codex_source:
                     inst.codex_source = saved_codex_source
                     changed = True
@@ -1894,7 +1901,7 @@ class InstanceTracker:
                         inst.state_changed_at = updated_at or int(time.time())
                     if state == "done" and (old_state != "done" or terminal_refreshed):
                         if old_state != "done":
-                            inst.completed_at = updated_at or int(time.time())
+                            inst.completed_at = saved_completed_at or updated_at or int(time.time())
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")

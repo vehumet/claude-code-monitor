@@ -23,6 +23,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from datetime import datetime
 
 # Cap the rollout walk: rollouts older than 24h are unlikely to be active
 # and parsing them every tick is pure overhead.
@@ -186,6 +187,28 @@ def _payload_session_id(record):
     return payload.get("id")
 
 
+def _record_time(record):
+    """Return a rollout record timestamp in unix seconds, or 0."""
+    if not isinstance(record, dict):
+        return 0
+    value = record.get("timestamp")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        for key in ("completed_at", "finished_at", "updated_at"):
+            try:
+                return int(float(payload.get(key) or 0))
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
 def _is_target_session(current_session_id, target_session_id):
     return not target_session_id or current_session_id is None or current_session_id == target_session_id
 
@@ -236,7 +259,7 @@ def _scan_turn_markers(path, session_id=None):
     return started, terminal, latest_marker == "failed"
 
 
-def _scan_activity(path, session_id=None, include_latest=False):
+def _scan_activity(path, session_id=None, include_latest=False, include_completed_at=False):
     """Return turn markers plus whether Codex is awaiting user input.
 
     Codex's in-chat questions are emitted as a ``request_user_input`` tool call,
@@ -246,6 +269,7 @@ def _scan_activity(path, session_id=None, include_latest=False):
     started = 0
     terminal = 0
     latest_marker = None
+    completed_at = 0
     pending_questions = set()
     current_session_id = None
     try:
@@ -275,6 +299,7 @@ def _scan_activity(path, session_id=None, include_latest=False):
                     elif pt in _COMPLETE_TYPES:
                         terminal += 1
                         latest_marker = "completed"
+                        completed_at = _record_time(d) or completed_at
                     elif pt in _FAIL_TYPES:
                         terminal += 1
                         latest_marker = "failed"
@@ -291,9 +316,17 @@ def _scan_activity(path, session_id=None, include_latest=False):
                         pending_questions.discard(call_id)
     except OSError:
         result = (0, 0, False, False)
-        return result + (None,) if include_latest else result
+        if include_latest:
+            result = result + (None,)
+        if include_completed_at:
+            result = result + (0,)
+        return result
     result = (started, terminal, latest_marker == "failed", bool(pending_questions))
-    return result + (latest_marker,) if include_latest else result
+    if include_latest:
+        result = result + (latest_marker,)
+    if include_completed_at:
+        result = result + (completed_at,)
+    return result
 
 
 def _infer_state(mtime, started, completed, failed, waiting_for_user=False, latest_marker=None):
@@ -523,6 +556,7 @@ def _allocate_slot(state_dir, my_id, my_cwd):
 _PRESERVED_STATE_FIELDS = (
     "slot", "summary", "summarySource",
     "summaryAt", "summaryMsgCount", "summarySessionId",
+    "completedAt",
 )
 
 
@@ -655,6 +689,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
             failed = cached["failed"]
             waiting = cached.get("waiting", False)
             latest_marker = cached.get("latest_marker")
+            completed_at = cached.get("completed_at", 0)
             source = cached.get("source", "")
             originator = cached.get("originator", "")
         else:
@@ -666,8 +701,8 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                     sessions_dir, state_dir,
                 )
                 continue
-            started, completed, failed, waiting, latest_marker = _scan_activity(
-                path, session_id, include_latest=True
+            started, completed, failed, waiting, latest_marker, completed_at = _scan_activity(
+                path, session_id, include_latest=True, include_completed_at=True
             )
             prev_cache[path] = {
                 "mtime": mtime,
@@ -678,6 +713,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                 "failed": failed,
                 "waiting": waiting,
                 "latest_marker": latest_marker,
+                "completed_at": completed_at,
                 "source": source,
                 "originator": originator,
             }
@@ -755,6 +791,10 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
         for k in _PRESERVED_STATE_FIELDS:
             if k in existing:
                 new_state[k] = existing[k]
+        if state == "done":
+            new_state["completedAt"] = int(completed_at or new_state.get("completedAt") or activity_time)
+        else:
+            new_state.pop("completedAt", None)
         if title and not new_state.get("summary"):
             new_state["summary"] = _trim_summary(title)
             new_state["summarySource"] = "trim"
@@ -779,6 +819,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                 or state_existing.get("codexTitle") != title
                 or state_existing.get("codexSurface") != surface
                 or state_existing.get("threadUpdatedAt") != thread_updated_at
+                or state_existing.get("completedAt") != new_state.get("completedAt")
             ):
                 _atomic_write_json(state_path, new_state)
             continue
