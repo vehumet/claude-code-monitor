@@ -724,26 +724,33 @@ _HAIKU_PROMPT_EN = (
 
 _CODEX_SUMMARY_PROMPT_KO = (
     "아래는 Codex 세션의 압축 digest야. "
-    "사용자가 지금 실제로 맡긴 작업을 한국어 명사구 {n}자 이내로 요약해. "
+    "이 세션을 채팅 목록에 표시할 짧은 제목을 만들어. "
+    "사용자가 지금 실제로 맡긴 작업을 한국어 명사구 {n}자 이내로 표현해. "
     "띄어쓰기를 생략하지 말고 자연스러운 한국어 띄어쓰기를 유지해. "
-    "도구명이나 '세션', '요약', '작업' 같은 일반어만 쓰지 말고, "
-    "사용자 요청·수정 파일·도구 호출을 근거로 구체적인 주제를 골라. "
-    "예: '코덱스 요약 개선', '로컬라이제이션 검토', '훅 설치 정리'. "
-    "따옴표·접두사·마크다운 없이 한 줄만 출력."
+    "첫 요청보다 최근 사용자가 원하는 목표와 최종 변경 내용을 우선해. "
+    "'세션', '요약', '작업', 도구명 같은 일반어만 쓰지 말고 구체적인 주제를 골라. "
+    "설명문이 아니라 작업명처럼 써. "
+    "좋은 예: 'Codex 앱 모니터링 조사', 'Provider 표시 개선', 'README 다국어 정리'. "
+    "나쁜 예: '세션 요약', '작업 완료', '파일 수정'. "
+    "JSON 한 줄만 출력: {{\"title\":\"제목\"}}"
     "\n\nDigest:\n{transcript}"
 )
 
 _CODEX_SUMMARY_PROMPT_EN = (
     "Below is a compact digest from a Codex session. "
-    "Summarize the concrete task the user is working on in the same language "
-    "as the dominant user request when practical, as a short noun phrase, "
+    "Create a short chat-list title for this session. "
+    "Name the concrete task the user is working on in the same language "
+    "as the dominant user request when practical. Use a short noun phrase, "
     "max {words} words and under {n} characters. "
     "Keep natural spacing between words; do not remove spaces to satisfy "
     "the character limit. "
+    "Prefer the user's recent goal and final changes over the first request. "
     "Do not answer with generic labels such as 'session summary', 'task summary', "
-    "or tool names alone. Use the user request, edited files, and tool calls "
-    "to name the actual work. "
-    "Output plain text only: no quotes, prefixes, punctuation, or markdown."
+    "'work completed', or tool names alone. "
+    "Write it like a task name, not a descriptive sentence. "
+    "Good examples: 'Codex app monitoring survey', 'Provider marker update', "
+    "'Bilingual README cleanup'. "
+    "Output exactly one JSON object on one line: {{\"title\":\"Title\"}}"
     "\n\nDigest:\n{transcript}"
 )
 
@@ -756,6 +763,31 @@ def _strip_markdown(text):
     if not text:
         return text
     return _MARKDOWN_MARKERS_RE.sub("", text).strip()
+
+
+def _extract_codex_title_output(text):
+    """Extract a title from Codex's title-generation response."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+            raw = "\n".join(lines[1:-1]).strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("title"), str):
+            return _strip_markdown(data["title"]).strip().strip('"').strip("'").strip()
+    except ValueError:
+        pass
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("title:"):
+            line = line.split(":", 1)[1].strip()
+        return _strip_markdown(line).strip().strip('"').strip("'").strip()
+    return ""
 
 
 def _find_codex_rollout(session_id):
@@ -1284,11 +1316,7 @@ def _call_codex_summary(transcript):
         return None
     _cleanup()
 
-    out = out.strip()
-    if not out:
-        return None
-    out = out.splitlines()[0].strip().strip('"').strip("'").strip()
-    out = _strip_markdown(out)
+    out = _extract_codex_title_output(out)
     return out or None
 
 

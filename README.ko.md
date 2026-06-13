@@ -48,24 +48,24 @@ Claude Code와 Codex 세션을 위한 always-on-top 오버레이 위젯입니다
 | 기타 터미널 | best-effort | 일반 process/window matching | 가능성이 높은 창을 앞으로 올림 | 정확도는 창 제목과 process ownership에 따라 달라집니다. |
 | macOS/Linux | 부분 지원 | hooks와 rollout 파일은 동작 | window focus, hotkey, sound는 제한적 | 이 프로젝트는 주로 Windows에서 개발 및 테스트합니다. |
 
-## 요약 생성 방식
+## 행 제목 생성 방식
 
-각 행의 주제 라벨은 자동 생성됩니다.
+각 행의 주제 라벨은 짧은 채팅 목록 제목 형태로 자동 생성됩니다.
 
 - 트리거: Stop hook으로 세션이 idle 상태가 될 때
 - 실행 방식: detached background process로 실행되어 대화 중인 세션을 막지 않음
 - 비용: 일반 CLI 호출처럼 Claude 또는 Codex 사용량을 소비하며 각 provider의 가장 저렴한 tier 사용
-- 언어: OS locale을 따름. 한국어 시스템은 한국어, 그 외는 영어. Codex 요약은 주요 사용자 요청 언어도 따르려 함
+- 언어: OS locale을 따름. 한국어 시스템은 한국어, 그 외는 영어. Codex 제목은 주요 사용자 요청 언어도 따르려 함
 - Debounce: 세션별 5분 cooldown
 
 | Provider | Source | Summarizer | 비고 |
 |---|---|---|---|
 | Claude | Session JSONL | `claude -p --model claude-haiku-4-5` | 신호 우선순위: ai-title, `/rename` slug, away_summary recap, 첫 사용자 메시지 |
-| Codex | Rollout JSONL에서 만든 제한된 digest | `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini` | Digest에는 최근 사용자 요청, assistant 진행, final answer, tool call, 변경 파일, plan update가 포함됩니다. |
+| Codex | Rollout JSONL에서 만든 제한된 digest | `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini` | 최근 사용자 요청, assistant 진행, final answer, tool call, 변경 파일, plan update를 바탕으로 JSON `title`을 생성합니다. |
 
-Codex 요약 안전장치:
+Codex 제목 생성 안전장치:
 
-- `--ephemeral`: 요약 호출이 새 rollout을 만들지 않게 합니다.
+- `--ephemeral`: 제목 생성 호출이 새 rollout을 만들지 않게 합니다.
 - `--ignore-user-config`: monitor hook이 재귀 실행되는 것을 막습니다.
 - 모델 override: `SESSION_MONITOR_CODEX_SUMMARY_MODEL` 또는 `~/.local/share/session-monitor/config.json`의 `codex_summary_model`
 

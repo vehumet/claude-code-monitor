@@ -799,7 +799,27 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertIn("dominant user request", mod._CODEX_SUMMARY_PROMPT_EN)
         self.assertIn("same language", mod._CODEX_SUMMARY_PROMPT_EN)
         self.assertIn("natural spacing", mod._CODEX_SUMMARY_PROMPT_EN)
+        self.assertIn('{"title":"Title"}', mod._CODEX_SUMMARY_PROMPT_EN)
+        self.assertIn("chat-list title", mod._CODEX_SUMMARY_PROMPT_EN)
         self.assertIn("띄어쓰기", mod._CODEX_SUMMARY_PROMPT_KO)
+        self.assertIn('{"title":"제목"}', mod._CODEX_SUMMARY_PROMPT_KO)
+        self.assertIn("채팅 목록", mod._CODEX_SUMMARY_PROMPT_KO)
+
+    def test_extract_codex_title_output_accepts_json_title(self):
+        mod = load_module(WRITE_STATE, "write_state_codex_title_output")
+
+        self.assertEqual(
+            mod._extract_codex_title_output('{"title":"Codex 앱 모니터링 조사"}'),
+            "Codex 앱 모니터링 조사",
+        )
+        self.assertEqual(
+            mod._extract_codex_title_output("```json\n{\"title\":\"Provider 표시 개선\"}\n```"),
+            "Provider 표시 개선",
+        )
+        self.assertEqual(
+            mod._extract_codex_title_output("Title: Bilingual README cleanup"),
+            "Bilingual README cleanup",
+        )
 
     def test_start_monitor_default_path_is_next_to_launcher(self):
         mod = load_module(START_MONITOR, "start_monitor_default_path")

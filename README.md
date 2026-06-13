@@ -48,24 +48,24 @@ Each row is one Claude Code or Codex session.
 | Other terminals | Best-effort | Generic process/window matching | Raises a likely matching window | Precision depends on window titles and process ownership. |
 | macOS/Linux | Partial | Hooks and rollout files work | Window focus, hotkey, and sound are limited | The project is developed and tested primarily on Windows. |
 
-## How the summary is generated
+## How the row title is generated
 
-The topic label in each row is generated automatically.
+The topic label in each row is generated automatically as a short chat-list title.
 
 - Trigger: session goes idle through a Stop hook.
 - Execution: detached background process, so it does not block your interactive session.
 - Cost: consumes Claude or Codex usage like any other CLI invocation, using the cheapest configured tier for each provider.
-- Language: follows the OS locale, Korean on Korean systems and English otherwise. Codex summaries also try to follow the dominant user request language.
+- Language: follows the OS locale, Korean on Korean systems and English otherwise. Codex titles also try to follow the dominant user request language.
 - Debounce: 5-minute cooldown per session.
 
 | Provider | Source | Summarizer | Notes |
 |---|---|---|---|
 | Claude | Session JSONL | `claude -p --model claude-haiku-4-5` | Signal priority: ai-title, `/rename` slug, away_summary recap, first user messages. |
-| Codex | Bounded digest from rollout JSONL | `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini` | Digest includes recent user requests, assistant progress, final answers, tool calls, touched files, and plan updates. |
+| Codex | Bounded digest from rollout JSONL | `codex exec --ephemeral --ignore-user-config -m gpt-5.4-mini` | Generates a JSON `title` from recent user requests, assistant progress, final answers, tool calls, touched files, and plan updates. |
 
-Codex summary safeguards:
+Codex title-generation safeguards:
 
-- `--ephemeral`: prevents the summary call from writing a new rollout.
+- `--ephemeral`: prevents the title-generation call from writing a new rollout.
 - `--ignore-user-config`: prevents monitor hooks from firing recursively.
 - Model override: `SESSION_MONITOR_CODEX_SUMMARY_MODEL` or `codex_summary_model` in `~/.local/share/session-monitor/config.json`.
 
