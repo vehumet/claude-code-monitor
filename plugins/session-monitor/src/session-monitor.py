@@ -1366,7 +1366,7 @@ class Instance:
     __slots__ = ("pid", "cwd", "state", "updated_at", "display_name",
                  "blink_on", "done_since", "hwnd", "wezterm",
                  "slot", "summary", "pinned_at", "provider", "session_id",
-                 "state_changed_at", "interrupt_source", "interrupt_at",
+                 "state_changed_at", "completed_at", "interrupt_source", "interrupt_at",
                  "codex_source", "codex_originator", "codex_surface",
                  "entrypoint")
 
@@ -1377,6 +1377,7 @@ class Instance:
         self.state = state
         self.updated_at = updated_at
         self.state_changed_at = updated_at or 0
+        self.completed_at = updated_at if state == "done" else 0
         self.slot = 0
         self.summary = ""
         self.provider = provider
@@ -1892,6 +1893,8 @@ class InstanceTracker:
                     if (state_changed or terminal_refreshed) and state != "working":
                         inst.state_changed_at = updated_at or int(time.time())
                     if state == "done" and (old_state != "done" or terminal_refreshed):
+                        if old_state != "done":
+                            inst.completed_at = updated_at or int(time.time())
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")
@@ -1900,14 +1903,17 @@ class InstanceTracker:
                         if is_virtual_id(pid) and _should_spawn_codex_summary(st):
                             _spawn_codex_summary(pid)
                     elif state == "interrupted" and old_state != "interrupted":
+                        inst.completed_at = 0
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("interrupted")
                     elif state == "question" and old_state != "question":
                         inst.blink_on = True
+                        inst.completed_at = 0
                         inst.done_since = 0.0
                         events.append("question")
                     elif state not in ("done", "interrupted"):
+                        inst.completed_at = 0
                         inst.done_since = 0.0
                     if state_changed or terminal_refreshed:
                         changed = True
@@ -2644,7 +2650,7 @@ class MonitorOverlay:
         candidates = [inst for inst in instances if inst.state == "done"]
         if not candidates:
             return None
-        return max(candidates, key=lambda i: (i.state_changed_at or i.updated_at or 0, str(i.pid)))
+        return max(candidates, key=lambda i: (i.completed_at or i.updated_at or 0, str(i.pid)))
 
     def _activate_latest_done_session(self, clear_highlight=True):
         inst = self._latest_done_instance(self.tracker.instances.values())

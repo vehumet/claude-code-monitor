@@ -1576,6 +1576,8 @@ class MonitorCoreTests(unittest.TestCase):
         older.state_changed_at = 400
         newer.state_changed_at = 500
         working.state_changed_at = 600
+        older.completed_at = 400
+        newer.completed_at = 500
 
         self.assertEqual(
             mod.MonitorOverlay._latest_done_instance([older, newer, working]),
@@ -1583,12 +1585,28 @@ class MonitorCoreTests(unittest.TestCase):
         )
         self.assertIsNone(mod.MonitorOverlay._latest_done_instance([working]))
 
+    def test_latest_done_instance_uses_completed_time_not_refresh_time(self):
+        mod = load_module(MONITOR, "session_monitor_latest_done_completion_time")
+        old_refreshed = mod.Instance(1, "C:\\a", state="done", updated_at=1000, session_id="old")
+        newer_done = mod.Instance(2, "C:\\b", state="done", updated_at=900, session_id="new")
+        old_refreshed.completed_at = 100
+        old_refreshed.state_changed_at = 1000
+        newer_done.completed_at = 900
+        newer_done.state_changed_at = 900
+
+        self.assertEqual(
+            mod.MonitorOverlay._latest_done_instance([old_refreshed, newer_done]),
+            newer_done,
+        )
+
     def test_latest_done_hotkey_activates_most_recent_done_session(self):
         mod = load_module(MONITOR, "session_monitor_latest_done_activate")
         older = mod.Instance(1, "C:\\a", state="done", updated_at=100, session_id="older")
         newer = mod.Instance(2, "C:\\b", state="done", updated_at=200, session_id="newer")
         older.state_changed_at = 400
         newer.state_changed_at = 500
+        older.completed_at = 400
+        newer.completed_at = 500
 
         calls = []
 
@@ -1766,6 +1784,7 @@ class MonitorCoreTests(unittest.TestCase):
                 self.assertTrue(changed)
                 self.assertIn("done", events)
                 self.assertEqual(tracker.instances[real_pid].state_changed_at, 100)
+                self.assertEqual(tracker.instances[real_pid].completed_at, 100)
 
                 state_path.write_text(
                     json.dumps({"pid": real_pid, "state": "done", "cwd": cwd, "updatedAt": 200}),
@@ -1776,6 +1795,7 @@ class MonitorCoreTests(unittest.TestCase):
                 self.assertTrue(changed)
                 self.assertIn("done", events)
                 self.assertEqual(tracker.instances[real_pid].state_changed_at, 200)
+                self.assertEqual(tracker.instances[real_pid].completed_at, 100)
             finally:
                 if old_state_dir is None:
                     os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
