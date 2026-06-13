@@ -60,6 +60,7 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(defaults["poll_interval_ms"], 1000)
         self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
         self.assertEqual(defaults["sound_files"], {})
+        self.assertEqual(defaults["app_done_ttl_s"], 1800)
 
     def test_monitor_sound_files_config_resolves_existing_path(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -2090,6 +2091,168 @@ class MonitorCoreTests(unittest.TestCase):
                     os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
                 else:
                     os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_app_done_ttl_hides_expired_codex_app_row_without_deleting_files(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            pid = "codex-expired-app"
+            sid = "expired-app-session"
+            cwd = str(home / "project")
+            session_path = sessions_dir / f"{pid}.json"
+            state_path = state_dir / f"{pid}.json"
+            session_path.write_text(
+                json.dumps({
+                    "pid": pid,
+                    "virtualId": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                    "codexSurface": "app",
+                }),
+                encoding="utf-8",
+            )
+            state_path.write_text(
+                json.dumps({
+                    "pid": pid,
+                    "sessionId": sid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "updatedAt": 100,
+                    "provider": "codex",
+                    "lastSignalSource": "rollout",
+                    "rolloutMtime": 100,
+                    "codexSurface": "app",
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_app_done_ttl_expired")
+                mod.poll_codex_rollouts = None
+
+                tracker = mod.InstanceTracker()
+                tracker.started_at = 0
+                tracker._app_done_ttl_s = 1800
+                tracker.poll()
+
+                self.assertNotIn(pid, tracker.instances)
+                self.assertTrue(session_path.exists())
+                self.assertTrue(state_path.exists())
+
+                fresh_state = json.loads(state_path.read_text(encoding="utf-8"))
+                fresh_state["state"] = "working"
+                fresh_state["updatedAt"] = int(mod.time.time()) + 10
+                fresh_state["rolloutMtime"] = fresh_state["updatedAt"]
+                state_path.write_text(json.dumps(fresh_state), encoding="utf-8")
+                tracker.poll()
+
+                self.assertIn(pid, tracker.instances)
+                self.assertEqual(tracker.instances[pid].state, "working")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_app_done_ttl_zero_keeps_expired_codex_app_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            pid = "codex-unlimited-app"
+            sid = "unlimited-app-session"
+            cwd = str(home / "project")
+            (sessions_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "virtualId": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                    "codexSurface": "app",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "sessionId": sid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "updatedAt": 100,
+                    "provider": "codex",
+                    "lastSignalSource": "rollout",
+                    "rolloutMtime": 100,
+                    "codexSurface": "app",
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_app_done_ttl_zero")
+                mod.poll_codex_rollouts = None
+
+                tracker = mod.InstanceTracker()
+                tracker.started_at = 0
+                tracker._app_done_ttl_s = 0
+                tracker.poll()
+
+                self.assertIn(pid, tracker.instances)
+                self.assertEqual(tracker.instances[pid].state, "done")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_app_done_ttl_does_not_hide_pinned_app_row(self):
+        mod = load_module(MONITOR, "session_monitor_app_done_ttl_pinned")
+        tracker = mod.InstanceTracker()
+        tracker._app_done_ttl_s = 1800
+        tracker.pins = {"pinned-session": 1.0}
+
+        self.assertFalse(tracker._is_app_done_expired(
+            "codex",
+            "",
+            "codex-pinned",
+            "pinned-session",
+            {
+                "state": "done",
+                "provider": "codex",
+                "codexSurface": "app",
+                "lastSignalSource": "rollout",
+                "rolloutMtime": 100,
+            },
+            now=2000,
+        ))
 
     def test_claude_desktop_sync_skips_sessions_observed_before_startup(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

@@ -203,6 +203,9 @@ def _default_config():
         "blink_interval_ms": 600,
         "blink_seconds": DONE_BLINK_SECONDS,
         "question_clear_grace_ms": 1000,
+        # Auto-hide completed app-surface rows after 30 minutes. Terminal
+        # sessions keep using process lifetime instead.
+        "app_done_ttl_s": 1800,
         "sound_enabled": True,
         # Optional event -> audio file path map. Supports done, question,
         # interrupted, and status_restored. File playback is best-effort and
@@ -1205,6 +1208,7 @@ class InstanceTracker:
             0.5,
             float(CONFIG.get("codex_question_check_interval_ms", 2000)) / 1000.0,
         )
+        self._app_done_ttl_s = max(0.0, float(CONFIG.get("app_done_ttl_s", 1800)))
         self._dismissed_keys = {}
         self.pins = self._load_pins()
 
@@ -1253,6 +1257,39 @@ class InstanceTracker:
             observed = max(observed, value)
         return observed
 
+    @staticmethod
+    def _ttl_observed_at(state_data) -> float:
+        if not isinstance(state_data, dict):
+            return 0.0
+        if state_data.get("lastSignalSource") == "rollout":
+            keys = ("rolloutMtime", "updatedAt", "threadUpdatedAt")
+        elif state_data.get("lastSignalSource") == "desktop_session":
+            keys = ("updatedAt", "threadUpdatedAt")
+        else:
+            keys = ("lastSignalAt", "updatedAt", "threadUpdatedAt", "rolloutMtime")
+        observed = 0.0
+        for key in keys:
+            try:
+                value = float(state_data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            observed = max(observed, value)
+        return observed
+
+    @staticmethod
+    def _is_app_passive_row(provider, entrypoint, state_data) -> bool:
+        if provider == "claude":
+            return (
+                entrypoint == "claude-desktop"
+                or (
+                    isinstance(state_data, dict)
+                    and state_data.get("lastSignalSource") == "desktop_session"
+                )
+            )
+        if provider == "codex" and isinstance(state_data, dict):
+            return state_data.get("codexSurface") == "app"
+        return False
+
     def _is_pre_start_passive_row(self, provider, entrypoint, pid, state_data) -> bool:
         if not self.started_at:
             return False
@@ -1266,6 +1303,20 @@ class InstanceTracker:
             )
         )
         return passive and self._activity_observed_at(state_data) < self.started_at
+
+    def _is_app_done_expired(self, provider, entrypoint, pid, session_id, state_data, now=None) -> bool:
+        if self._app_done_ttl_s <= 0:
+            return False
+        if not isinstance(state_data, dict) or state_data.get("state") != "done":
+            return False
+        if not self._is_app_passive_row(provider, entrypoint, state_data):
+            return False
+        if (session_id or str(pid)) in self.pins:
+            return False
+        observed_at = self._ttl_observed_at(state_data)
+        if observed_at <= 0:
+            return False
+        return (now or time.time()) - observed_at >= self._app_done_ttl_s
 
     def _state_observed_at_for_pid(self, pid) -> float:
         try:
@@ -1435,6 +1486,11 @@ class InstanceTracker:
             if self._is_pre_start_passive_row(provider, entrypoint, pid, state_for_pid):
                 self._remove_monitor_files(pid)
                 continue
+            if self._is_app_done_expired(provider, entrypoint, pid, session_id, state_for_pid):
+                if pid in self.instances:
+                    del self.instances[pid]
+                    changed = True
+                continue
 
             if is_virtual_id(pid):
                 # Virtual rows are owned by codex_rollout_poller, which
@@ -1516,6 +1572,11 @@ class InstanceTracker:
             state_entrypoint = (session_data or {}).get("entrypoint", "") or ""
             if self._is_pre_start_passive_row(saved_provider, state_entrypoint, pid, st):
                 self._remove_monitor_files(pid)
+                continue
+            if self._is_app_done_expired(saved_provider, state_entrypoint, pid, state_session_id, st):
+                if pid in self.instances:
+                    del self.instances[pid]
+                    changed = True
                 continue
             if self._is_dismissed(saved_provider, state_session_id, pid, self._dismiss_observed_at(st)):
                 self._remove_monitor_files(pid)
