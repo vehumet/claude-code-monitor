@@ -1299,15 +1299,7 @@ def short_cwd(cwd: str) -> str:
 
 _FOLDER_MAX_CHARS = 9  # 'firstgame' length cap
 
-# Provider glyphs shown in the left marker column so users can tell Claude vs
-# Codex rows at a glance. Filled shapes survive small UI sizes better than
-# hollow outlines.
-# SESSION_MONITOR_ASCII_GLYPH=1 swaps in ASCII fallbacks for terminals/fonts
-# that can't render the geometric shapes cleanly.
-_GLYPH_UNICODE = {"claude": "●", "codex": "◆"}
-_GLYPH_ASCII = {"claude": "[C]", "codex": "[X]"}
-_SURFACE_GLYPH_UNICODE = {("claude", "claude-desktop"): "◉"}
-_SURFACE_GLYPH_ASCII = {("claude", "claude-desktop"): "[D]"}
+_PROVIDER_MARKERS = {"claude": "C", "codex": "G"}
 
 
 def provider_glyph(provider) -> str:
@@ -1320,18 +1312,12 @@ def provider_marker(provider) -> str:
     """Single-character row marker identifying which LLM CLI owns the row."""
     if not provider:
         return ""
-    ascii_glyph = os.environ.get("SESSION_MONITOR_ASCII_GLYPH")
-    table = _GLYPH_ASCII if ascii_glyph == "1" else _GLYPH_UNICODE
-    return table.get(provider, "")
+    return _PROVIDER_MARKERS.get(provider, "")
 
 
 def row_marker(provider, entrypoint="") -> str:
-    """Marker glyph for a row, including known app/desktop surfaces."""
-    if not provider:
-        return ""
-    ascii_glyph = os.environ.get("SESSION_MONITOR_ASCII_GLYPH")
-    table = _SURFACE_GLYPH_ASCII if ascii_glyph == "1" else _SURFACE_GLYPH_UNICODE
-    return table.get((provider, entrypoint), provider_marker(provider))
+    """Marker glyph for a row."""
+    return provider_marker(provider)
 
 
 def slot_glyph(slot) -> str:
@@ -2002,11 +1988,13 @@ class MonitorOverlay:
         try:
             self.font_title = tkfont.Font(family="Segoe UI", size=9, weight="bold")
             self.font_row = tkfont.Font(family="Segoe UI", size=9)
+            self.font_marker = tkfont.Font(family="Segoe UI", size=9, weight="bold")
             self.font_state = tkfont.Font(family="Segoe UI", size=8)
             self.font_empty = tkfont.Font(family="Segoe UI", size=9, slant="italic")
         except Exception:
             self.font_title = tkfont.Font(size=9, weight="bold")
             self.font_row = tkfont.Font(size=9)
+            self.font_marker = tkfont.Font(size=9, weight="bold")
             self.font_state = tkfont.Font(size=8)
             self.font_empty = tkfont.Font(size=9, slant="italic")
 
@@ -2016,8 +2004,8 @@ class MonitorOverlay:
         # CJK width — the same N is passed to write-state.py so Haiku stays
         # within the column.
         self.col_dot_w = max(
-            self.font_row.measure("◆  "),
-            self.font_row.measure("[X] "),
+            self.font_marker.measure("G  "),
+            self.font_marker.measure("C  "),
         )
         # Folder column no longer carries the provider glyph; the left marker
         # column owns provider identity so names stay aligned.
@@ -2561,7 +2549,7 @@ class MonitorOverlay:
 
         cell_h = self.row_height - 2
 
-        dot_glyph = row_marker(inst.provider, inst.entrypoint) or "\u25cf"
+        dot_glyph = row_marker(inst.provider, inst.entrypoint) or "?"
         dot_box = tk.Frame(
             frame, bg=base_bg,
             width=self.col_dot_w, height=cell_h,
@@ -2571,7 +2559,7 @@ class MonitorOverlay:
         dot_box.pack_propagate(False)
         marker_fg = state_color if inst.pinned_at is None else THEME["fg"]
         dot = tk.Label(
-            dot_box, text=dot_glyph, font=self.font_row,
+            dot_box, text=dot_glyph, font=self.font_marker,
             bg=base_bg, fg=marker_fg, cursor="hand2",
         )
         dot.pack(fill=tk.BOTH, expand=True)

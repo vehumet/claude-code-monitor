@@ -14,7 +14,7 @@ Claude Code와 Codex 세션을 위한 always-on-top 오버레이 위젯입니다
 
 각 행은 하나의 Claude Code 또는 Codex 세션입니다.
 
-- Provider 표시: `●` Claude, `◆` Codex
+- Provider 표시: **C** Claude, **G** Codex
 - 상태 색상과 상태 라벨
 - 프로젝트 폴더와 slot 번호
 - 짧은 주제 요약

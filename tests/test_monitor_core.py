@@ -178,12 +178,12 @@ class MonitorCoreTests(unittest.TestCase):
 
         self.assertEqual(calls, [["/usr/bin/mpg123", "-q", "/tmp/done.mp3"]])
 
-    def test_claude_desktop_rows_use_distinct_marker(self):
+    def test_provider_rows_use_letter_markers(self):
         mod = load_module(MONITOR, "session_monitor_claude_desktop_marker")
 
-        self.assertEqual(mod.row_marker("claude"), "●")
-        self.assertEqual(mod.row_marker("claude", "claude-desktop"), "◉")
-        self.assertEqual(mod.row_marker("codex", "claude-desktop"), "◆")
+        self.assertEqual(mod.row_marker("claude"), "C")
+        self.assertEqual(mod.row_marker("claude", "claude-desktop"), "C")
+        self.assertEqual(mod.row_marker("codex", "claude-desktop"), "G")
 
     def test_monitor_background_opacity_defaults_darker(self):
         mod = load_module(MONITOR, "session_monitor_default_opacity")

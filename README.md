@@ -14,7 +14,7 @@ Always-on-top overlay widget for Claude Code and Codex sessions.
 
 Each row is one Claude Code or Codex session.
 
-- Provider marker: `●` Claude, `◆` Codex
+- Provider marker: **C** Claude, **G** Codex
 - State colour and state label
 - Project folder and slot number
 - Short topic summary
