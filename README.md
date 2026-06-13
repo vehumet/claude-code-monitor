@@ -109,6 +109,7 @@ Optional `~/.local/share/session-monitor/config.json`:
   "summary_max_chars": 12,
   "blink_seconds": 10,
   "app_done_ttl_s": 1800,
+  "latest_done_hotkey": "",
   "sound_enabled": true,
   "sound_files": {
     "done": "~/Sounds/done.mp3",
@@ -119,7 +120,7 @@ Optional `~/.local/share/session-monitor/config.json`:
 }
 ```
 
-Language is auto-detected from the OS locale (`ko` on Korean systems, `en` otherwise) — set it explicitly to override. `background_opacity` controls overlay opacity (`1.0` is fully opaque; legacy `opacity` still works). `summary_max_chars` controls both the summary column width and the cap passed to Haiku. `app_done_ttl_s` auto-hides completed app-backed Codex/Claude Desktop rows after that many seconds (`1800` = 30 minutes); set it to `0` for unlimited. `sound_files` maps monitor events (`done`, `question`, `interrupted`, `status_restored`) to audio files; playback is best-effort using the platform's available audio support and falls back to the built-in beep on Windows.
+Language is auto-detected from the OS locale (`ko` on Korean systems, `en` otherwise) — set it explicitly to override. `background_opacity` controls overlay opacity (`1.0` is fully opaque; legacy `opacity` still works). `summary_max_chars` controls both the summary column width and the cap passed to Haiku. `app_done_ttl_s` auto-hides completed app-backed Codex/Claude Desktop rows after that many seconds (`1800` = 30 minutes); set it to `0` for unlimited. `latest_done_hotkey` is disabled by default; on Windows, set a value like `ctrl+alt+space` to focus the most recently completed visible row. `sound_files` maps monitor events (`done`, `question`, `interrupted`, `status_restored`) to audio files; playback is best-effort using the platform's available audio support and falls back to the built-in beep on Windows.
 
 ## Uninstall
 

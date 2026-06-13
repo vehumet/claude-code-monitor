@@ -61,6 +61,30 @@ class MonitorCoreTests(unittest.TestCase):
         self.assertEqual(defaults["codex_question_check_interval_ms"], 2000)
         self.assertEqual(defaults["sound_files"], {})
         self.assertEqual(defaults["app_done_ttl_s"], 1800)
+        self.assertEqual(defaults["latest_done_hotkey"], "")
+
+    def test_parse_latest_done_hotkey_config(self):
+        mod = load_module(MONITOR, "session_monitor_parse_hotkey")
+
+        parsed = mod.parse_hotkey("ctrl+alt+space")
+
+        self.assertIsNotNone(parsed)
+        modifiers, vk = parsed
+        if mod.IS_WINDOWS:
+            self.assertTrue(modifiers & mod.MOD_CONTROL)
+            self.assertTrue(modifiers & mod.MOD_ALT)
+            self.assertTrue(modifiers & mod.MOD_NOREPEAT)
+            self.assertEqual(vk, mod.VK_SPACE)
+        else:
+            self.assertEqual(vk, 0x20)
+        self.assertIsNone(mod.parse_hotkey(""))
+        self.assertIsNone(mod.parse_hotkey("ctrl+alt"))
+        self.assertIsNone(mod.parse_hotkey("ctrl+a+b"))
+        parsed_win = mod.parse_hotkey("win+space")
+        self.assertIsNotNone(parsed_win)
+        if mod.IS_WINDOWS:
+            self.assertTrue(parsed_win[0] & mod.MOD_WIN)
+            self.assertEqual(parsed_win[1], mod.VK_SPACE)
 
     def test_monitor_sound_files_config_resolves_existing_path(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -1544,6 +1568,51 @@ class MonitorCoreTests(unittest.TestCase):
             "older",
         )
 
+    def test_latest_done_instance_uses_most_recent_done_state_change(self):
+        mod = load_module(MONITOR, "session_monitor_latest_done_instance")
+        older = mod.Instance(1, "C:\\a", state="done", updated_at=100, session_id="older")
+        newer = mod.Instance(2, "C:\\b", state="done", updated_at=200, session_id="newer")
+        working = mod.Instance(3, "C:\\c", state="working", updated_at=300, session_id="working")
+        older.state_changed_at = 400
+        newer.state_changed_at = 500
+        working.state_changed_at = 600
+
+        self.assertEqual(
+            mod.MonitorOverlay._latest_done_instance([older, newer, working]),
+            newer,
+        )
+        self.assertIsNone(mod.MonitorOverlay._latest_done_instance([working]))
+
+    def test_latest_done_hotkey_activates_most_recent_done_session(self):
+        mod = load_module(MONITOR, "session_monitor_latest_done_activate")
+        older = mod.Instance(1, "C:\\a", state="done", updated_at=100, session_id="older")
+        newer = mod.Instance(2, "C:\\b", state="done", updated_at=200, session_id="newer")
+        older.state_changed_at = 400
+        newer.state_changed_at = 500
+
+        calls = []
+
+        class Tracker:
+            instances = {older.pid: older, newer.pid: newer}
+
+            @staticmethod
+            def pin_key(inst):
+                return inst.session_id or str(inst.pid)
+
+        class Overlay:
+            tracker = Tracker()
+            _latest_done_instance = staticmethod(mod.MonitorOverlay._latest_done_instance)
+
+            def _clear_recent_highlight(self, pid):
+                calls.append(("clear", pid))
+
+            def _activate_terminal(self, pid):
+                calls.append(("activate", pid))
+
+        mod.MonitorOverlay._activate_latest_done_session(Overlay())
+
+        self.assertEqual(calls, [("clear", 2), ("activate", 2)])
+
     def test_summarize_claude_status_uses_unresolved_incident(self):
         mod = load_module(MONITOR, "session_monitor_status_summary")
 
@@ -2653,10 +2722,15 @@ class MonitorCoreTests(unittest.TestCase):
     def test_pidless_codex_app_focus_opens_thread_deep_link_first(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_app_deeplink")
         opened = []
+        activated = []
 
         class Dummy:
             def _open_codex_thread(self, session_id):
                 opened.append(session_id)
+                return True
+
+            def _activate_codex_app_window(self):
+                activated.append(True)
                 return True
 
             def _activate_wezterm_pane_for_codex_row(self, *_args):
@@ -2671,6 +2745,7 @@ class MonitorCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(opened, ["019e-desktop-thread"])
+        self.assertEqual(activated, [True])
 
     def test_pidless_codex_cli_focus_opens_thread_deep_link_first(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_cli_deeplink")

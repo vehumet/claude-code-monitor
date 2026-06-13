@@ -64,7 +64,31 @@ if IS_WINDOWS:
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
     TH32CS_SNAPPROCESS = 0x00000002
+    SW_SHOW = 5
     SW_RESTORE = 9
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_SHOWWINDOW = 0x0040
+    WM_HOTKEY = 0x0312
+    GWLP_WNDPROC = -4
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+    MOD_NOREPEAT = 0x4000
+    VK_SPACE = 0x20
+    VK_SHIFT = 0x10
+    VK_CONTROL = 0x11
+    VK_MENU = 0x12
+    VK_LWIN = 0x5B
+    VK_RWIN = 0x5C
+    KEYEVENTF_KEYUP = 0x0002
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+    WM_QUIT = 0x0012
 
     # ── DPI awareness ──────────────────────────────────────────────
     try:
@@ -89,6 +113,15 @@ if IS_WINDOWS:
             ("pcPriClassBase", wintypes.LONG),
             ("dwFlags", wintypes.DWORD),
             ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong),
         ]
 
 
@@ -206,6 +239,9 @@ def _default_config():
         # Auto-hide completed app-surface rows after 30 minutes. Terminal
         # sessions keep using process lifetime instead.
         "app_done_ttl_s": 1800,
+        # Global hotkey that focuses the most recently completed visible row.
+        # Empty string disables it. Example: "ctrl+alt+space".
+        "latest_done_hotkey": "",
         "sound_enabled": True,
         # Optional event -> audio file path map. Supports done, question,
         # interrupted, and status_restored. File playback is best-effort and
@@ -693,6 +729,44 @@ def is_codex_desktop_app_pid(pid: int, tree: dict) -> bool:
     return bool(parent and parent[1] == "codex.exe")
 
 
+def find_codex_app_window(tree: dict) -> int | None:
+    """Find a visible Codex Desktop app window. Windows only."""
+    if not IS_WINDOWS:
+        return None
+    user32 = ctypes.windll.user32
+    candidates = []
+
+    def enum_callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title_len = user32.GetWindowTextLengthW(hwnd)
+        if title_len <= 0:
+            return True
+        w_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+        entry = tree.get(w_pid.value)
+        if not entry or entry[1] != "codex.exe":
+            return True
+        # Child codex.exe helpers do not own the main Desktop window.
+        if is_codex_desktop_app_pid(w_pid.value, tree):
+            return True
+        buf = ctypes.create_unicode_buffer(title_len + 1)
+        user32.GetWindowTextW(hwnd, buf, title_len + 1)
+        title = buf.value
+        if title and title != "Program Manager":
+            rank = 0 if "codex" in title.lower() else 1
+            candidates.append((rank, hwnd, title))
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    if candidates:
+        _log.debug("Codex app window candidates: %s", candidates[:5])
+        return candidates[0][1]
+    return None
+
+
 def load_nested_pids(state_root: str) -> set:
     """Load PIDs marked nested by our summarizer; clean up stale markers."""
     d = os.path.join(state_root, "nested-pids")
@@ -1061,21 +1135,159 @@ def activate_window(hwnd: int):
         return
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
+    else:
+        user32.ShowWindow(hwnd, SW_SHOW)
 
-    kernel32 = ctypes.windll.kernel32
     fg_hwnd = user32.GetForegroundWindow()
     our_tid = kernel32.GetCurrentThreadId()
     fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None)
+    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
 
-    if our_tid != fg_tid:
-        user32.AttachThreadInput(our_tid, fg_tid, True)
+    attached = []
+    try:
+        for tid in {fg_tid, target_tid}:
+            if tid and tid != our_tid and user32.AttachThreadInput(our_tid, tid, True):
+                attached.append(tid)
+        user32.BringWindowToTop(hwnd)
+        user32.SetActiveWindow(hwnd)
         user32.SetForegroundWindow(hwnd)
-        user32.AttachThreadInput(our_tid, fg_tid, False)
-    else:
+        try:
+            user32.SwitchToThisWindow(hwnd, True)
+        except Exception:
+            pass
+    finally:
+        for tid in attached:
+            user32.AttachThreadInput(our_tid, tid, False)
+
+    if user32.GetForegroundWindow() == hwnd:
+        return
+
+    # When invoked from a low-level keyboard hook, Windows may still deny
+    # foreground activation and only flash the taskbar. SendInput(Alt) is the
+    # most reliable foreground-lock bypass because Windows itself treats Alt as
+    # permission to change foreground.
+    try:
+        send_alt_input()
+        user32.BringWindowToTop(hwnd)
+        user32.SetActiveWindow(hwnd)
         user32.SetForegroundWindow(hwnd)
+        try:
+            user32.SwitchToThisWindow(hwnd, True)
+        except Exception:
+            pass
+    except Exception:
+        _log.debug("SendInput foreground fallback failed", exc_info=True)
+
+    if user32.GetForegroundWindow() == hwnd:
+        return
+
+    try:
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        _log.debug("foreground fallback failed", exc_info=True)
+
+
+if IS_WINDOWS:
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [
+            ("type", wintypes.DWORD),
+            ("u", INPUT_UNION),
+        ]
+
+
+def send_alt_input():
+    """Ask Windows to unlock foreground changes by sending an Alt tap."""
+    if not IS_WINDOWS:
+        return False
+    user32 = ctypes.windll.user32
+    inputs = (INPUT * 2)()
+    inputs[0].type = 1  # INPUT_KEYBOARD
+    inputs[0].u.ki = KEYBDINPUT(VK_MENU, 0, 0, 0, None)
+    inputs[1].type = 1
+    inputs[1].u.ki = KEYBDINPUT(VK_MENU, 0, KEYEVENTF_KEYUP, 0, None)
+    sent = user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+    return sent == 2
+
+
+_HOTKEY_MODIFIERS = {
+    "alt": MOD_ALT if IS_WINDOWS else 0,
+    "ctrl": MOD_CONTROL if IS_WINDOWS else 0,
+    "control": MOD_CONTROL if IS_WINDOWS else 0,
+    "shift": MOD_SHIFT if IS_WINDOWS else 0,
+    "win": MOD_WIN if IS_WINDOWS else 0,
+    "windows": MOD_WIN if IS_WINDOWS else 0,
+    "meta": MOD_WIN if IS_WINDOWS else 0,
+    "cmd": MOD_WIN if IS_WINDOWS else 0,
+}
+
+_HOTKEY_KEYS = {
+    "space": VK_SPACE if IS_WINDOWS else 0x20,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "tab": 0x09,
+    "backspace": 0x08,
+    "delete": 0x2E,
+    "insert": 0x2D,
+    "home": 0x24,
+    "end": 0x23,
+    "pageup": 0x21,
+    "pagedown": 0x22,
+    "left": 0x25,
+    "up": 0x26,
+    "right": 0x27,
+    "down": 0x28,
+}
+for _i in range(1, 25):
+    _HOTKEY_KEYS[f"f{_i}"] = 0x70 + _i - 1
+
+
+def parse_hotkey(value):
+    """Parse 'ctrl+alt+space' style config into (modifiers, vk), or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parts = [p.strip().lower() for p in re.split(r"[+\-]", value) if p.strip()]
+    if not parts:
+        return None
+    modifiers = 0
+    key = None
+    for part in parts:
+        if part in _HOTKEY_MODIFIERS:
+            modifiers |= _HOTKEY_MODIFIERS[part]
+            continue
+        if key is not None:
+            return None
+        if part in _HOTKEY_KEYS:
+            key = _HOTKEY_KEYS[part]
+        elif len(part) == 1 and "a" <= part <= "z":
+            key = ord(part.upper())
+        elif len(part) == 1 and "0" <= part <= "9":
+            key = ord(part)
+        else:
+            return None
+    if key is None:
+        return None
+    return (modifiers | (MOD_NOREPEAT if IS_WINDOWS else 0), key)
 
 
 def short_cwd(cwd: str) -> str:
@@ -1732,6 +1944,19 @@ class MonitorOverlay:
         self.blink_seconds = max(0.0, float(CONFIG.get("blink_seconds", DONE_BLINK_SECONDS)))
         self.summary_max_chars = max(4, int(CONFIG.get("summary_max_chars", 12)))
         self.sound_enabled = CONFIG.get("sound_enabled", True)
+        self.latest_done_hotkey = CONFIG.get("latest_done_hotkey", "")
+        self._hotkey_id = 0x534D
+        self._hotkey_hwnd = 0
+        self._hotkey_registered = False
+        self._hotkey_prev_wndproc = None
+        self._hotkey_wndproc = None
+        self._hotkey_parsed = parse_hotkey(self.latest_done_hotkey)
+        self._keyboard_hook_handle = 0
+        self._keyboard_hook_thread_id = 0
+        self._keyboard_hook_thread = None
+        self._keyboard_hook_proc = None
+        self._keyboard_hook_event = threading.Event()
+        self._keyboard_hook_last_fire = 0.0
         # Suppress sound + blink for whatever state already exists, including
         # delayed catch-up writes that land just after the widget opens.
         self._first_poll = True
@@ -1827,7 +2052,7 @@ class MonitorOverlay:
             bg=THEME["bg"], fg=THEME["dim"], cursor="hand2",
         )
         self.close_btn.pack(side=tk.RIGHT, padx=(0, 4))
-        self.close_btn.bind("<Button-1>", lambda _: self.root.destroy())
+        self.close_btn.bind("<Button-1>", lambda _: self._close())
         self.close_btn.bind("<Enter>", lambda _: self.close_btn.config(fg=THEME["close_hover"]))
         self.close_btn.bind("<Leave>", lambda _: self.close_btn.config(fg=THEME["dim"]))
 
@@ -1852,10 +2077,181 @@ class MonitorOverlay:
 
         # Blink state
         self._blink_phase = True
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self._install_latest_done_hotkey()
+        self._poll_keyboard_hook_event()
 
         # Start loops
         self._poll_loop()
         self._blink_loop()
+
+    def _close(self):
+        self._unregister_latest_done_hotkey()
+        self.root.destroy()
+
+    def _on_destroy(self, event):
+        if event.widget == self.root:
+            self._unregister_latest_done_hotkey()
+
+    def _install_latest_done_hotkey(self):
+        if not self._hotkey_parsed or not IS_WINDOWS:
+            return
+        try:
+            # Tk window subclassing through ctypes is fragile under pythonw and
+            # can terminate the process without a Python traceback. Use a
+            # low-level keyboard hook instead; it is slightly broader but does
+            # not mutate Tk's native WndProc.
+            self._install_keyboard_hook_hotkey()
+        except Exception:
+            _log.debug("failed to install latest_done_hotkey", exc_info=True)
+            self._unregister_latest_done_hotkey()
+            self._install_keyboard_hook_hotkey()
+
+    def _install_keyboard_hook_hotkey(self):
+        if not IS_WINDOWS or not self._hotkey_parsed or self._keyboard_hook_thread:
+            return
+
+        def hook_thread():
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hook_proc_type = ctypes.WINFUNCTYPE(
+                ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long,
+                ctypes.c_int,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+
+            def low_level_keyboard_proc(n_code, w_param, l_param):
+                if n_code >= 0 and int(w_param) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    if self._keyboard_hook_matches(data.vkCode):
+                        now = time.monotonic()
+                        if now - self._keyboard_hook_last_fire > 0.4:
+                            self._keyboard_hook_last_fire = now
+                            self._activate_latest_done_session(clear_highlight=False)
+                        return 1
+                return user32.CallNextHookEx(self._keyboard_hook_handle, n_code, w_param, l_param)
+
+            self._keyboard_hook_thread_id = kernel32.GetCurrentThreadId()
+            self._keyboard_hook_proc = hook_proc_type(low_level_keyboard_proc)
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+            user32.SetWindowsHookExW.argtypes = [
+                ctypes.c_int,
+                hook_proc_type,
+                wintypes.HINSTANCE,
+                wintypes.DWORD,
+            ]
+            user32.SetWindowsHookExW.restype = wintypes.HHOOK
+            user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallNextHookEx.restype = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+            module_handle = kernel32.GetModuleHandleW(None)
+            hook = user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                self._keyboard_hook_proc,
+                module_handle,
+                0,
+            )
+            if not hook:
+                _log.warning("failed to install keyboard hook for latest_done_hotkey=%r", self.latest_done_hotkey)
+                return
+            self._keyboard_hook_handle = hook
+            _log.info("installed keyboard hook for latest_done_hotkey=%r", self.latest_done_hotkey)
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+        self._keyboard_hook_thread = threading.Thread(target=hook_thread, name="session-monitor-hotkey", daemon=True)
+        self._keyboard_hook_thread.start()
+
+    def _keyboard_hook_matches(self, vk_code) -> bool:
+        if not IS_WINDOWS or not self._hotkey_parsed:
+            return False
+        modifiers, vk = self._hotkey_parsed
+        if int(vk_code) != int(vk):
+            return False
+        user32 = ctypes.windll.user32
+
+        def down(vk_value):
+            return bool(user32.GetAsyncKeyState(vk_value) & 0x8000)
+
+        base_modifiers = modifiers & ~MOD_NOREPEAT
+        if base_modifiers & MOD_CONTROL and not down(VK_CONTROL):
+            return False
+        if base_modifiers & MOD_ALT and not down(VK_MENU):
+            return False
+        if base_modifiers & MOD_SHIFT and not down(VK_SHIFT):
+            return False
+        if base_modifiers & MOD_WIN and not (down(VK_LWIN) or down(VK_RWIN)):
+            return False
+        return True
+
+    def _poll_keyboard_hook_event(self):
+        if self._keyboard_hook_event.is_set():
+            self._keyboard_hook_event.clear()
+            self._activate_latest_done_session()
+        if self._keyboard_hook_thread:
+            self.root.after(50, self._poll_keyboard_hook_event)
+
+    def _subclass_hotkey_window(self, hwnd):
+        if not IS_WINDOWS or self._hotkey_wndproc is not None:
+            return
+        user32 = ctypes.windll.user32
+        long_ptr = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        wndproc_type = ctypes.WINFUNCTYPE(
+            long_ptr,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        set_window_long = user32.SetWindowLongPtrW
+        set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+        set_window_long.restype = long_ptr
+        call_window_proc = user32.CallWindowProcW
+        call_window_proc.argtypes = [long_ptr, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        call_window_proc.restype = long_ptr
+
+        def wndproc(h_wnd, msg, w_param, l_param):
+            if msg == WM_HOTKEY and int(w_param) == self._hotkey_id:
+                self.root.after(0, self._activate_latest_done_session)
+                return 0
+            return call_window_proc(self._hotkey_prev_wndproc, h_wnd, msg, w_param, l_param)
+
+        self._hotkey_wndproc = wndproc_type(wndproc)
+        prev = set_window_long(hwnd, GWLP_WNDPROC, long_ptr(ctypes.cast(self._hotkey_wndproc, ctypes.c_void_p).value))
+        self._hotkey_prev_wndproc = prev
+
+    def _unregister_latest_done_hotkey(self):
+        if not IS_WINDOWS:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            if self._hotkey_registered and self._hotkey_hwnd:
+                user32.UnregisterHotKey(self._hotkey_hwnd, self._hotkey_id)
+            if self._hotkey_hwnd and self._hotkey_prev_wndproc:
+                long_ptr = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+                set_window_long = user32.SetWindowLongPtrW
+                set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+                set_window_long.restype = long_ptr
+                set_window_long(self._hotkey_hwnd, GWLP_WNDPROC, long_ptr(self._hotkey_prev_wndproc))
+            if self._keyboard_hook_handle:
+                user32.UnhookWindowsHookEx(self._keyboard_hook_handle)
+            if self._keyboard_hook_thread_id:
+                user32.PostThreadMessageW(self._keyboard_hook_thread_id, WM_QUIT, 0, 0)
+        except Exception:
+            _log.debug("failed to unregister latest_done_hotkey", exc_info=True)
+        finally:
+            self._hotkey_registered = False
+            self._hotkey_hwnd = 0
+            self._hotkey_prev_wndproc = None
+            self._hotkey_wndproc = None
+            self._keyboard_hook_handle = 0
+            self._keyboard_hook_thread_id = 0
+            self._keyboard_hook_thread = None
+            self._keyboard_hook_proc = None
 
     def _load_position(self):
         try:
@@ -2233,6 +2629,22 @@ class MonitorOverlay:
         if self.tracker.dismiss_instance(pid):
             self._rebuild_rows()
 
+    @staticmethod
+    def _latest_done_instance(instances):
+        candidates = [inst for inst in instances if inst.state == "done"]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda i: (i.state_changed_at or i.updated_at or 0, str(i.pid)))
+
+    def _activate_latest_done_session(self, clear_highlight=True):
+        inst = self._latest_done_instance(self.tracker.instances.values())
+        if not inst:
+            _log.debug("latest_done_hotkey pressed but no done session is visible")
+            return
+        if clear_highlight:
+            self._clear_recent_highlight(inst.pid)
+        self._activate_terminal(inst.pid)
+
     def _clear_recent_highlight(self, pid):
         """Dismiss the current recent-change highlight when its row is clicked."""
         inst = self.tracker.instances.get(pid)
@@ -2347,7 +2759,11 @@ class MonitorOverlay:
         deep link; CLI rows prefer terminal/pane activation."""
         try:
             if session_id and self._open_codex_thread(session_id):
-                return
+                if codex_surface == "app" or str(codex_originator or "").lower() == "codex desktop":
+                    if self._activate_codex_app_window():
+                        return
+                else:
+                    return
 
             if self._activate_wezterm_pane_for_codex_row(cwd, session_id):
                 return
@@ -2363,6 +2779,19 @@ class MonitorOverlay:
                        cwd, len(codex_pids))
         except Exception:
             _log.error("_activate_codex_pidless failed", exc_info=True)
+
+    def _activate_codex_app_window(self) -> bool:
+        if not IS_WINDOWS:
+            return False
+        for _ in range(12):
+            tree = build_process_tree()
+            hwnd = find_codex_app_window(tree)
+            if hwnd:
+                activate_window(hwnd)
+                if ctypes.windll.user32.GetForegroundWindow() == hwnd:
+                    return True
+            time.sleep(0.1)
+        return False
 
     def _open_codex_thread(self, session_id: str) -> bool:
         """Open a local Codex app thread via the documented codex:// scheme."""
