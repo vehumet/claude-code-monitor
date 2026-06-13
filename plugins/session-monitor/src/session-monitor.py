@@ -726,7 +726,25 @@ def load_claude_native_session(pid):
         return {}
 
 
-def sync_claude_desktop_sessions(sessions_root: str, state_root: str):
+def _claude_native_observed_at(path: str, data: dict) -> float:
+    observed = 0.0
+    if isinstance(data, dict):
+        for key in ("updatedAt", "lastSignalAt", "startedAt"):
+            try:
+                value = float(data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 1_000_000_000_000:
+                value /= 1000.0
+            observed = max(observed, value)
+    try:
+        observed = max(observed, os.path.getmtime(path))
+    except OSError:
+        pass
+    return observed
+
+
+def sync_claude_desktop_sessions(sessions_root: str, state_root: str, started_after: float = 0.0):
     """Mirror live Claude Desktop agent sessions into the monitor runtime.
 
     Claude Desktop starts Claude Code as a child claude.exe process. Those agent
@@ -749,6 +767,8 @@ def sync_claude_desktop_sessions(sessions_root: str, state_root: str):
             continue
         pid = data.get("pid")
         if not isinstance(pid, int) or not is_claude_pid_alive(pid):
+            continue
+        if started_after and _claude_native_observed_at(path, data) < started_after:
             continue
         cwd = data.get("cwd", "") or ""
         session_id = data.get("sessionId", "") or ""
@@ -1169,6 +1189,7 @@ class InstanceTracker:
     def __init__(self):
         self.sessions_dir = sessions_dir()
         self.state_dir = get_state_dir()
+        self.started_at = time.time()
         # Keys are int PIDs for hook-driven rows and "codex:<sid8>" strings
         # for the rollout poller's PID-less virtual rows.
         self.instances: dict = {}
@@ -1218,6 +1239,33 @@ class InstanceTracker:
                 value = 0.0
             observed = max(observed, value)
         return observed
+
+    @staticmethod
+    def _activity_observed_at(state_data) -> float:
+        if not isinstance(state_data, dict):
+            return 0.0
+        observed = 0.0
+        for key in ("lastSignalAt", "updatedAt", "threadUpdatedAt", "rolloutMtime"):
+            try:
+                value = float(state_data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            observed = max(observed, value)
+        return observed
+
+    def _is_pre_start_passive_row(self, provider, entrypoint, pid, state_data) -> bool:
+        if not self.started_at:
+            return False
+        passive = (
+            is_virtual_id(pid)
+            or (provider == "claude" and entrypoint == "claude-desktop")
+            or (
+                provider == "claude"
+                and isinstance(state_data, dict)
+                and state_data.get("lastSignalSource") == "desktop_session"
+            )
+        )
+        return passive and self._activity_observed_at(state_data) < self.started_at
 
     def _state_observed_at_for_pid(self, pid) -> float:
         try:
@@ -1326,7 +1374,7 @@ class InstanceTracker:
         sessions_data = {}
         session_by_pid = {}
         try:
-            sync_claude_desktop_sessions(self.sessions_dir, self.state_dir)
+            sync_claude_desktop_sessions(self.sessions_dir, self.state_dir, self.started_at)
         except Exception:
             _log.debug("claude desktop session sync failed", exc_info=True)
         for sf in glob.glob(os.path.join(self.sessions_dir, "*.json")):
@@ -1348,6 +1396,7 @@ class InstanceTracker:
                     self._codex_rollout_cache,
                     self.sessions_dir,
                     self.state_dir,
+                    started_after=self.started_at,
                 )
             except Exception:
                 _log.debug("codex rollout poller failed", exc_info=True)
@@ -1379,6 +1428,11 @@ class InstanceTracker:
                 continue
 
             if self._is_dismissed(provider, session_id, pid, self._state_observed_at_for_pid(pid)):
+                self._remove_monitor_files(pid)
+                continue
+
+            state_for_pid = _read_json_file(os.path.join(self.state_dir, f"{pid}.json"))
+            if self._is_pre_start_passive_row(provider, entrypoint, pid, state_for_pid):
                 self._remove_monitor_files(pid)
                 continue
 
@@ -1459,6 +1513,10 @@ class InstanceTracker:
 
             session_data = session_by_pid.get(pid)
             state_session_id = (session_data or {}).get("sessionId") or st.get("sessionId") or ""
+            state_entrypoint = (session_data or {}).get("entrypoint", "") or ""
+            if self._is_pre_start_passive_row(saved_provider, state_entrypoint, pid, st):
+                self._remove_monitor_files(pid)
+                continue
             if self._is_dismissed(saved_provider, state_session_id, pid, self._dismiss_observed_at(st)):
                 self._remove_monitor_files(pid)
                 continue

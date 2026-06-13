@@ -49,6 +49,7 @@ VIRTUAL_PREFIX = "codex-"
 IGNORE_NESTED = "nested"
 IGNORE_HOOK_OWNED = "hook_owned"
 IGNORE_EXEC = "exec"
+IGNORE_PRE_START = "pre_start"
 _THREAD_META_CACHE_KEY = "__codex_thread_meta__"
 
 
@@ -464,6 +465,10 @@ def _thread_metadata_recent(metadata, cutoff):
     return _safe_float(metadata.get("threadUpdatedAt")) >= cutoff
 
 
+def _rollout_activity_time(mtime, metadata):
+    return max(float(mtime or 0), _safe_float((metadata or {}).get("threadUpdatedAt")))
+
+
 def _norm_rollout_path(path):
     if not path:
         return ""
@@ -521,7 +526,7 @@ _PRESERVED_STATE_FIELDS = (
 )
 
 
-def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
+def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, started_after=0.0):
     """Sync ~/.codex/sessions rollouts to monitor sessions+state JSONs.
 
     The InstanceTracker's standard sessions/state loops pick up the files
@@ -580,7 +585,14 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         metadata = thread_meta.get(session_id, {}) if session_id else {}
         if ignored_cache_hit and session_id:
             reason = cached.get("ignore_reason")
-            if reason == IGNORE_HOOK_OWNED and not _is_hook_owned_session(state_dir, session_id, metadata):
+            if reason == IGNORE_PRE_START:
+                if started_after and _rollout_activity_time(mtime, metadata) >= started_after:
+                    ignored_cache_hit = False
+                else:
+                    _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
+                    seen_rollout_paths.add(path)
+                    continue
+            elif reason == IGNORE_HOOK_OWNED and not _is_hook_owned_session(state_dir, session_id, metadata):
                 ignored_cache_hit = False
             elif reason:
                 _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
@@ -601,6 +613,14 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         if mtime < cutoff and not _thread_metadata_recent(metadata, cutoff):
             continue
         if now - mtime > _STALE_EVICTION_S and not metadata:
+            continue
+        if started_after and _rollout_activity_time(mtime, metadata) < started_after:
+            if session_id:
+                seen_rollout_paths.add(path)
+                _ignore_rollout(
+                    prev_cache, path, mtime, session_id, IGNORE_PRE_START,
+                    sessions_dir, state_dir,
+                )
             continue
         if ignored_cache_hit:
             reason = _ignore_reason(state_dir, session_id, payload, metadata)
@@ -696,7 +716,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir):
         seen_virtual_ids.add(vid)
 
         state = _infer_state(mtime, started, completed, failed, waiting, latest_marker)
-        activity_time = max(int(mtime), int(_safe_float(thread_updated_at)))
+        activity_time = int(_rollout_activity_time(mtime, metadata))
 
         sess_record = {
             "pid": vid,

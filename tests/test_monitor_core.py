@@ -1928,6 +1928,7 @@ class MonitorCoreTests(unittest.TestCase):
                 state_path.write_text(json.dumps(old_state_payload), encoding="utf-8")
 
                 tracker = mod.InstanceTracker()
+                tracker.started_at = 0
                 tracker.poll()
                 self.assertIn(pid, tracker.instances)
 
@@ -1966,6 +1967,178 @@ class MonitorCoreTests(unittest.TestCase):
                     os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
                 else:
                     os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_startup_filter_removes_old_codex_virtual_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            pid = "codex-old-session"
+            sid = "old-session"
+            cwd = str(home / "project")
+            (sessions_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "virtualId": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "sessionId": sid,
+                    "state": "done",
+                    "cwd": cwd,
+                    "updatedAt": 100,
+                    "provider": "codex",
+                    "lastSignalSource": "rollout",
+                    "rolloutMtime": 100,
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_startup_filter_old_codex")
+                mod.poll_codex_rollouts = None
+
+                tracker = mod.InstanceTracker()
+                tracker.started_at = 200.0
+                tracker.poll()
+
+                self.assertNotIn(pid, tracker.instances)
+                self.assertFalse((sessions_dir / f"{pid}.json").exists())
+                self.assertFalse((state_dir / f"{pid}.json").exists())
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_startup_filter_allows_fresh_codex_virtual_row(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+
+            pid = "codex-fresh-session"
+            sid = "fresh-session"
+            cwd = str(home / "project")
+            (sessions_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "virtualId": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "provider": "codex",
+                }),
+                encoding="utf-8",
+            )
+            (state_dir / f"{pid}.json").write_text(
+                json.dumps({
+                    "pid": pid,
+                    "sessionId": sid,
+                    "state": "working",
+                    "cwd": cwd,
+                    "updatedAt": 300,
+                    "provider": "codex",
+                    "lastSignalSource": "rollout",
+                    "rolloutMtime": 300,
+                }),
+                encoding="utf-8",
+            )
+
+            old_state_dir = os.environ.get("SESSION_MONITOR_STATE_DIR")
+            old_sessions_dir = os.environ.get("SESSION_MONITOR_SESSIONS_DIR")
+            try:
+                os.environ["SESSION_MONITOR_STATE_DIR"] = str(state_dir)
+                os.environ["SESSION_MONITOR_SESSIONS_DIR"] = str(sessions_dir)
+                mod = load_module(MONITOR, "session_monitor_startup_filter_fresh_codex")
+                mod.poll_codex_rollouts = None
+
+                tracker = mod.InstanceTracker()
+                tracker.started_at = 200.0
+                tracker.poll()
+
+                self.assertIn(pid, tracker.instances)
+                self.assertEqual(tracker.instances[pid].state, "working")
+            finally:
+                if old_state_dir is None:
+                    os.environ.pop("SESSION_MONITOR_STATE_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_STATE_DIR"] = old_state_dir
+                if old_sessions_dir is None:
+                    os.environ.pop("SESSION_MONITOR_SESSIONS_DIR", None)
+                else:
+                    os.environ["SESSION_MONITOR_SESSIONS_DIR"] = old_sessions_dir
+
+    def test_claude_desktop_sync_skips_sessions_observed_before_startup(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            native_sessions_dir = home / ".claude" / "sessions"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            native_sessions_dir.mkdir(parents=True)
+
+            real_pid = 4242
+            native_path = native_sessions_dir / f"{real_pid}.json"
+            native_path.write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "desktop-session",
+                    "cwd": str(home / "project"),
+                    "startedAt": 100,
+                    "entrypoint": "claude-desktop",
+                }),
+                encoding="utf-8",
+            )
+            os.utime(native_path, (100, 100))
+
+            mod = load_module(MONITOR, "session_monitor_claude_desktop_startup_filter")
+            mod.is_claude_pid_alive = lambda _pid: True
+
+            mod.sync_claude_desktop_sessions(str(sessions_dir), str(state_dir), started_after=200)
+            self.assertFalse((sessions_dir / f"{real_pid}.json").exists())
+            self.assertFalse((state_dir / f"{real_pid}.json").exists())
+
+            native_path.write_text(
+                json.dumps({
+                    "pid": real_pid,
+                    "sessionId": "desktop-session",
+                    "cwd": str(home / "project"),
+                    "updatedAt": 300,
+                    "entrypoint": "claude-desktop",
+                }),
+                encoding="utf-8",
+            )
+            os.utime(native_path, (300, 300))
+
+            mod.sync_claude_desktop_sessions(str(sessions_dir), str(state_dir), started_after=200)
+            self.assertTrue((sessions_dir / f"{real_pid}.json").exists())
+            self.assertTrue((state_dir / f"{real_pid}.json").exists())
 
     def test_tracker_loads_claude_desktop_entrypoint(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -2008,6 +2181,7 @@ class MonitorCoreTests(unittest.TestCase):
                 }
 
                 tracker = mod.InstanceTracker()
+                tracker.started_at = 0
                 tracker.poll()
                 inst = tracker.instances[real_pid]
 
@@ -2569,6 +2743,53 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse((state_dir / f"{vid}.json").exists())
             self.assertTrue(cache[str(rollout)]["ignored"])
             self.assertEqual(cache[str(rollout)]["ignore_reason"], "exec")
+
+    def test_codex_rollout_before_monitor_start_is_ignored_until_new_activity_window(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            home = Path(td)
+            os.environ["HOME"] = td
+            os.environ["USERPROFILE"] = td
+            sessions_dir = runtime_dir(home) / "sessions"
+            state_dir = runtime_dir(home) / "state"
+            rollout_dir = home / ".codex" / "sessions" / "2026" / "05" / "08"
+            sessions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            rollout_dir.mkdir(parents=True)
+
+            sid = "prestart-1111-2222-3333-abcdefghijkl"
+            cwd = str(home / "project")
+            rollout = rollout_dir / f"rollout-2026-05-08T00-00-00-{sid}.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": "cli"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_pre_start_filter")
+            vid = mod.virtual_id_for(sid)
+            cache = {}
+            started_after = mod.time.time() + 10
+
+            mod.poll_codex_rollouts(
+                set(), cache, str(sessions_dir), str(state_dir),
+                started_after=started_after,
+            )
+
+            self.assertFalse((sessions_dir / f"{vid}.json").exists())
+            self.assertFalse((state_dir / f"{vid}.json").exists())
+            self.assertTrue(cache[str(rollout)]["ignored"])
+            self.assertEqual(cache[str(rollout)]["ignore_reason"], "pre_start")
+
+            mod.poll_codex_rollouts(
+                set(), cache, str(sessions_dir), str(state_dir),
+                started_after=started_after - 20,
+            )
+
+            self.assertTrue((sessions_dir / f"{vid}.json").exists())
+            self.assertTrue((state_dir / f"{vid}.json").exists())
+            state = json.loads((state_dir / f"{vid}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["state"], "working")
 
     def test_hookless_cli_working_rollout_creates_virtual_row(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
