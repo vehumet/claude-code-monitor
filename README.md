@@ -179,6 +179,10 @@ Config keys:
 - `sound_files`: maps monitor events to audio files. Supported events: `done`, `question`, `interrupted`, `status_restored`.
 - Sound playback: best-effort using platform audio support; falls back to the built-in beep on Windows.
 
+## Troubleshooting
+
+- Hotkey does not work in a fullscreen game: if the game runs as administrator, start Session Monitor as administrator too.
+
 ## Uninstall
 
 ```powershell

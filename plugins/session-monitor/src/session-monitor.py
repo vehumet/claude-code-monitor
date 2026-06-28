@@ -1383,6 +1383,21 @@ class Instance:
         self.pinned_at = None
 
 
+def snapshot_instance(inst: Instance) -> Instance:
+    """Copy activation-relevant row data after a terminal state is observed."""
+    snap = Instance(
+        inst.pid,
+        inst.cwd,
+        state=inst.state,
+        updated_at=inst.updated_at,
+        provider=inst.provider,
+        session_id=inst.session_id,
+    )
+    for attr in Instance.__slots__:
+        setattr(snap, attr, getattr(inst, attr))
+    return snap
+
+
 class InstanceTracker:
     """Polls session + state files to maintain live instance list."""
 
@@ -1409,6 +1424,7 @@ class InstanceTracker:
         )
         self._app_done_ttl_s = max(0.0, float(CONFIG.get("app_done_ttl_s", 1800)))
         self._dismissed_keys = {}
+        self.latest_completed_instance = None
         self.pins = self._load_pins()
 
     @staticmethod
@@ -1565,6 +1581,19 @@ class InstanceTracker:
         self.save_pins()
         return True
 
+    def remember_completed_instance(self, inst: Instance):
+        if not inst or inst.state != "done":
+            return
+        if not inst.completed_at:
+            inst.completed_at = inst.updated_at or int(time.time())
+        current = self.latest_completed_instance
+        if current:
+            current_key = (current.completed_at or current.updated_at or 0, str(current.pid))
+            next_key = (inst.completed_at or inst.updated_at or 0, str(inst.pid))
+            if next_key < current_key:
+                return
+        self.latest_completed_instance = snapshot_instance(inst)
+
     def _load_pins(self) -> dict:
         try:
             with open(self.PINS_FILE, "r", encoding="utf-8") as f:
@@ -1697,6 +1726,7 @@ class InstanceTracker:
                 continue
             if self._is_app_done_expired(provider, entrypoint, pid, session_id, state_for_pid):
                 if pid in self.instances:
+                    self.remember_completed_instance(self.instances[pid])
                     del self.instances[pid]
                     changed = True
                 continue
@@ -1785,6 +1815,7 @@ class InstanceTracker:
                 continue
             if self._is_app_done_expired(saved_provider, state_entrypoint, pid, state_session_id, st):
                 if pid in self.instances:
+                    self.remember_completed_instance(self.instances[pid])
                     del self.instances[pid]
                     changed = True
                 continue
@@ -1891,6 +1922,7 @@ class InstanceTracker:
                         inst.done_since = time.monotonic()
                         inst.blink_on = True
                         events.append("done")
+                        self.remember_completed_instance(inst)
                         # PID-less codex rows have no Stop hook to spawn the
                         # summarizer for them — do it here on the done edge.
                         if is_virtual_id(pid) and _should_spawn_codex_summary(st):
@@ -1908,8 +1940,10 @@ class InstanceTracker:
                     elif state not in ("done", "interrupted"):
                         inst.completed_at = 0
                         inst.done_since = 0.0
-                    if state_changed or terminal_refreshed:
-                        changed = True
+                if state_changed or terminal_refreshed:
+                    changed = True
+                if inst.state == "done":
+                    self.remember_completed_instance(inst)
 
         # Proactively resolve hwnd for instances that don't have one yet
         if IS_WINDOWS:
@@ -1929,6 +1963,7 @@ class InstanceTracker:
         # Remove instances whose PID is gone
         for pid in list(self.instances):
             if pid not in seen_pids:
+                self.remember_completed_instance(self.instances[pid])
                 del self.instances[pid]
                 changed = True
 
@@ -2650,11 +2685,13 @@ class MonitorOverlay:
     def _activate_latest_done_session(self, clear_highlight=True):
         inst = self._latest_done_instance(self.tracker.instances.values())
         if not inst:
-            _log.debug("latest_done_hotkey pressed but no done session is visible")
+            inst = getattr(self.tracker, "latest_completed_instance", None)
+        if not inst:
+            _log.debug("latest_done_hotkey pressed but no completed session is known")
             return
         if clear_highlight:
             self._clear_recent_highlight(inst.pid)
-        self._activate_terminal(inst.pid)
+        self._activate_terminal(inst.pid, fallback_inst=inst)
 
     def _clear_recent_highlight(self, pid):
         """Dismiss the current recent-change highlight when its row is clicked."""
@@ -2692,9 +2729,9 @@ class MonitorOverlay:
                 pass
             stack.extend(w.winfo_children())
 
-    def _activate_terminal(self, claude_pid):
+    def _activate_terminal(self, claude_pid, fallback_inst=None):
         try:
-            inst = self.tracker.instances.get(claude_pid)
+            inst = self.tracker.instances.get(claude_pid) or fallback_inst
 
             # wezterm 페인 우선 — pane_id 기반 정확 매칭
             if inst and inst.wezterm and self._activate_wezterm_pane(inst.wezterm):

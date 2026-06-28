@@ -1773,12 +1773,59 @@ class MonitorCoreTests(unittest.TestCase):
             def _clear_recent_highlight(self, pid):
                 calls.append(("clear", pid))
 
-            def _activate_terminal(self, pid):
-                calls.append(("activate", pid))
+            def _activate_terminal(self, pid, fallback_inst=None):
+                calls.append(("activate", pid, fallback_inst))
 
         mod.MonitorOverlay._activate_latest_done_session(Overlay())
 
-        self.assertEqual(calls, [("clear", 2), ("activate", 2)])
+        self.assertEqual(calls, [("clear", 2), ("activate", 2, newer)])
+
+    def test_latest_done_hotkey_falls_back_to_last_completed_session(self):
+        mod = load_module(MONITOR, "session_monitor_latest_done_fallback")
+        working = mod.Instance(1, "C:\\a", state="working", updated_at=300, session_id="working")
+        completed = mod.Instance(2, "C:\\b", state="done", updated_at=200, session_id="done")
+        completed.completed_at = 200
+
+        calls = []
+
+        class Tracker:
+            instances = {working.pid: working}
+            latest_completed_instance = completed
+
+            @staticmethod
+            def pin_key(inst):
+                return inst.session_id or str(inst.pid)
+
+        class Overlay:
+            tracker = Tracker()
+            _latest_done_instance = staticmethod(mod.MonitorOverlay._latest_done_instance)
+
+            def _clear_recent_highlight(self, pid):
+                calls.append(("clear", pid))
+
+            def _activate_terminal(self, pid, fallback_inst=None):
+                calls.append(("activate", pid, fallback_inst))
+
+        mod.MonitorOverlay._activate_latest_done_session(Overlay())
+
+        self.assertEqual(calls, [("clear", 2), ("activate", 2, completed)])
+
+    def test_tracker_remembers_most_recent_completed_instance_snapshot(self):
+        mod = load_module(MONITOR, "session_monitor_remember_completed")
+        tracker = mod.InstanceTracker()
+        older = mod.Instance(1, "C:\\a", state="done", updated_at=100, session_id="older")
+        newer = mod.Instance(2, "C:\\b", state="done", updated_at=200, session_id="newer")
+        older.completed_at = 100
+        newer.completed_at = 200
+
+        tracker.remember_completed_instance(newer)
+        tracker.remember_completed_instance(older)
+
+        self.assertEqual(tracker.latest_completed_instance.pid, newer.pid)
+        newer.state = "working"
+        newer.cwd = "C:\\changed"
+        self.assertEqual(tracker.latest_completed_instance.state, "done")
+        self.assertEqual(tracker.latest_completed_instance.cwd, "C:\\b")
 
     def test_summarize_claude_status_uses_unresolved_incident(self):
         mod = load_module(MONITOR, "session_monitor_status_summary")
@@ -2832,6 +2879,31 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertFalse(failed)
             self.assertEqual(
                 mod._infer_state(rollout.stat().st_mtime, started, terminal, failed),
+                "done",
+            )
+
+    def test_rollout_missing_terminal_before_later_done_uses_latest_marker(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_poller_missing_terminal_done")
+
+            started, terminal, failed, waiting, latest = mod._scan_activity(
+                str(rollout), include_latest=True
+            )
+
+            self.assertEqual(started, 2)
+            self.assertEqual(terminal, 1)
+            self.assertEqual(latest, "completed")
+            self.assertEqual(
+                mod._infer_state(rollout.stat().st_mtime, started, terminal, failed, waiting, latest),
                 "done",
             )
 

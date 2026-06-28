@@ -179,6 +179,10 @@ python ~/.local/share/session-monitor/start-session-monitor.py
 - `sound_files`: monitor event를 audio file에 매핑합니다. 지원 event: `done`, `question`, `interrupted`, `status_restored`.
 - Sound playback: platform의 사용 가능한 audio support로 best-effort 처리하며, Windows에서는 내장 beep로 fallback합니다.
 
+## 문제 해결
+
+- Fullscreen game에서 단축키가 동작하지 않음: game이 관리자 권한으로 실행 중이면 Session Monitor도 관리자 권한으로 실행해야 할 수 있습니다.
+
 ## 제거
 
 ```powershell

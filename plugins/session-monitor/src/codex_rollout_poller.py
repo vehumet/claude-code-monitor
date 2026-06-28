@@ -337,6 +337,8 @@ def _infer_state(mtime, started, completed, failed, waiting_for_user=False, late
         return "question"
     if latest_marker == "started":
         return "working"
+    if latest_marker == "completed":
+        return "done"
     if started > 0 or completed > 0:
         return "working" if started > completed else "done"
     if time.time() - mtime < _WORKING_FRESHNESS_S:
