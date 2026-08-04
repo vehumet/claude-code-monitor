@@ -3082,6 +3082,90 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(latest, "completed")
             self.assertEqual(completed_at, 1781398923)
 
+    def test_rollout_incremental_scan_only_extends_cached_activity(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            sid = "incremental-1111-2222-3333-abcdefghijkl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_incremental")
+
+            first = mod._scan_activity_incremental(str(rollout), sid)
+            first_offset = first["scan_offset"]
+            # A sentinel count proves the second call extends the supplied
+            # cache instead of silently rescanning from byte zero.
+            first["started"] = 7
+            with rollout.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete"},
+                }) + "\n")
+
+            second = mod._scan_activity_incremental(str(rollout), sid, first)
+
+            self.assertEqual(second["started"], 7)
+            self.assertEqual(second["completed"], 1)
+            self.assertEqual(second["latest_marker"], "completed")
+            self.assertGreater(second["scan_offset"], first_offset)
+
+    def test_rollout_incremental_scan_resets_after_truncation(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            sid = "truncate11-1111-2222-3333-abcdefghijkl"
+            rollout.write_text(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n",
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_incremental_truncate")
+            cached = mod._scan_activity_incremental(str(rollout), sid)
+
+            rollout.write_text(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n",
+                encoding="utf-8",
+            )
+            refreshed = mod._scan_activity_incremental(str(rollout), sid, cached)
+
+            self.assertEqual(refreshed["started"], 0)
+            self.assertEqual(refreshed["completed"], 1)
+            self.assertEqual(refreshed["latest_marker"], "completed")
+
+    def test_rollout_state_bootstrap_starts_at_existing_eof(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            rollout = Path(td) / "rollout.jsonl"
+            sid = "bootstrap1-1111-2222-3333-abcdefghijkl"
+            rollout.write_text(
+                "\n".join([
+                    json.dumps({"type": "session_meta", "payload": {"id": sid}}),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+            mod = load_module(POLLER, "codex_rollout_state_bootstrap")
+            stat = rollout.stat()
+            cached = mod._activity_cache_from_state(
+                str(rollout),
+                stat,
+                sid,
+                {
+                    "sessionId": sid,
+                    "state": "working",
+                    "rolloutPath": str(rollout),
+                    "rolloutMtime": int(stat.st_mtime),
+                },
+            )
+
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["scan_offset"], stat.st_size)
+            self.assertEqual(cached["latest_marker"], "started")
+            self.assertEqual(cached["scan_tail"], rollout.read_bytes()[-256:])
+
     def test_pidless_codex_row_uses_cwd_focus_fallback(self):
         mod = load_module(MONITOR, "session_monitor_pidless_codex_focus")
         called = []

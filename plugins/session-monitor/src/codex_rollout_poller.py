@@ -35,6 +35,9 @@ _STALE_EVICTION_S = 30 * 60
 # reasoning bursts can sit silent for tens of seconds while the model is
 # thinking; a 5s threshold flips working↔done in a way that's distracting.
 _WORKING_FRESHNESS_S = 30
+# Full discovery is only needed to notice newly-created rollouts. Between
+# discoveries, poll the small set of recently-active paths retained below.
+_ROLLOUT_DISCOVERY_INTERVAL_S = 10
 
 # Known event_msg payload.type markers, verified against Codex CLI 0.128.0.
 # Comparing task_started vs terminal turn markers is the most reliable
@@ -52,6 +55,8 @@ IGNORE_HOOK_OWNED = "hook_owned"
 IGNORE_EXEC = "exec"
 IGNORE_PRE_START = "pre_start"
 _THREAD_META_CACHE_KEY = "__codex_thread_meta__"
+_ROLLOUT_PATH_CACHE_KEY = "__codex_rollout_paths__"
+_CACHE_META_KEYS = frozenset({_THREAD_META_CACHE_KEY, _ROLLOUT_PATH_CACHE_KEY})
 
 
 def _codex_sessions_root():
@@ -259,33 +264,130 @@ def _scan_turn_markers(path, session_id=None):
     return started, terminal, latest_marker == "failed"
 
 
-def _scan_activity(path, session_id=None, include_latest=False, include_completed_at=False):
-    """Return turn markers plus whether Codex is awaiting user input.
+def _empty_activity_cache(session_id=None):
+    return {
+        "scan_session_id": session_id,
+        "scan_offset": 0,
+        "scan_dev": None,
+        "scan_ino": None,
+        "scan_size": 0,
+        "started": 0,
+        "completed": 0,
+        "latest_marker": None,
+        "completed_at": 0,
+        "pending_questions": set(),
+        "current_session_id": None,
+    }
 
-    Codex's in-chat questions are emitted as a ``request_user_input`` tool call,
-    not as a PermissionRequest hook. The call remains pending until its matching
-    ``function_call_output`` is appended to the rollout.
-    """
-    started = 0
-    terminal = 0
-    latest_marker = None
-    completed_at = 0
-    pending_questions = set()
-    current_session_id = None
+
+def _scan_tail(path, offset, limit=256):
+    size = min(limit, max(0, offset))
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            f.seek(offset - size)
+            return f.read(size)
+    except OSError:
+        return b""
+
+
+def _activity_cache_from_state(path, path_stat, session_id, state_data):
+    """Seed a first-run scan from state written at the same rollout mtime."""
+    if not isinstance(state_data, dict):
+        return None
+    if state_data.get("sessionId") not in (None, "", session_id):
+        return None
+    if (
+        state_data.get("rolloutPath")
+        and _norm_rollout_path(state_data["rolloutPath"]) != _norm_rollout_path(path)
+    ):
+        return None
+    if state_data.get("rolloutMtime") != int(path_stat.st_mtime):
+        return None
+    # A pending question needs its real call_id set to detect its answer, so
+    # bootstrap that uncommon state with a full scan.
+    marker = {
+        "working": "started",
+        "done": "completed",
+        "interrupted": "failed",
+    }.get(state_data.get("state"))
+    if not marker:
+        return None
+    activity = _empty_activity_cache(session_id)
+    activity.update({
+        "scan_offset": path_stat.st_size,
+        "scan_dev": path_stat.st_dev,
+        "scan_ino": path_stat.st_ino,
+        "scan_size": path_stat.st_size,
+        "scan_tail": _scan_tail(path, path_stat.st_size),
+        "started": 1,
+        "completed": 1 if marker in ("completed", "failed") else 0,
+        "latest_marker": marker,
+        "completed_at": state_data.get("completedAt", 0),
+        "current_session_id": session_id,
+        "mtime": path_stat.st_mtime,
+    })
+    return activity
+
+
+def _scan_activity_incremental(path, session_id=None, cached=None):
+    """Extend cached rollout activity by parsing only newly-appended records.
+
+    A truncation, file replacement, session change, or legacy cache entry falls
+    back to one full scan. Invalid partially-written final JSON is retried
+    safely on the next poll.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return _empty_activity_cache(session_id)
+
+    reusable = bool(
+        isinstance(cached, dict)
+        and cached.get("scan_session_id") == session_id
+        and isinstance(cached.get("scan_offset"), int)
+        and cached.get("scan_offset", 0) <= stat.st_size
+        and cached.get("scan_dev") == stat.st_dev
+        and cached.get("scan_ino") == stat.st_ino
+        and (
+            stat.st_size > cached.get("scan_size", 0)
+            or stat.st_mtime == cached.get("mtime")
+        )
+    )
+    if reusable and cached.get("scan_tail") is not None:
+        tail = cached.get("scan_tail")
+        try:
+            with open(path, "rb") as check:
+                check.seek(max(0, cached["scan_offset"] - len(tail)))
+                reusable = check.read(len(tail)) == tail
+        except OSError:
+            reusable = False
+    activity = dict(cached) if reusable else _empty_activity_cache(session_id)
+    activity["pending_questions"] = set(activity.get("pending_questions") or ())
+    offset = activity.get("scan_offset", 0) if reusable else 0
+
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                line_start = f.tell()
+                line = f.readline()
+                if not line:
+                    break
                 if not line.strip():
                     continue
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    # Retry an in-flight final JSON record on the next poll.
+                    if not line.endswith(b"\n"):
+                        f.seek(line_start)
+                        break
                     continue
                 record_session_id = _payload_session_id(d)
                 if record_session_id:
-                    current_session_id = record_session_id
+                    activity["current_session_id"] = record_session_id
                     continue
-                if not _is_target_session(current_session_id, session_id):
+                if not _is_target_session(activity.get("current_session_id"), session_id):
                     continue
                 line_type = d.get("type")
                 payload = d.get("payload") or {}
@@ -294,15 +396,15 @@ def _scan_activity(path, session_id=None, include_latest=False, include_complete
                 if line_type == "event_msg":
                     pt = payload.get("type")
                     if pt in _START_TYPES:
-                        started += 1
-                        latest_marker = "started"
+                        activity["started"] += 1
+                        activity["latest_marker"] = "started"
                     elif pt in _COMPLETE_TYPES:
-                        terminal += 1
-                        latest_marker = "completed"
-                        completed_at = _record_time(d) or completed_at
+                        activity["completed"] += 1
+                        activity["latest_marker"] = "completed"
+                        activity["completed_at"] = _record_time(d) or activity["completed_at"]
                     elif pt in _FAIL_TYPES:
-                        terminal += 1
-                        latest_marker = "failed"
+                        activity["completed"] += 1
+                        activity["latest_marker"] = "failed"
                 elif line_type == "response_item":
                     item_type = payload.get("type")
                     call_id = payload.get("call_id")
@@ -311,22 +413,43 @@ def _scan_activity(path, session_id=None, include_latest=False, include_complete
                         and payload.get("name") in _QUESTION_TOOL_NAMES
                         and call_id
                     ):
-                        pending_questions.add(call_id)
+                        activity["pending_questions"].add(call_id)
                     elif item_type == "function_call_output" and call_id:
-                        pending_questions.discard(call_id)
+                        activity["pending_questions"].discard(call_id)
+            activity["scan_offset"] = f.tell()
+            tail_size = min(256, activity["scan_offset"])
+            f.seek(activity["scan_offset"] - tail_size)
+            activity["scan_tail"] = f.read(tail_size)
     except OSError:
-        result = (0, 0, False, False)
-        if include_latest:
-            result = result + (None,)
-        if include_completed_at:
-            result = result + (0,)
-        return result
-    result = (started, terminal, latest_marker == "failed", bool(pending_questions))
+        return activity
+
+    activity["scan_session_id"] = session_id
+    activity["scan_dev"] = stat.st_dev
+    activity["scan_ino"] = stat.st_ino
+    activity["scan_size"] = stat.st_size
+    activity["mtime"] = stat.st_mtime
+    return activity
+
+
+def _activity_result(activity, include_latest=False, include_completed_at=False):
+    latest_marker = activity.get("latest_marker")
+    result = (
+        activity.get("started", 0),
+        activity.get("completed", 0),
+        latest_marker == "failed",
+        bool(activity.get("pending_questions")),
+    )
     if include_latest:
         result = result + (latest_marker,)
     if include_completed_at:
-        result = result + (completed_at,)
+        result = result + (activity.get("completed_at", 0),)
     return result
+
+
+def _scan_activity(path, session_id=None, include_latest=False, include_completed_at=False):
+    """Return rollout activity after a full scan (compatibility/test helper)."""
+    activity = _scan_activity_incremental(path, session_id)
+    return _activity_result(activity, include_latest, include_completed_at)
 
 
 def _infer_state(mtime, started, completed, failed, waiting_for_user=False, latest_marker=None):
@@ -362,19 +485,24 @@ def find_rollout_for_session(session_id):
     return None
 
 
-def infer_rollout_state_for_session(session_id):
+def infer_rollout_state_for_session(session_id, scan_cache=None):
     """Return current rollout-derived state for a Codex session, or None."""
-    path = find_rollout_for_session(session_id)
+    cached = scan_cache.get(session_id) if isinstance(scan_cache, dict) else None
+    path = cached.get("path") if isinstance(cached, dict) else None
+    if not path or not os.path.exists(path):
+        path = find_rollout_for_session(session_id)
     if not path:
         return None
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return None
-    started, completed, failed, waiting, latest_marker = _scan_activity(
-        path, session_id, include_latest=True
+    activity = _scan_activity_incremental(path, session_id, cached)
+    activity["path"] = path
+    if isinstance(scan_cache, dict):
+        scan_cache[session_id] = activity
+    started, completed, failed, waiting, latest_marker = _activity_result(
+        activity, include_latest=True
     )
-    return _infer_state(mtime, started, completed, failed, waiting, latest_marker)
+    return _infer_state(
+        activity.get("mtime", 0), started, completed, failed, waiting, latest_marker
+    )
 
 
 def _atomic_write_json(path, data):
@@ -596,10 +724,29 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
         for metadata in thread_meta.values()
         if metadata.get("rolloutPath") and _thread_metadata_recent(metadata, cutoff)
     }
+    thread_rollout_files = {
+        metadata.get("rolloutPath")
+        for metadata in thread_meta.values()
+        if metadata.get("rolloutPath") and _thread_metadata_recent(metadata, cutoff)
+    }
 
-    for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")):
+    discovery = prev_cache.get(_ROLLOUT_PATH_CACHE_KEY, {})
+    discovery_due = (
+        not isinstance(discovery, dict)
+        or now - discovery.get("checked_at", 0) >= _ROLLOUT_DISCOVERY_INTERVAL_S
+    )
+    if discovery_due:
+        rollout_paths = set(glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")))
+        discovery_checked_at = now
+    else:
+        rollout_paths = set(discovery.get("paths") or ())
+        discovery_checked_at = discovery.get("checked_at", now)
+    rollout_paths.update(thread_rollout_files)
+
+    for path in rollout_paths:
         try:
-            mtime = os.path.getmtime(path)
+            path_stat = os.stat(path)
+            mtime = path_stat.st_mtime
         except OSError:
             continue
         path_key = _norm_rollout_path(path)
@@ -614,10 +761,33 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
         # the disk write below as well — Codex sessions can have rollouts
         # in the multi-megabyte range and re-parsing them every 500ms
         # turned the poller into the dominant cost on the hot path.
-        cache_valid = cached is not None and cached.get("mtime") == mtime
+        cache_valid = bool(
+            cached is not None
+            and cached.get("mtime") == mtime
+            and (
+                "scan_size" not in cached
+                or cached.get("scan_size") == path_stat.st_size
+            )
+        )
         ignored_cache_hit = cache_valid and cached.get("ignored")
         cache_hit = cache_valid and not cached.get("ignored")
+        cache_extendable = bool(
+            isinstance(cached, dict)
+            and not cached.get("ignored")
+            and cached.get("session_id")
+            and cached.get("scan_session_id") == cached.get("session_id")
+            and isinstance(cached.get("scan_offset"), int)
+            and cached.get("scan_offset", 0) <= path_stat.st_size
+            and cached.get("scan_dev") == path_stat.st_dev
+            and cached.get("scan_ino") == path_stat.st_ino
+            and (
+                path_stat.st_size > cached.get("scan_size", 0)
+                or path_stat.st_mtime == cached.get("mtime")
+            )
+        )
         session_id = cached.get("session_id") if cache_valid else None
+        if cache_extendable:
+            session_id = cached.get("session_id")
         metadata = thread_meta.get(session_id, {}) if session_id else {}
         if ignored_cache_hit and session_id:
             reason = cached.get("ignore_reason")
@@ -634,7 +804,7 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                 _drop_virtual_monitor_row(sessions_dir, state_dir, session_id)
                 seen_rollout_paths.add(path)
                 continue
-        if not cache_hit:
+        if not cache_hit and not cache_extendable:
             meta = _read_first_json_line(path)
             if not meta or meta.get("type") != "session_meta":
                 continue
@@ -695,7 +865,13 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
             source = cached.get("source", "")
             originator = cached.get("originator", "")
         else:
-            reason = _ignore_reason(state_dir, session_id, payload, metadata)
+            reason = (
+                IGNORE_HOOK_OWNED
+                if cache_extendable and _is_hook_owned_session(state_dir, session_id, metadata)
+                else None
+            )
+            if not cache_extendable:
+                reason = _ignore_reason(state_dir, session_id, payload, metadata)
             if reason:
                 seen_rollout_paths.add(path)
                 _ignore_rollout(
@@ -703,22 +879,27 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                     sessions_dir, state_dir,
                 )
                 continue
-            started, completed, failed, waiting, latest_marker, completed_at = _scan_activity(
-                path, session_id, include_latest=True, include_completed_at=True
+            scan_seed = cached if cache_extendable else None
+            if scan_seed is None:
+                bootstrap_state = _read_existing(
+                    os.path.join(state_dir, f"{virtual_id_for(session_id)}.json")
+                )
+                scan_seed = _activity_cache_from_state(
+                    path, path_stat, session_id, bootstrap_state
+                )
+            activity = _scan_activity_incremental(path, session_id, scan_seed)
+            started, completed, failed, waiting, latest_marker, completed_at = _activity_result(
+                activity, include_latest=True, include_completed_at=True
             )
-            prev_cache[path] = {
-                "mtime": mtime,
+            activity.update({
                 "session_id": session_id,
                 "cwd": cwd,
-                "started": started,
-                "completed": completed,
                 "failed": failed,
                 "waiting": waiting,
-                "latest_marker": latest_marker,
-                "completed_at": completed_at,
                 "source": source,
                 "originator": originator,
-            }
+            })
+            prev_cache[path] = activity
 
         seen_rollout_paths.add(path)
         title = metadata.get("title") or ""
@@ -854,11 +1035,18 @@ def poll_codex_rollouts(known_session_ids, prev_cache, sessions_dir, state_dir, 
                 except OSError:
                     pass
 
+    prev_cache[_ROLLOUT_PATH_CACHE_KEY] = {
+        "checked_at": discovery_checked_at,
+        "paths": tuple(seen_rollout_paths),
+    }
+
     # Drop cache entries for rollouts we didn't visit this tick — either
     # the file vanished or it crossed the eviction window. Without this an
     # always-on monitor accumulates cache entries for every rollout it has
     # ever seen.
     for stale in list(prev_cache):
+        if stale in _CACHE_META_KEYS:
+            continue
         if stale in seen_rollout_paths:
             continue
         cached = prev_cache.get(stale, {})

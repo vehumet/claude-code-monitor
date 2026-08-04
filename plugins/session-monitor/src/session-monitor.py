@@ -1418,6 +1418,7 @@ class InstanceTracker:
         # request_user_input waits; keep it throttled because rollout files can
         # grow large.
         self._codex_question_cache: dict = {}
+        self._codex_question_scan_cache: dict = {}
         self._codex_question_check_s = max(
             0.5,
             float(CONFIG.get("codex_question_check_interval_ms", 2000)) / 1000.0,
@@ -1634,7 +1635,14 @@ class InstanceTracker:
         state = None
         if infer_rollout_state_for_session is not None:
             try:
-                state = infer_rollout_state_for_session(session_id)
+                try:
+                    state = infer_rollout_state_for_session(
+                        session_id, self._codex_question_scan_cache
+                    )
+                except TypeError:
+                    # Keep test/standalone adapters written for the original
+                    # one-argument helper working during upgrades.
+                    state = infer_rollout_state_for_session(session_id)
             except Exception:
                 _log.debug("failed to infer Codex rollout state", exc_info=True)
         self._codex_question_cache[session_id] = {
@@ -1827,8 +1835,12 @@ class InstanceTracker:
                 state = "question"
             elif saved_provider == "claude" and claude_session_has_pending_ask_user_question(session_data):
                 state = "question"
-            elif saved_provider == "codex" and self._codex_waits_for_user_cached(
-                (session_data or {}).get("sessionId")
+            elif (
+                saved_provider == "codex"
+                and not is_virtual_id(pid)
+                and self._codex_waits_for_user_cached(
+                    (session_data or {}).get("sessionId")
+                )
             ):
                 state = "question"
 
