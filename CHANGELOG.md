@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.31] - 2026-08-04
+
+### Changed
+
+- Parse only newly appended Codex rollout records and reuse recent rollout discovery and thread metadata caches.
+
+### Fixed
+
+- Prevent large, long-running Codex rollouts from blocking the overlay event loop with repeated full-file scans.
+- Avoid duplicate question-state scans for PID-less Codex rows and restore current rollout state without a full startup rescan.
+
 ## [0.0.30] - 2026-06-14
 
 ### Added
